@@ -6,6 +6,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "aiodocker>=0.27.0",
     "alembic>=1.20.0",
     "asyncpg>=0.31.0",
     "fastapi>=0.141.1",
@@ -35,13 +36,21 @@ plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--strict-markers", "-m", "not integration"]
-markers = ["integration: requires a running PostgreSQL reachable through DATABASE_URL"]
+addopts = ["--strict-markers", "-m", "not integration and not docker and not runsc"]
+markers = [
+    "integration: requires a running PostgreSQL reachable through DATABASE_URL",
+    "docker: requires Docker and the lab image; runs under LINUXLAB_TEST_OCI_RUNTIME",
+    "runsc: requires LINUXLAB_TEST_OCI_RUNTIME=runsc (gVisor)",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 
 [dependency-groups]
 dev = [
     "httpx2>=2.13.1",
     "mypy>=2.3.1",
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "ruff>=0.16.9",
 ]
