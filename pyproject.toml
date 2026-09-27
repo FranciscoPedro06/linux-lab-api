@@ -30,7 +30,7 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
 
 [tool.mypy]
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
