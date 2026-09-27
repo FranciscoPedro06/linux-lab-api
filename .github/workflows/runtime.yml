@@ -1,0 +1,65 @@
+name: Runtime
+
+# Runs the Docker integration and isolation tests under gVisor (runsc).
+# Kept separate from CI because it installs a container runtime on the runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/linuxlab/labs/**"
+      - "lab-image/**"
+      - ".github/workflows/runtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GVISOR_RELEASE: "20260921.0"
+  GVISOR_SHA512: "7c899979bed334f0987888c41e545cede8e1f7e67a257978c8de244c3867e32bc30d08491e9af36720273c502acd01d8d86c9844ebcbe125790c43fe6bdf563e"
+
+jobs:
+  gvisor:
+    name: Isolation tests (runsc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      LINUXLAB_TEST_OCI_RUNTIME: runsc
+      LINUXLAB_LAB_IMAGE: linuxlab/lab-base:ci
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install gVisor ${{ env.GVISOR_RELEASE }}
+        run: |
+          set -euo pipefail
+          curl -fsSLo gvisor.tar.bz2 \
+            "https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64/gvisor.tar.bz2"
+          echo "${GVISOR_SHA512}  gvisor.tar.bz2" | sha512sum --check --strict
+          sudo tar -xjf gvisor.tar.bz2 -C /usr/local/bin runsc containerd-shim-runsc-v1 gvisor-bin
+          rm gvisor.tar.bz2
+          sudo /usr/local/bin/runsc install
+          sudo systemctl restart docker
+
+      - name: Show container runtimes
+        run: |
+          runsc --version
+          docker info --format 'Default runtime: {{.DefaultRuntime}}'
+          docker info --format '{{range $name, $_ := .Runtimes}}Registered runtime: {{$name}}{{"\n"}}{{end}}'
+
+      - name: Smoke test runsc
+        run: |
+          set -euo pipefail
+          output=$(docker run --rm --runtime=runsc --network=none ubuntu:24.04 dmesg)
+          echo "$output"
+          grep -q gVisor <<<"$output"
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.19"
+      - run: uv sync --locked
+      - run: docker build --tag "$LINUXLAB_LAB_IMAGE" lab-image
+
+      - name: Run tests under ${{ env.LINUXLAB_TEST_OCI_RUNTIME }}
+        run: uv run pytest -m "docker or runsc" -v -rA
