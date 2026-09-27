@@ -1,0 +1,58 @@
+# Local development environment: PostgreSQL, API and web dev server.
+# Expects linux-lab-web cloned next to this repository; override with LINUXLAB_WEB_DIR.
+# Credentials below are for local development only.
+
+name: linuxlab
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: linuxlab
+      POSTGRES_PASSWORD: linuxlab
+      POSTGRES_DB: linuxlab
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linuxlab -d linuxlab"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build:
+      context: ..
+      target: dev
+    environment:
+      DATABASE_URL: postgresql+asyncpg://linuxlab:linuxlab@postgres:5432/linuxlab
+    command: >-
+      sh -c "alembic upgrade head &&
+      uvicorn --factory linuxlab.main:create_app --host 0.0.0.0 --port 8000 --reload --reload-dir src"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ../src:/app/src
+      - ../migrations:/app/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+    environment:
+      API_PROXY_TARGET: http://api:8000
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ${LINUXLAB_WEB_DIR:-../../linux-lab-web}:/app
+      - web-node-modules:/app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  postgres-data:
+  web-node-modules:
