@@ -82,13 +82,12 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 
 **Email enumeration on sign-up.** Accepted until there is an email flow.
 
-## Pending verification
+## Verification
 
-These depend on `runsc` behavior and will be confirmed by tests in increment 02:
+Isolation is checked by tests that run commands inside a real lab; results and the environment each was run in are in [runtime.md](runtime.md#verification-status).
 
-1. `pids_limit` is enforced for processes inside the sandbox.
-2. tmpfs options (`size`, `uid`, `gid`, `mode`) are honored.
-3. The added capabilities are enough for `labctl`, and the student ends up with `CapEff` equal to zero.
-4. Behavior of a process started by `docker exec` when the client disconnects.
-5. Container creation and `exec` latency.
-6. OOM behavior and how the API detects it.
+Still open:
+
+1. All checks under `runsc`. They are automated in the `Runtime` workflow but have not run yet.
+2. Behavior of a process started by `docker exec` when the client disconnects. This depends on TTY execs and is part of the terminal work.
+3. How the API detects an OOM that kills the container's main process. The runtime tests only cover an OOM that kills the offending process while the container keeps running.
