@@ -2,7 +2,7 @@
 
 Backend for Linux Lab, a platform for learning Linux by solving problems in a real terminal, inside an isolated environment created for each student.
 
-This repository holds the API, lab lifecycle management, the WebSocket terminal, mission validation, mission content, the lab image and the infrastructure. The web interface lives in `linux-lab-web`.
+This repository holds the API, lab lifecycle management, the WebSocket terminal, mission validation, mission content, the lab image and the infrastructure. The web interface lives in [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web).
 
 ## Why
 
