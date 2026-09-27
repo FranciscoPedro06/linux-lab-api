@@ -1,0 +1,8 @@
+# Setup scripts and image files run on Linux; CRLF line endings break bash.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff2 binary
