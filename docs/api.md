@@ -38,6 +38,14 @@ User-facing messages are in Portuguese.
 
 Every route requires a session except `signup`, `login` and `health`.
 
+### `GET /api/health`
+
+```json
+{ "status": "ok", "database": "ok" }
+```
+
+Returns `200` when every dependency responds and `503` with `"unavailable"` otherwise. Docker status is added together with the lab runtime.
+
 ### `GET /api/missions/{slug}`
 
 `explanation` and `solutions` are only included once the user has completed the mission. This is enforced by the server.

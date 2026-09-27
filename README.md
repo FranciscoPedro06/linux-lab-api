@@ -73,28 +73,69 @@ No Redis, queue or orchestrator. PostgreSQL handles sessions, state and concurre
 ## Repository layout
 
 ```
-content/     modules and missions (YAML, Markdown, setup and test scripts)
-lab-image/   lab Docker image and platform utilities
-infra/       Docker Compose, Caddy, Docker daemon configuration
-tests/       unit, integration, security and mission tests
-docs/        architecture, API contract, mission format, threat model
+src/linuxlab/  application package
+migrations/    Alembic migrations
+tests/         unit, integration, security and mission tests
+content/       modules and missions (YAML, Markdown, setup and test scripts)
+lab-image/     lab Docker image and platform utilities
+infra/         Docker Compose, Caddy, Docker daemon configuration
+docs/          architecture, API contract, mission format, threat model
 ```
 
 Mission content (titles, briefings, hints, messages) is written in Portuguese. Code, identifiers and documentation are in English.
 
 ## Running
 
-There is no code yet. Setup instructions will be added with the first increment.
+Requirements:
 
-Expected development requirements:
+- Docker with Compose
+- Python 3.12 and [uv](https://docs.astral.sh/uv/) for running tools outside containers
 
-- Linux or WSL2 with a native Docker Engine (Docker Desktop does not allow installing gVisor)
-- Python 3.12
-- gVisor (`runsc`), required in production and optional in development
+Lab isolation is not implemented yet. From increment 02 on, development requires Linux or WSL2 with a native Docker Engine, since Docker Desktop does not allow installing gVisor (`runsc`).
 
-Configuration is done through environment variables; see [.env.example](.env.example).
+### Full environment
+
+Clone [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web) next to this repository, then:
+
+```sh
+docker compose -f infra/compose.yml up --build
+```
+
+This starts PostgreSQL, the API with auto-reload and the Vite dev server, and applies migrations on startup.
+
+| Service | Address |
+|---|---|
+| Web | http://localhost:5173 |
+| API | http://localhost:8000/api/health |
+| PostgreSQL | `localhost:5432`, user, password and database `linuxlab` |
+
+All ports are bound to `127.0.0.1`. If the web repository lives elsewhere, set `LINUXLAB_WEB_DIR`.
+
+### API on the host
+
+```sh
+docker compose -f infra/compose.yml up -d postgres
+cp .env.example .env
+uv sync
+uv run alembic upgrade head
+uv run uvicorn --factory linuxlab.main:create_app --reload
+```
+
+Configuration comes from environment variables or `.env`; see [.env.example](.env.example).
 
 ## Tests
+
+```sh
+uv run ruff check
+uv run ruff format --check
+uv run mypy
+uv run pytest                  # unit tests
+uv run pytest -m integration   # requires PostgreSQL at DATABASE_URL
+```
+
+CI runs the same checks, the integration tests against a PostgreSQL service, and a build of the production image.
+
+Planned coverage as the project grows:
 
 - **Unit:** validators, the validation tree, the mission parser, progress rules, authentication, and a snapshot of the container security configuration.
 - **Integration:** lab creation, setup, validation, reset and terminal against real Docker and PostgreSQL.
@@ -103,7 +144,7 @@ Configuration is done through environment variables; see [.env.example](.env.exa
 
 ## Status
 
-The architecture is defined and implementation has not started. Planned order:
+Increment 01 is done: application skeleton, health check, database connection, Alembic, local environment and CI. Planned order:
 
 | # | Increment |
 |---|---|
