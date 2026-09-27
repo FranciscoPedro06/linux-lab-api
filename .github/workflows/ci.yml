@@ -57,3 +57,4 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: docker build --target prod --tag linuxlab-api:ci .
+      - run: docker build --tag linuxlab/lab-base:ci lab-image
