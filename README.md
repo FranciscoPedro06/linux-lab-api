@@ -91,7 +91,7 @@ Requirements:
 - Docker with Compose
 - Python 3.12 and [uv](https://docs.astral.sh/uv/) for running tools outside containers
 
-Lab isolation is not implemented yet. From increment 02 on, development requires Linux or WSL2 with a native Docker Engine, since Docker Desktop does not allow installing gVisor (`runsc`).
+Labs run under gVisor (`runsc`) in production. Any Docker Engine, including Docker Desktop, is enough to develop and to run the lab tests under `runc`; testing under gVisor needs Linux with a native Docker Engine and is also done in CI. See [docs/runtime.md](docs/runtime.md).
 
 ### Full environment
 
@@ -131,9 +131,12 @@ uv run ruff format --check
 uv run mypy
 uv run pytest                  # unit tests
 uv run pytest -m integration   # requires PostgreSQL at DATABASE_URL
+uv run pytest -m docker        # lab runtime and isolation, requires Docker and the lab image
 ```
 
-CI runs the same checks, the integration tests against a PostgreSQL service, and a build of the production image.
+Lab runtime tests, gVisor setup and the list of isolation checks are described in [docs/runtime.md](docs/runtime.md).
+
+CI runs the same checks, the integration tests against a PostgreSQL service, and builds the API and lab images. A separate `Runtime` workflow runs the lab tests under gVisor.
 
 Planned coverage as the project grows:
 
@@ -144,7 +147,7 @@ Planned coverage as the project grows:
 
 ## Status
 
-Increment 01 is done: application skeleton, health check, database connection, Alembic, local environment and CI. Planned order:
+Increments 01 and 02 are implemented: application skeleton, database connection, local environment and CI, then the lab image and the lab runtime with isolation tests. The runtime is not yet used by the HTTP API. Planned order:
 
 | # | Increment |
 |---|---|
@@ -167,6 +170,7 @@ Increment 01 is done: application skeleton, health check, database connection, A
 - [docs/architecture.md](docs/architecture.md): components, flows and decisions
 - [docs/api.md](docs/api.md): HTTP endpoints and terminal protocol
 - [docs/missions.md](docs/missions.md): mission format and authoring rules
+- [docs/runtime.md](docs/runtime.md): lab runtime, gVisor setup and verification status
 - [docs/threat-model.md](docs/threat-model.md): isolation, limits and accepted risks
 
 ## License
