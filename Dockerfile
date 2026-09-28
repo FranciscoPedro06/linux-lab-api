@@ -19,7 +19,7 @@ COPY src ./src
 COPY migrations ./migrations
 RUN uv sync --locked
 EXPOSE 8000
-CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "src"]
+CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "65536", "--reload", "--reload-dir", "src"]
 
 
 FROM base AS build
@@ -41,4 +41,4 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 USER linuxlab
 EXPOSE 8000
-CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "65536"]
