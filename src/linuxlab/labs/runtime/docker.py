@@ -347,7 +347,16 @@ class DockerTerminalSession:
             return self._exit_code
         self._closed = True
         exited_on_its_own = self._exited
-        await self._stream.close()
+        # A failure to close the stream must not skip the cleanup below, or the
+        # shell and its processes would outlive the terminal.
+        try:
+            await self._stream.close()
+        except Exception:
+            logger.warning(
+                "terminal stream did not close cleanly: container=%s",
+                self._container_id,
+                exc_info=True,
+            )
         try:
             remaining = await self._runtime.end_terminal_processes(self._container_id, self._token)
             if remaining:

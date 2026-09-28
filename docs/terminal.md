@@ -9,7 +9,7 @@ API: router.py -> access.py -> relay.py
    | LabRuntime.open_terminal
 DockerRuntime: docker exec with Tty=true, stdin attached, as the student
    |
-lab container: bash --login on /dev/pts/N
+lab container: bash --login, stdin/stdout on the exec's TTY
 ```
 
 | Module | Responsibility |
@@ -77,7 +77,7 @@ Keepalive pings are handled by uvicorn at the WebSocket protocol level (every 20
 
 `open_terminal` runs `docker exec` with `Tty=true` and stdin attached, as uid 1000 in `/home/student`, with `TERM=xterm-256color`. The user is fixed; the protocol has no way to choose it, pass exec parameters or change the container.
 
-With a TTY, Docker streams raw bytes instead of multiplexed stdout and stderr, so both arrive interleaved as a real terminal shows them. The PTY size is set right after the exec starts and on every `resize`, through Docker's exec resize call.
+With a TTY, Docker streams raw bytes instead of multiplexed stdout and stderr, so both arrive interleaved as a real terminal shows them. The PTY size is set right after the exec starts and on every `resize`, through Docker's exec resize call. How the terminal device appears inside the lab differs between runc and runsc; see [Known behavior](#known-behavior).
 
 Each terminal gets a random token in its environment (`LINUXLAB_TERMINAL`). Nothing reads it except the cleanup below.
 
@@ -142,4 +142,4 @@ Terminal content, typed commands and the terminal token are never logged.
 - Input that arrives before bash has set up line editing can be discarded by bash itself, for example a Ctrl+D sent before the first prompt. People type after seeing the prompt; the tests wait for it.
 - In development, React's Strict Mode mounts the page twice, so the browser opens a terminal, closes it and opens another. The first one is cleaned up normally.
 - A reconnect starts a new shell: files and detached processes remain, but the working directory, variables and history of the old shell do not.
-- Under gVisor the shell's terminal is a host terminal passed into the sandbox. It behaves as a terminal (line editing, window size, Ctrl+C, programs that check `isatty`), but it has no name under `/dev/pts`, so `tty` prints `not a tty` and programs that need `ttyname()` fail. Under runc it is `/dev/pts/N`. Running the shell behind a PTY allocated inside the sandbox would remove the difference; it is not done yet.
+- The terminal device differs between runtimes. Under runc the shell's terminal is a traditional pseudo-terminal, `/dev/pts/N`. Under runsc (gVisor) it is a host terminal passed into the sandbox and no `/dev/pts` device is exposed for it, so `tty` prints `not a tty` and programs that need `ttyname()` fail. In both runtimes the exec's TTY provides the terminal behavior the product needs, and the tests check it under both: line editing, history, window size and resize, Ctrl+C, Ctrl+D, `isatty` and interactive input. There is no additional PTY or intermediate shell.
