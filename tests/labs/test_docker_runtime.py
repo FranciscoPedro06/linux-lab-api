@@ -16,7 +16,7 @@ from linuxlab.labs.runtime import (
 )
 from linuxlab.labs.runtime.docker import MAX_OUTPUT_BYTES, DockerRuntime
 
-from .support import LAB_IMAGE, processes, read_until, sh
+from .support import LAB_IMAGE, OCI_RUNTIME, processes, read_until, sh
 
 pytestmark = pytest.mark.docker
 
@@ -117,14 +117,22 @@ async def test_terminal_is_a_login_shell_on_a_pty_as_student(
 ) -> None:
     terminal = await runtime.open_terminal(lab.id, TerminalSize(cols=80, rows=24))
     try:
-        await terminal.write(b"id -un; tty; stty size; echo $TERM\r")
+        await terminal.write(
+            b"id -un; [ -t 0 ] && echo stdin-is-a-terminal; tty; stty size; echo $TERM\r"
+        )
         output = await read_until(terminal, b"xterm-256color\r\n")
     finally:
         await terminal.close()
 
     assert b"student\r\n" in output
-    assert b"/dev/pts/" in output
+    assert b"stdin-is-a-terminal\r\n" in output
     assert b"24 80\r\n" in output
+    if OCI_RUNTIME == "runsc":
+        # gVisor hands the exec a host terminal: it is a TTY (isatty, window size, line
+        # editing) but has no /dev/pts name, so ttyname() and `tty` fail.
+        assert b"not a tty\r\n" in output
+    else:
+        assert b"/dev/pts/" in output
 
 
 async def test_terminal_resize_reaches_the_pty(runtime: DockerRuntime, lab: ContainerInfo) -> None:
