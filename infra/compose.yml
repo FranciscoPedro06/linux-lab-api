@@ -27,14 +27,23 @@ services:
       target: dev
     environment:
       DATABASE_URL: postgresql+asyncpg://linuxlab:linuxlab@postgres:5432/linuxlab
+      ALLOWED_ORIGINS: http://localhost:5173
+      # Terminal without authentication; see docs/terminal.md. Development only.
+      DEV_TERMINAL_ACCESS: "true"
+      LAB_OCI_RUNTIME: ${LAB_OCI_RUNTIME:-runc}
+      LAB_IMAGE: linuxlab/lab-base:dev
     command: >-
       sh -c "alembic upgrade head &&
-      uvicorn --factory linuxlab.main:create_app --host 0.0.0.0 --port 8000 --reload --reload-dir src"
+      uvicorn --factory linuxlab.main:create_app --host 0.0.0.0 --port 8000
+      --ws-max-size 65536 --reload --reload-dir src"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
       - ../src:/app/src
       - ../migrations:/app/migrations
+      # The API creates lab containers and terminal execs. Access to the Docker socket
+      # is equivalent to root on the host (see docs/threat-model.md). Labs never get it.
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       postgres:
         condition: service_healthy
