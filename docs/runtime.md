@@ -52,6 +52,7 @@ The same configuration gives different observable behavior under the two runtime
 | Network with `NetworkDisabled` | `lo` still present | No interfaces at all; the configuration uses only `NetworkMode: none`, which keeps `lo` |
 | tmpfs `nodev` | Reported in `/proc/mounts` | Not reported; device creation is still refused because no capability allows `mknod` |
 | Seccomp in `/proc/self/status` | 2 (Docker default profile) | 0; syscalls go to the gVisor kernel, which is filtered on the host by gVisor |
+| Terminal (TTY exec) | `/dev/pts/N`; `tty` prints the name | A host terminal without a `/dev/pts` name: `isatty` and window size work, `tty` prints `not a tty` |
 
 In both runtimes the effect of exhausting a resource stays inside the lab that did it; the tests check that another lab keeps working.
 
