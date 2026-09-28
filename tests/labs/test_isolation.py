@@ -517,7 +517,17 @@ async def _wait_until_stopped(
         await asyncio.sleep(0.2)
 
 
-async def test_cpu_quota_limits_a_busy_process(
+BUSY_SECONDS = 5
+
+
+async def _cpu_counters(client: aiodocker.Docker, lab: ContainerInfo) -> tuple[int, int]:
+    """Total CPU time (ns) and throttled periods of the lab's cgroup, as seen by the host."""
+    stats = (await client.containers.container(lab.id).stats(stream=False))[0]
+    cpu = stats["cpu_stats"]
+    return int(cpu["cpu_usage"]["total_usage"]), int(cpu["throttling_data"]["throttled_periods"])
+
+
+async def test_cpu_quota_is_enforced(
     runtime: DockerRuntime, docker_client: aiodocker.Docker, fresh_lab: ContainerInfo
 ) -> None:
     details = await docker_inspect(docker_client, fresh_lab)
@@ -526,18 +536,29 @@ async def test_cpu_quota_limits_a_busy_process(
     script = (
         "import time\n"
         "wall, cpu = time.monotonic(), time.process_time()\n"
-        "while time.monotonic() - wall < 3:\n"
+        f"while time.monotonic() - wall < {BUSY_SECONDS}:\n"
         "    pass\n"
         "print((time.process_time() - cpu) / (time.monotonic() - wall))\n"
     )
+    usage_before, throttled_before = await _cpu_counters(docker_client, fresh_lab)
     result = await runtime.exec(
         fresh_lab.id, ["python3", "-I", "-c", script], user="student", time_limit=30
     )
-    ratio = float(result.stdout)
-    print(f"cpu time / wall time for a busy loop: {ratio:.2f}")
+    usage_after, throttled_after = await _cpu_counters(docker_client, fresh_lab)
+    assert result.exit_code == 0, result
 
-    # A single busy thread would reach ~1.0 without a quota; 0.5 CPU caps it near 0.5.
-    assert ratio < 0.75
+    host_cpu = (usage_after - usage_before) / 1e9 / BUSY_SECONDS
+    throttled = throttled_after - throttled_before
+    print(
+        f"host cgroup: {host_cpu:.2f} CPU during a {BUSY_SECONDS}s busy loop, "
+        f"{throttled} throttled periods; in-lab process_time ratio {float(result.stdout):.2f} "
+        "(diagnostic only: gVisor's own CPU accounting does not see host throttling)"
+    )
+
+    # One busy thread would use ~1.0 CPU without a quota. The host counts CPU time and
+    # throttling for the whole cgroup, which under runsc is the entire sandbox.
+    assert throttled > 0
+    assert 0.3 < host_cpu < 0.7
 
 
 async def test_seccomp_filter(runtime: DockerRuntime, lab: ContainerInfo) -> None:
