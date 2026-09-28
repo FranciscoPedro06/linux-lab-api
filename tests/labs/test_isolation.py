@@ -4,7 +4,9 @@ These assert observed behavior, not configuration: each test runs commands in th
 lab and checks what the kernel (or gVisor) actually allows.
 """
 
+import asyncio
 import time
+from typing import Any
 
 import aiodocker
 import pytest
@@ -469,8 +471,11 @@ async def test_labs_have_independent_process_budgets(
     assert created > held
 
 
-async def test_memory_limit_kills_oversized_allocation(
-    runtime: DockerRuntime, docker_client: aiodocker.Docker, fresh_lab: ContainerInfo
+async def test_memory_limit_is_enforced(
+    runtime: DockerRuntime,
+    docker_client: aiodocker.Docker,
+    fresh_lab: ContainerInfo,
+    lab: ContainerInfo,
 ) -> None:
     details = await docker_inspect(docker_client, fresh_lab)
     assert details["HostConfig"]["Memory"] == MEMORY_BYTES
@@ -480,12 +485,36 @@ async def test_memory_limit_kills_oversized_allocation(
         return ["python3", "-I", "-c", f"data = b'x' * ({mib} * 1024 * 1024)"]
 
     within = await runtime.exec(fresh_lab.id, allocate(256), user="student", time_limit=60)
-    beyond = await runtime.exec(fresh_lab.id, allocate(768), user="student", time_limit=60)
-
     assert within.exit_code == 0, within
-    assert beyond.exit_code == 137, beyond
+
+    beyond = await runtime.exec(fresh_lab.id, allocate(768), user="student", time_limit=60)
+    assert beyond.exit_code != 0, beyond
     assert not beyond.timed_out
-    assert (await runtime.inspect(fresh_lab.id)).running
+
+    if OCI_RUNTIME == "runsc":
+        # The memory cgroup covers the whole gVisor sandbox: the host OOM killer ends the
+        # sandbox, and with it the lab.
+        state = await _wait_until_stopped(docker_client, fresh_lab)
+        assert state["OOMKilled"] is True, state
+    else:
+        # The OOM killer picks the offending process; the lab keeps running.
+        assert beyond.exit_code == 137, beyond
+        assert (await runtime.inspect(fresh_lab.id)).running
+
+    # Either way the damage stays inside the lab that exceeded its limit.
+    assert (await runtime.inspect(lab.id)).running
+    assert (await sh(runtime, lab, "true")).exit_code == 0
+
+
+async def _wait_until_stopped(
+    client: aiodocker.Docker, lab: ContainerInfo, seconds: float = 10
+) -> dict[str, Any]:
+    deadline = time.monotonic() + seconds
+    while True:
+        state: dict[str, Any] = (await docker_inspect(client, lab))["State"]
+        if not state["Running"] or time.monotonic() > deadline:
+            return state
+        await asyncio.sleep(0.2)
 
 
 async def test_cpu_quota_limits_a_busy_process(
