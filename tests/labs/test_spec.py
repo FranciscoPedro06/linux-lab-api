@@ -19,9 +19,9 @@ EXPECTED = {
         "Privileged": False,
         "ReadonlyRootfs": True,
         "Tmpfs": {
-            "/home/student": "rw,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0755",
-            "/tmp": "rw,nosuid,nodev,size=32m,mode=1777",
-            "/run/lab": "rw,nosuid,nodev,size=1m,uid=1000,gid=1000,mode=0755",
+            "/home/student": "rw,nosuid,nodev,exec,size=64m,uid=1000,gid=1000,mode=0755",
+            "/tmp": "rw,nosuid,nodev,exec,size=32m,mode=1777",
+            "/run/lab": "rw,nosuid,nodev,noexec,size=1m,uid=1000,gid=1000,mode=0755",
         },
         "Binds": [],
         "Mounts": [],

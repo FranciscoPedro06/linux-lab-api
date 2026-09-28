@@ -9,7 +9,7 @@ import time
 import aiodocker
 import pytest
 
-from linuxlab.labs.runtime import ContainerInfo
+from linuxlab.labs.runtime import ContainerInfo, ExecUser
 from linuxlab.labs.runtime.docker import DockerRuntime
 from linuxlab.labs.runtime.spec import MEMORY_BYTES, NANO_CPUS, PIDS_LIMIT
 
@@ -228,12 +228,52 @@ async def test_tmpfs_sizes(runtime: DockerRuntime, lab: ContainerInfo) -> None:
 async def test_tmpfs_mount_options(runtime: DockerRuntime, lab: ContainerInfo) -> None:
     mounts = (await sh(runtime, lab, "cat /proc/mounts")).stdout.decode()
 
-    for target in ("/home/student", "/tmp", "/run/lab"):
+    for target, executable in (("/home/student", True), ("/tmp", True), ("/run/lab", False)):
         entries = [line.split() for line in mounts.splitlines() if line.split()[1] == target]
         assert len(entries) == 1, (target, entries)
-        _source, _target, fstype, options, *_ = entries[0]
+        _source, _target, fstype, raw_options, *_ = entries[0]
+        options = set(raw_options.split(","))
         assert fstype == "tmpfs", target
-        assert {"rw", "nosuid", "nodev"} <= set(options.split(",")), (target, options)
+        assert {"rw", "nosuid"} <= options, (target, raw_options)
+        assert ("noexec" not in options) == executable, (target, raw_options)
+        # gVisor does not report nodev; device creation is checked by behavior below.
+        if OCI_RUNTIME != "runsc":
+            assert "nodev" in options, (target, raw_options)
+
+
+SCRIPT = "printf '#!/bin/sh\\necho ran\\n' > {path} && chmod +x {path} && {path}"
+
+
+@pytest.mark.parametrize(
+    ("directory", "executable"),
+    [("/home/student", True), ("/tmp", True), ("/run/lab", False)],
+)
+async def test_script_execution_by_location(
+    runtime: DockerRuntime, lab: ContainerInfo, directory: str, executable: bool
+) -> None:
+    path = f"{directory}/exec-probe.sh"
+    result = await sh(
+        runtime, lab, SCRIPT.format(path=path) + f"; status=$?; rm -f {path}; exit $status"
+    )
+
+    if executable:
+        assert result.exit_code == 0, result
+        assert result.stdout == b"ran\n"
+    else:
+        assert result.exit_code == 126, result
+        assert b"Permission denied" in result.stderr
+
+
+@pytest.mark.parametrize("user", ["student", "root"])
+@pytest.mark.parametrize("directory", ["/home/student", "/tmp"])
+async def test_device_nodes_cannot_be_created(
+    runtime: DockerRuntime, lab: ContainerInfo, user: ExecUser, directory: str
+) -> None:
+    # c 1 1 is /dev/mem.
+    result = await sh(runtime, lab, f"mknod {directory}/mem c 1 1", user=user)
+
+    assert result.exit_code != 0, result
+    assert b"Operation not permitted" in result.stderr
 
 
 async def test_home_size_is_enforced(runtime: DockerRuntime, lab: ContainerInfo) -> None:
