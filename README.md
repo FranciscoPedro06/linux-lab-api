@@ -2,7 +2,7 @@
 
 Backend for Linux Lab, a platform for learning Linux by solving problems in a real terminal, inside an isolated environment created for each student.
 
-This repository holds the API, lab lifecycle management, the WebSocket terminal, mission validation, mission content, the lab image and the infrastructure. The web interface lives in [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web).
+This repository holds the API, the lab runtime, the WebSocket terminal, the lab image and the infrastructure. Mission content and validation will live here too. The web interface lives in [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web).
 
 ## Why
 
@@ -12,14 +12,15 @@ In Linux Lab the student gets a problem ("the deploy script is readable by every
 
 ## How it works
 
-1. The student picks a mission and starts the lab.
-2. The API creates an isolated container, runs the mission setup and leaves the environment in the problem's initial state.
-3. The browser opens a terminal (xterm.js) connected over WebSocket to a `bash` shell inside the container.
-4. The student solves the problem with whatever commands they prefer.
-5. On validation, the API inspects the container state (files, permissions, processes) and compares it against the conditions declared by the mission.
-6. Progress is stored. The environment is disposable and can be recreated at any time with Reset.
+What exists today:
 
-A mission declares conditions; it does not run validation code:
+1. A lab is an isolated container created from the lab image, with no network, a read-only root filesystem and CPU, memory and process limits. For now labs are created by hand with a development command.
+2. The browser opens a terminal (xterm.js) connected over WebSocket to a `bash` shell inside that container, running as an unprivileged user.
+3. The student works with whatever commands they prefer; nothing typed is parsed or filtered.
+
+Planned, not implemented yet: accounts, missions with their initial state, validation of the final state, progress and resetting a lab.
+
+Missions will declare conditions rather than run validation code:
 
 ```yaml
 validation:
@@ -33,9 +34,11 @@ validation:
       mode: "0700"
 ```
 
-`chmod 700 deploy.sh`, `chmod u=rwx,go= deploy.sh`, or anything else that reaches the same state passes.
+`chmod 700 deploy.sh`, `chmod u=rwx,go= deploy.sh`, or anything else that reaches the same state would pass.
 
 ## Architecture
+
+This is the target design; the [Status](#status) section lists what is implemented.
 
 ```
 Browser (linux-lab-web)
