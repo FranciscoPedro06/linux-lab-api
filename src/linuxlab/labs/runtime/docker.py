@@ -67,11 +67,15 @@ END_TERMINAL_SCRIPT = r"""
 import os, signal, sys, time
 
 marker = f"{sys.argv[1]}={sys.argv[2]}".encode()
-own_pid = os.getpid()
+# Never target this cleanup itself: its process, its parent (timeout) or its session.
+# Session ids are pids, and a pid freed by the terminal's shell can be reused here.
+own_pids = {os.getpid(), os.getppid()}
+own_session = os.getsid(0)
 
 
 def pids():
-    return [int(name) for name in os.listdir("/proc") if name.isdigit() and int(name) != own_pid]
+    found = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    return [pid for pid in found if pid not in own_pids]
 
 
 def alive(pid):
@@ -97,11 +101,15 @@ def sid(pid):
         return None
 
 
-sessions = {sid(pid) for pid in pids() if marked(pid)} - {None}
+sessions = {sid(pid) for pid in pids() if marked(pid)} - {None, own_session}
 
 
 def targets():
-    return [pid for pid in pids() if alive(pid) and (sid(pid) in sessions or marked(pid))]
+    return [
+        pid
+        for pid in pids()
+        if alive(pid) and sid(pid) != own_session and (sid(pid) in sessions or marked(pid))
+    ]
 
 
 for signum in (signal.SIGHUP, signal.SIGKILL):
@@ -246,7 +254,10 @@ class DockerRuntime:
             time_limit=TERMINAL_CLEANUP_SECONDS,
         )
         if result.exit_code != 0:
-            raise LabRuntimeError(f"{container_id}: terminal cleanup failed: {result.stderr!r}")
+            raise LabRuntimeError(
+                f"{container_id}: terminal cleanup failed: exit {result.exit_code}, "
+                f"timed out {result.timed_out}, stderr {result.stderr!r}"
+            )
         return int(result.stdout)
 
     async def stop(self, container_id: str) -> None:
