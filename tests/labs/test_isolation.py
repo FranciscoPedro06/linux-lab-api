@@ -294,6 +294,22 @@ async def test_only_loopback_interface(runtime: DockerRuntime, lab: ContainerInf
     assert result.stdout.decode().split() == ["lo"]
 
 
+async def test_localhost_is_available(runtime: DockerRuntime, lab: ContainerInfo) -> None:
+    script = (
+        "import socket\n"
+        "server = socket.create_server(('127.0.0.1', 0))\n"
+        "client = socket.create_connection(server.getsockname(), timeout=3)\n"
+        "connection, _ = server.accept()\n"
+        "client.sendall(b'ping')\n"
+        "print(connection.recv(4).decode())\n"
+    )
+    result = await runtime.exec(
+        lab.id, ["python3", "-I", "-c", script], user="student", time_limit=10
+    )
+
+    assert result.stdout == b"ping\n", result
+
+
 async def test_no_outbound_connectivity(runtime: DockerRuntime, lab: ContainerInfo) -> None:
     script = (
         "import socket\n"

@@ -48,7 +48,6 @@ def build_container_config(spec: LabContainerSpec, oci_runtime: str) -> dict[str
         "Hostname": "linuxlab",
         "Env": ["LANG=C.UTF-8"],
         "Labels": {MANAGED_LABEL: "true", LAB_ID_LABEL: spec.lab_id},
-        "NetworkDisabled": True,
         "HostConfig": {
             "Runtime": oci_runtime,
             "NetworkMode": "none",
