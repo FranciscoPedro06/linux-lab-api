@@ -20,7 +20,17 @@ STUDENT_HOME = "/home/student"
 
 MEMORY_BYTES = 512 * 1024 * 1024
 NANO_CPUS = 500_000_000  # 0.5 CPU
+
+# Process limits depend on the runtime.
+# runc: the cgroup PID limit counts the lab's processes; fork fails once it is reached.
+# runsc: the cgroup covers the gVisor sandbox's host threads (about two per guest
+# process plus a fixed overhead), and reaching it kills the whole sandbox. The limit
+# students see is RLIMIT_NPROC, which gVisor enforces inside each sandbox. It is not
+# used with runc, where it would count uid 1000 across every lab on the host.
+GVISOR_RUNTIMES = frozenset({"runsc"})
 PIDS_LIMIT = 128
+GVISOR_PIDS_LIMIT = 512
+GVISOR_NPROC_LIMIT = 128
 
 # Used only by platform processes that run as root through exec. The student
 # runs as uid 1000 with no-new-privileges and has no effective capabilities.
@@ -41,6 +51,7 @@ def container_name(lab_id: str) -> str:
 
 def build_container_config(spec: LabContainerSpec, oci_runtime: str) -> dict[str, Any]:
     """Docker Engine API body for POST /containers/create."""
+    gvisor = oci_runtime in GVISOR_RUNTIMES
     return {
         "Image": spec.image,
         "User": f"{STUDENT_UID}:{STUDENT_GID}",
@@ -60,17 +71,24 @@ def build_container_config(spec: LabContainerSpec, oci_runtime: str) -> dict[str
             "Memory": MEMORY_BYTES,
             "MemorySwap": MEMORY_BYTES,
             "NanoCpus": NANO_CPUS,
-            "PidsLimit": PIDS_LIMIT,
+            "PidsLimit": GVISOR_PIDS_LIMIT if gvisor else PIDS_LIMIT,
             "CapDrop": ["ALL"],
             "CapAdd": list(PLATFORM_CAPABILITIES),
             "SecurityOpt": ["no-new-privileges:true"],
             "IpcMode": "private",
-            "Ulimits": [
-                {"Name": "nofile", "Soft": 1024, "Hard": 1024},
-                {"Name": "core", "Soft": 0, "Hard": 0},
-            ],
+            "Ulimits": _ulimits(gvisor),
             "Init": False,
             "AutoRemove": False,
             "RestartPolicy": {"Name": "no"},
         },
     }
+
+
+def _ulimits(gvisor: bool) -> list[dict[str, Any]]:
+    ulimits: list[dict[str, Any]] = [
+        {"Name": "nofile", "Soft": 1024, "Hard": 1024},
+        {"Name": "core", "Soft": 0, "Hard": 0},
+    ]
+    if gvisor:
+        ulimits.append({"Name": "nproc", "Soft": GVISOR_NPROC_LIMIT, "Hard": GVISOR_NPROC_LIMIT})
+    return ulimits
