@@ -6,11 +6,7 @@ import pytest
 from linuxlab.labs.runtime import ContainerInfo
 from linuxlab.labs.runtime.docker import DockerRuntime
 
-from .support import LAB_IMAGE, OCI_RUNTIME, running_lab
-
-
-def pytest_report_header() -> str:
-    return f"lab runtime: {OCI_RUNTIME}, lab image: {LAB_IMAGE}"
+from .support import OCI_RUNTIME, running_lab
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
