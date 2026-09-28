@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "src/linuxlab/labs/**"
+      - "tests/labs/**"
       - "lab-image/**"
       - ".github/workflows/runtime.yml"
   workflow_dispatch:
