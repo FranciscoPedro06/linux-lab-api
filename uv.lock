@@ -373,6 +373,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiodocker" },
+    { name = "aiohttp" },
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "fastapi" },
@@ -393,6 +394,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiodocker", specifier = ">=0.27.0" },
+    { name = "aiohttp", specifier = ">=3.14.3" },
     { name = "alembic", specifier = ">=1.20.0" },
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "fastapi", specifier = ">=0.141.1" },
