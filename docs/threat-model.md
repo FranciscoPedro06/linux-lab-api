@@ -26,32 +26,34 @@ Built by a single function and covered by a snapshot test. Any change requires a
 | Runtime | `runsc` in production; the API refuses to start in production with any other runtime. `runc` in development only |
 | Network | `none` |
 | Rootfs | Read-only |
-| tmpfs | `/home/student` 64 MB, `/tmp` 32 MB, `/run/lab` 1 MB, all `nosuid,nodev` |
+| tmpfs | `/home/student` 64 MB and `/tmp` 32 MB with `exec`; `/run/lab` 1 MB with `noexec`; all `nosuid,nodev` |
 | Memory | 512 MB, no swap. tmpfs counts toward this limit |
 | CPU | 0.5 |
-| PIDs | 128 |
+| Processes | runc: cgroup PID limit 128. runsc: RLIMIT_NPROC 128 inside the sandbox and cgroup PID limit 512 on the host |
 | Capabilities | `drop ALL`; `add CHOWN, DAC_OVERRIDE, FOWNER, KILL` |
 | `no-new-privileges` | Enabled |
 | User | uid 1000 for the terminal; root only for platform execs |
 | Seccomp | Default profile, never `unconfined` |
 | Mounts | No bind mounts, devices or sockets |
 | Namespaces | No `privileged`, `pid=host`, `ipc=host` or `userns=host` |
-| ulimits | `nofile=1024`, `core=0` |
+| ulimits | `nofile=1024`, `core=0`; `nproc=128` under runsc only |
 | Init | tini; main process `sleep infinity` |
 
 The added capabilities are there for `labctl init`, `labctl probe` and `labctl kill-shell`, which run as root. The student has no effective capabilities and no path to uid 0: the image has no `sudo` and no setuid or setgid binaries, and `no-new-privileges` blocks privilege escalation.
 
-`ulimit nproc` is not used. That limit is counted per uid across the whole host, so uid 1000 in every lab would share one counter. Process limits come from the cgroup (`pids_limit`).
+The process limit is set differently per runtime. Under runc, `nproc` would be counted per uid across the whole host, so uid 1000 in every lab would share one counter; the cgroup PID limit is used instead. Under runsc, the cgroup PID limit counts the sandbox's host threads rather than student processes, and reaching it kills the sandbox, so it only protects the host; the limit students hit is `nproc`, which gVisor counts inside each sandbox.
 
 Under `runsc`, syscall filtering is done by gVisor itself.
+
+Observed differences between the runtimes are listed in [runtime.md](runtime.md#differences-between-runc-and-runsc).
 
 ## Resource exhaustion
 
 | Student action | Effect |
 |---|---|
-| Fork bomb | `fork` fails inside the lab; the host and other labs are unaffected |
-| CPU loop | Capped at 0.5 CPU |
-| Memory allocation | OOM inside the lab's cgroup; if the main process dies, the lab is marked `failed` |
+| Fork bomb | `fork` fails with EAGAIN at the process limit. Under runsc, a fork loop of heavy processes (about 5 MB of host memory each) exhausts memory first and the lab is OOM-killed. The host and other labs are unaffected in both cases |
+| CPU loop | Capped at 0.5 CPU, measured from host cgroup statistics |
+| Memory allocation | runc: the OOM killer ends the offending process and the lab keeps running. runsc: the whole sandbox is OOM-killed and the lab stops. The host and other labs are unaffected in both cases |
 | Disk writes | `ENOSPC` once the tmpfs is full |
 | Continuous terminal output | Capped at about 256 KB/s; writes to the PTY block |
 | Long-running processes | Killed with the container |
@@ -84,10 +86,9 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 
 ## Verification
 
-Isolation is checked by tests that run commands inside a real lab; results and the environment each was run in are in [runtime.md](runtime.md#verification-status).
+Isolation is checked by tests that run commands inside a real lab, under both runc and runsc; results and the environment each was run in are in [runtime.md](runtime.md#verification-status).
 
 Still open:
 
-1. All checks under `runsc`. They are automated in the `Runtime` workflow but have not run yet.
-2. Behavior of a process started by `docker exec` when the client disconnects. This depends on TTY execs and is part of the terminal work.
-3. How the API detects an OOM that kills the container's main process. The runtime tests only cover an OOM that kills the offending process while the container keeps running.
+1. Behavior of a process started by `docker exec` when the client disconnects. This depends on TTY execs and is part of the terminal work.
+2. Detecting that a lab stopped because of OOM, which under runsc is the normal outcome of exceeding memory, and reporting it to the student. This is part of the lab lifecycle work.
