@@ -26,10 +26,12 @@ PIDS_LIMIT = 128
 # runs as uid 1000 with no-new-privileges and has no effective capabilities.
 PLATFORM_CAPABILITIES = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL")
 
+# Docker mounts tmpfs noexec unless told otherwise. Students run their own scripts
+# from home and /tmp; /run/lab only holds platform data.
 TMPFS = {
-    STUDENT_HOME: f"rw,nosuid,nodev,size=64m,uid={STUDENT_UID},gid={STUDENT_GID},mode=0755",
-    "/tmp": "rw,nosuid,nodev,size=32m,mode=1777",
-    "/run/lab": f"rw,nosuid,nodev,size=1m,uid={STUDENT_UID},gid={STUDENT_GID},mode=0755",
+    STUDENT_HOME: f"rw,nosuid,nodev,exec,size=64m,uid={STUDENT_UID},gid={STUDENT_GID},mode=0755",
+    "/tmp": "rw,nosuid,nodev,exec,size=32m,mode=1777",
+    "/run/lab": f"rw,nosuid,nodev,noexec,size=1m,uid={STUDENT_UID},gid={STUDENT_GID},mode=0755",
 }
 
 
