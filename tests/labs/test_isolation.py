@@ -408,27 +408,40 @@ async def test_docker_managed_files_are_not_writable(
 # RLIMIT_NPROC under runsc (see spec.py).
 STUDENT_PROCESS_LIMIT = 128
 
-FORK_UNTIL_BLOCKED = (
-    "import os, signal, time\n"
-    "children, error = [], None\n"
-    "try:\n"
-    "    for _ in range(400):\n"
-    "        pid = os.fork()\n"
-    "        if pid == 0:\n"
-    "            time.sleep(60)\n"
-    "            os._exit(0)\n"
-    "        children.append(pid)\n"
-    "except OSError as exc:\n"
-    "    error = exc\n"
-    "for pid in children:\n"
-    "    os.kill(pid, signal.SIGKILL)\n"
-    "print(type(error).__name__, getattr(error, 'errno', None), len(children))\n"
-)
+# Forks until fork fails, then kills the children and reports the error.
+# Children either exec `sleep` (small processes) or stay as copies of the Python
+# interpreter. The distinction matters under gVisor, where each forked Python
+# process costs about 5 MB of host memory, so memory runs out before the process
+# limit; under runc copy-on-write keeps them almost free.
+FORK_UNTIL_BLOCKED = """
+import os, signal, sys, time
+exec_sleep = sys.argv[1] == "exec"
+children, error = [], None
+try:
+    for _ in range(400):
+        pid = os.fork()
+        if pid == 0:
+            if exec_sleep:
+                os.execv("/usr/bin/sleep", ["sleep", "60"])
+            time.sleep(60)
+            os._exit(0)
+        children.append(pid)
+except OSError as exc:
+    error = exc
+for pid in children:
+    os.kill(pid, signal.SIGKILL)
+print(type(error).__name__, getattr(error, "errno", None), len(children))
+"""
 
 
-async def fork_until_blocked(runtime: DockerRuntime, lab: ContainerInfo) -> tuple[str, str, int]:
+async def fork_until_blocked(
+    runtime: DockerRuntime, lab: ContainerInfo, children: str = "exec"
+) -> tuple[str, str, int]:
     result = await runtime.exec(
-        lab.id, ["python3", "-I", "-c", FORK_UNTIL_BLOCKED], user="student", time_limit=60
+        lab.id,
+        ["python3", "-I", "-c", FORK_UNTIL_BLOCKED, children],
+        user="student",
+        time_limit=60,
     )
     assert result.exit_code == 0, result
     error, errno, created = result.stdout.decode().split()
@@ -469,6 +482,33 @@ async def test_labs_have_independent_process_budgets(
 
     assert error == "BlockingIOError"
     assert created > held
+
+
+async def test_fork_loop_of_python_processes_is_contained(
+    runtime: DockerRuntime,
+    docker_client: aiodocker.Docker,
+    fresh_lab: ContainerInfo,
+    lab: ContainerInfo,
+) -> None:
+    result = await runtime.exec(
+        fresh_lab.id,
+        ["python3", "-I", "-c", FORK_UNTIL_BLOCKED, "python"],
+        user="student",
+        time_limit=60,
+    )
+    state = await _wait_until_stopped(docker_client, fresh_lab, seconds=3)
+    print(f"python fork loop: exit={result.exit_code} stdout={result.stdout!r} state={state}")
+
+    if OCI_RUNTIME == "runsc" and not state["Running"]:
+        # Memory ran out before the process limit and the sandbox was OOM-killed.
+        assert state["OOMKilled"] is True, state
+    else:
+        # fork failed with EAGAIN and the lab is still usable.
+        assert result.stdout.split()[:2] == [b"BlockingIOError", b"11"], result
+        assert state["Running"]
+
+    # The other lab is unaffected either way.
+    assert (await sh(runtime, lab, "true")).exit_code == 0
 
 
 async def test_memory_limit_is_enforced(
