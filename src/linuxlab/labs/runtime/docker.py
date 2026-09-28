@@ -254,6 +254,13 @@ class DockerRuntime:
             time_limit=TERMINAL_CLEANUP_SECONDS,
         )
         if result.exit_code != 0:
+            # The lab may have been removed or stopped while the cleanup ran; then
+            # there is nothing left to end.
+            try:
+                if not (await self.inspect(container_id)).running:
+                    return 0
+            except ContainerNotFoundError:
+                return 0
             raise LabRuntimeError(
                 f"{container_id}: terminal cleanup failed: exit {result.exit_code}, "
                 f"timed out {result.timed_out}, stderr {result.stderr!r}"
@@ -349,8 +356,8 @@ class DockerTerminalSession:
                     self._container_id,
                     remaining,
                 )
-        except ContainerNotRunningError:
-            pass  # The lab stopped (for example after an OOM); nothing is left to end.
+        except (ContainerNotRunningError, ContainerNotFoundError):
+            pass  # The lab stopped or was removed (for example after an OOM); nothing is left.
         if exited_on_its_own:
             self._exit_code = await self._exit_code_or_none()
         return self._exit_code

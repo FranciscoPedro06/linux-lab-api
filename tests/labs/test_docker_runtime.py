@@ -195,6 +195,25 @@ async def test_closing_a_terminal_leaves_other_terminals_running(
         await second.close()
 
 
+@pytest.mark.parametrize("ending", ["stop", "remove"])
+async def test_closing_a_terminal_after_its_lab_ended_is_not_an_error(
+    runtime: DockerRuntime, ending: str
+) -> None:
+    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    try:
+        await runtime.start(info.id)
+        terminal = await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))
+        await terminal.write(b"sleep 351\r")
+        if ending == "stop":
+            await runtime.stop(info.id)
+        else:
+            await runtime.remove(info.id)
+
+        await terminal.close()
+    finally:
+        await runtime.remove(info.id)
+
+
 async def test_terminal_requires_a_running_container(runtime: DockerRuntime) -> None:
     info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
     try:
