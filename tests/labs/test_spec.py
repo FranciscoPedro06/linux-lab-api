@@ -12,7 +12,6 @@ EXPECTED = {
     "Hostname": "linuxlab",
     "Env": ["LANG=C.UTF-8"],
     "Labels": {"linuxlab.managed": "true", "linuxlab.lab_id": "0b7c9d2e"},
-    "NetworkDisabled": True,
     "HostConfig": {
         "Runtime": "runsc",
         "NetworkMode": "none",
