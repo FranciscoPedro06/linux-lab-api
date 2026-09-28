@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 
@@ -11,10 +12,11 @@ from linuxlab.labs.runtime import (
     LabContainerSpec,
     LabRuntime,
     RuntimeUnavailableError,
+    TerminalSize,
 )
 from linuxlab.labs.runtime.docker import MAX_OUTPUT_BYTES, DockerRuntime
 
-from .support import LAB_IMAGE, sh
+from .support import LAB_IMAGE, processes, read_until, sh
 
 pytestmark = pytest.mark.docker
 
@@ -105,3 +107,90 @@ async def test_operations_on_missing_container_raise(runtime: DockerRuntime) -> 
         await runtime.inspect("ll-lab-does-not-exist")
     with pytest.raises(ContainerNotFoundError):
         await runtime.start("ll-lab-does-not-exist")
+
+
+# Interactive terminals
+
+
+async def test_terminal_is_a_login_shell_on_a_pty_as_student(
+    runtime: DockerRuntime, lab: ContainerInfo
+) -> None:
+    terminal = await runtime.open_terminal(lab.id, TerminalSize(cols=80, rows=24))
+    try:
+        await terminal.write(b"id -un; tty; stty size; echo $TERM\r")
+        output = await read_until(terminal, b"xterm-256color\r\n")
+    finally:
+        await terminal.close()
+
+    assert b"student\r\n" in output
+    assert b"/dev/pts/" in output
+    assert b"24 80\r\n" in output
+
+
+async def test_terminal_resize_reaches_the_pty(runtime: DockerRuntime, lab: ContainerInfo) -> None:
+    terminal = await runtime.open_terminal(lab.id, TerminalSize(cols=80, rows=24))
+    try:
+        await terminal.resize(TerminalSize(cols=132, rows=40))
+        await terminal.write(b"stty size\r")
+        output = await read_until(terminal, b"40 132\r\n")
+    finally:
+        await terminal.close()
+
+    assert b"40 132" in output
+
+
+async def test_terminal_reports_the_shell_exit_code(
+    runtime: DockerRuntime, lab: ContainerInfo
+) -> None:
+    terminal = await runtime.open_terminal(lab.id, TerminalSize(cols=80, rows=24))
+    await terminal.write(b"exit 3\r")
+    async with asyncio.timeout(10):
+        while await terminal.read() is not None:
+            pass
+
+    assert await terminal.close() == 3
+    assert await terminal.close() == 3
+
+
+async def test_closing_a_terminal_ends_its_processes(
+    runtime: DockerRuntime, lab: ContainerInfo
+) -> None:
+    terminal = await runtime.open_terminal(lab.id, TerminalSize(cols=80, rows=24))
+    await terminal.write(b"sleep 311 & setsid sleep 312 & sleep 313\r")
+    await asyncio.sleep(1)
+    assert len(await processes(runtime, lab, "sleep 31[123]")) == 3
+
+    await terminal.close()
+
+    assert await processes(runtime, lab, "sleep 31[123]") == []
+    assert await processes(runtime, lab, "bash --login") == []
+
+
+async def test_closing_a_terminal_leaves_other_terminals_running(
+    runtime: DockerRuntime, lab: ContainerInfo
+) -> None:
+    first = await runtime.open_terminal(lab.id, TerminalSize(cols=80, rows=24))
+    second = await runtime.open_terminal(lab.id, TerminalSize(cols=80, rows=24))
+    try:
+        await first.write(b"sleep 321\r")
+        await second.write(b"sleep 322 &\r")
+        await asyncio.sleep(1)
+
+        await first.close()
+
+        assert await processes(runtime, lab, "sleep 321") == []
+        assert len(await processes(runtime, lab, "sleep 322")) == 1
+        await second.write(b"echo still-here\r")
+        assert b"still-here" in await read_until(second, b"still-here\r\n")
+    finally:
+        await first.close()
+        await second.close()
+
+
+async def test_terminal_requires_a_running_container(runtime: DockerRuntime) -> None:
+    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    try:
+        with pytest.raises(ContainerNotRunningError):
+            await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))
+    finally:
+        await runtime.remove(info.id)

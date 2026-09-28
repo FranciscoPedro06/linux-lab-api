@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import time
+import uuid
 from collections.abc import Sequence
 from typing import Any
 
@@ -7,6 +9,7 @@ import aiodocker
 import aiohttp
 from aiodocker.exceptions import DockerError
 from aiodocker.execs import Exec
+from aiodocker.stream import Stream
 
 from linuxlab.labs.runtime.base import (
     ContainerInfo,
@@ -17,6 +20,7 @@ from linuxlab.labs.runtime.base import (
     LabContainerSpec,
     LabRuntimeError,
     RuntimeUnavailableError,
+    TerminalSize,
 )
 from linuxlab.labs.runtime.spec import (
     LABEL_PREFIX,
@@ -26,6 +30,8 @@ from linuxlab.labs.runtime.spec import (
     build_container_config,
     container_name,
 )
+
+logger = logging.getLogger(__name__)
 
 EXEC_IDENTITIES: dict[ExecUser, tuple[str, str]] = {
     "student": (f"{STUDENT_UID}:{STUDENT_GID}", STUDENT_HOME),
@@ -46,6 +52,69 @@ TIMEOUT_EXIT_CODE = 124
 KILLED_EXIT_CODE = 137
 
 STOP_GRACE_SECONDS = 2
+
+TERMINAL_COMMAND = ["bash", "--login"]
+TERMINAL_MARKER = "LINUXLAB_TERMINAL"
+TERMINAL_CONTROL_SECONDS = 5
+TERMINAL_CLEANUP_SECONDS = 10
+
+# Closing the connection to a TTY exec does not end anything inside the container:
+# the shell and everything started from it keep running. On close, this runs as the
+# student and ends the terminal the way a hangup would: SIGHUP, then SIGKILL, to every
+# process in the shell's session and every process that still carries the terminal's
+# marker (for example after setsid). It only reaches the student's own processes.
+END_TERMINAL_SCRIPT = r"""
+import os, signal, sys, time
+
+marker = f"{sys.argv[1]}={sys.argv[2]}".encode()
+own_pid = os.getpid()
+
+
+def pids():
+    return [int(name) for name in os.listdir("/proc") if name.isdigit() and int(name) != own_pid]
+
+
+def alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat:
+            return stat.read().rsplit(b")", 1)[1].split()[0] != b"Z"
+    except (OSError, IndexError):
+        return False
+
+
+def marked(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as environ:
+            return marker in environ.read().split(b"\0")
+    except OSError:
+        return False
+
+
+def sid(pid):
+    try:
+        return os.getsid(pid)
+    except OSError:
+        return None
+
+
+sessions = {sid(pid) for pid in pids() if marked(pid)} - {None}
+
+
+def targets():
+    return [pid for pid in pids() if alive(pid) and (sid(pid) in sessions or marked(pid))]
+
+
+for signum in (signal.SIGHUP, signal.SIGKILL):
+    for pid in targets():
+        try:
+            os.kill(pid, signum)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 1
+    while targets() and time.monotonic() < deadline:
+        time.sleep(0.05)
+print(len(targets()))
+"""
 
 
 class DockerRuntime:
@@ -143,6 +212,43 @@ class DockerRuntime:
             truncated=truncated,
         )
 
+    async def open_terminal(self, container_id: str, size: TerminalSize) -> "DockerTerminalSession":
+        if not (await self.inspect(container_id)).running:
+            raise ContainerNotRunningError(container_id)
+
+        token = uuid.uuid4().hex
+        uid_gid, workdir = EXEC_IDENTITIES["student"]
+        try:
+            execution = await self._client.containers.container(container_id).exec(
+                cmd=TERMINAL_COMMAND,
+                user=uid_gid,
+                environment=[*EXEC_ENV, "TERM=xterm-256color", f"{TERMINAL_MARKER}={token}"],
+                workdir=workdir,
+                stdin=True,
+                stdout=True,
+                stderr=True,
+                tty=True,
+            )
+            stream = execution.start(detach=False)
+            async with asyncio.timeout(TERMINAL_CONTROL_SECONDS):
+                await stream.__aenter__()
+                await execution.resize(h=size.rows, w=size.cols)
+        except (DockerError, aiohttp.ClientError, OSError, TimeoutError) as error:
+            raise LabRuntimeError(f"{container_id}: could not start terminal: {error}") from error
+        return DockerTerminalSession(self, container_id, execution, stream, token)
+
+    async def end_terminal_processes(self, container_id: str, token: str) -> int:
+        """Hang up a terminal's processes. Returns how many are still alive afterwards."""
+        result = await self.exec(
+            container_id,
+            ["python3", "-I", "-c", END_TERMINAL_SCRIPT, TERMINAL_MARKER, token],
+            user="student",
+            time_limit=TERMINAL_CLEANUP_SECONDS,
+        )
+        if result.exit_code != 0:
+            raise LabRuntimeError(f"{container_id}: terminal cleanup failed: {result.stderr!r}")
+        return int(result.stdout)
+
     async def stop(self, container_id: str) -> None:
         try:
             await self._client.containers.container(container_id).stop(t=STOP_GRACE_SECONDS)
@@ -161,6 +267,89 @@ class DockerRuntime:
             return await self._client.containers.container(container_id).show()
         except DockerError as error:
             raise _translate(error, container_id) from error
+
+
+class DockerTerminalSession:
+    """A `bash --login` exec with a PTY (Tty=true, stdin attached) as the student.
+
+    With a TTY, Docker sends raw output bytes rather than the multiplexed stdout/stderr
+    format, and input is written to the PTY as-is: keystrokes, control characters and
+    escape sequences reach the shell exactly as the browser sent them.
+    """
+
+    def __init__(
+        self,
+        runtime: DockerRuntime,
+        container_id: str,
+        execution: Exec,
+        stream: Stream,
+        token: str,
+    ) -> None:
+        self._runtime = runtime
+        self._container_id = container_id
+        self._execution = execution
+        self._stream = stream
+        self._token = token
+        self._exited = False
+        self._closed = False
+        self._exit_code: int | None = None
+
+    async def read(self) -> bytes | None:
+        if self._exited:
+            return None
+        try:
+            message = await self._stream.read_out()
+        except (DockerError, aiohttp.ClientError, OSError) as error:
+            raise LabRuntimeError(f"{self._container_id}: terminal read failed: {error}") from error
+        if message is None:
+            self._exited = True
+            return None
+        return message.data
+
+    async def write(self, data: bytes) -> None:
+        try:
+            async with asyncio.timeout(TERMINAL_CONTROL_SECONDS):
+                await self._stream.write_in(data)
+        except (DockerError, aiohttp.ClientError, OSError, RuntimeError, TimeoutError) as error:
+            raise LabRuntimeError(
+                f"{self._container_id}: terminal write failed: {error}"
+            ) from error
+
+    async def resize(self, size: TerminalSize) -> None:
+        try:
+            async with asyncio.timeout(TERMINAL_CONTROL_SECONDS):
+                await self._execution.resize(h=size.rows, w=size.cols)
+        except (DockerError, aiohttp.ClientError, OSError, TimeoutError) as error:
+            raise LabRuntimeError(
+                f"{self._container_id}: terminal resize failed: {error}"
+            ) from error
+
+    async def close(self) -> int | None:
+        if self._closed:
+            return self._exit_code
+        self._closed = True
+        exited_on_its_own = self._exited
+        await self._stream.close()
+        try:
+            remaining = await self._runtime.end_terminal_processes(self._container_id, self._token)
+            if remaining:
+                logger.warning(
+                    "terminal processes still alive after cleanup: container=%s count=%d",
+                    self._container_id,
+                    remaining,
+                )
+        except ContainerNotRunningError:
+            pass  # The lab stopped (for example after an OOM); nothing is left to end.
+        if exited_on_its_own:
+            self._exit_code = await self._exit_code_or_none()
+        return self._exit_code
+
+    async def _exit_code_or_none(self) -> int | None:
+        try:
+            async with asyncio.timeout(TERMINAL_CONTROL_SECONDS):
+                return await _wait_exit_code(self._execution)
+        except (DockerError, aiohttp.ClientError, OSError, TimeoutError):
+            return None
 
 
 def _translate(error: DockerError, container_id: str) -> LabRuntimeError:

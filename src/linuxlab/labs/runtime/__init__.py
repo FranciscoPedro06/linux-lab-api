@@ -8,6 +8,8 @@ from linuxlab.labs.runtime.base import (
     LabRuntime,
     LabRuntimeError,
     RuntimeUnavailableError,
+    TerminalSession,
+    TerminalSize,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     "LabRuntime",
     "LabRuntimeError",
     "RuntimeUnavailableError",
+    "TerminalSession",
+    "TerminalSize",
 ]

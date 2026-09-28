@@ -11,6 +11,7 @@ from linuxlab.labs.runtime import (
     LabRuntime,
     LabRuntimeError,
     RuntimeUnavailableError,
+    TerminalSize,
 )
 from linuxlab.labs.runtime.fake import ExecCall, FakeRuntime
 
@@ -106,3 +107,56 @@ async def test_exec_rejects_invalid_arguments(argv: list[str], time_limit: float
 async def test_ping_reports_unavailable_runtime() -> None:
     with pytest.raises(RuntimeUnavailableError):
         await FakeRuntime(available=False).ping()
+
+
+@pytest.mark.parametrize(("cols", "rows"), [(0, 24), (80, 0), (501, 24), (80, 201), (-1, -1)])
+def test_terminal_size_rejects_out_of_range_values(cols: int, rows: int) -> None:
+    with pytest.raises(ValueError):
+        TerminalSize(cols, rows)
+
+
+def test_terminal_size_accepts_bounds() -> None:
+    assert TerminalSize(1, 1) == TerminalSize(cols=1, rows=1)
+    assert TerminalSize(500, 200).cols == 500
+
+
+async def test_containers_can_be_found_by_name() -> None:
+    runtime = FakeRuntime()
+    info = await runtime.create(SPEC)
+
+    assert (await runtime.inspect(info.name)).id == info.id
+
+
+async def test_fake_terminal_echoes_input_and_reports_exit() -> None:
+    runtime = FakeRuntime()
+    info = await runtime.create(SPEC)
+    await runtime.start(info.id)
+
+    terminal = await runtime.open_terminal(info.id, TerminalSize(80, 24))
+    await terminal.write(b"ls\r")
+    await terminal.resize(TerminalSize(100, 30))
+    terminal.exit(0)
+
+    assert await terminal.read() == b"ls\r"
+    assert await terminal.read() is None
+    assert await terminal.close() == 0
+    assert terminal.resizes == [TerminalSize(100, 30)]
+
+
+async def test_fake_terminal_close_unblocks_reader() -> None:
+    runtime = FakeRuntime()
+    info = await runtime.create(SPEC)
+    await runtime.start(info.id)
+    terminal = await runtime.open_terminal(info.id, TerminalSize(80, 24))
+
+    await terminal.close()
+
+    assert await terminal.read() is None
+
+
+async def test_terminal_requires_running_container() -> None:
+    runtime = FakeRuntime()
+    info = await runtime.create(SPEC)
+
+    with pytest.raises(ContainerNotRunningError):
+        await runtime.open_terminal(info.id, TerminalSize(80, 24))
