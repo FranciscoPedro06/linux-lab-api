@@ -11,7 +11,13 @@ import pytest
 
 from linuxlab.labs.runtime import ContainerInfo, ExecUser
 from linuxlab.labs.runtime.docker import DockerRuntime
-from linuxlab.labs.runtime.spec import MEMORY_BYTES, NANO_CPUS, PIDS_LIMIT
+from linuxlab.labs.runtime.spec import (
+    GVISOR_NPROC_LIMIT,
+    GVISOR_PIDS_LIMIT,
+    MEMORY_BYTES,
+    NANO_CPUS,
+    PIDS_LIMIT,
+)
 
 from .support import OCI_RUNTIME, docker_inspect, running_lab, sh
 
@@ -396,36 +402,71 @@ async def test_docker_managed_files_are_not_writable(
 # Resources
 
 
-async def test_pids_limit_contains_process_creation(
+# The number of processes a student can have: the cgroup PID limit under runc,
+# RLIMIT_NPROC under runsc (see spec.py).
+STUDENT_PROCESS_LIMIT = 128
+
+FORK_UNTIL_BLOCKED = (
+    "import os, signal, time\n"
+    "children, error = [], None\n"
+    "try:\n"
+    "    for _ in range(400):\n"
+    "        pid = os.fork()\n"
+    "        if pid == 0:\n"
+    "            time.sleep(60)\n"
+    "            os._exit(0)\n"
+    "        children.append(pid)\n"
+    "except OSError as exc:\n"
+    "    error = exc\n"
+    "for pid in children:\n"
+    "    os.kill(pid, signal.SIGKILL)\n"
+    "print(type(error).__name__, getattr(error, 'errno', None), len(children))\n"
+)
+
+
+async def fork_until_blocked(runtime: DockerRuntime, lab: ContainerInfo) -> tuple[str, str, int]:
+    result = await runtime.exec(
+        lab.id, ["python3", "-I", "-c", FORK_UNTIL_BLOCKED], user="student", time_limit=60
+    )
+    assert result.exit_code == 0, result
+    error, errno, created = result.stdout.decode().split()
+    return error, errno, int(created)
+
+
+async def test_process_creation_is_limited_inside_the_lab(
     runtime: DockerRuntime, docker_client: aiodocker.Docker, fresh_lab: ContainerInfo
 ) -> None:
-    details = await docker_inspect(docker_client, fresh_lab)
-    assert details["HostConfig"]["PidsLimit"] == PIDS_LIMIT
+    host_config = (await docker_inspect(docker_client, fresh_lab))["HostConfig"]
+    nproc = [limit for limit in host_config["Ulimits"] if limit["Name"] == "nproc"]
+    if OCI_RUNTIME == "runsc":
+        assert host_config["PidsLimit"] == GVISOR_PIDS_LIMIT
+        assert nproc == [{"Name": "nproc", "Soft": GVISOR_NPROC_LIMIT, "Hard": GVISOR_NPROC_LIMIT}]
+    else:
+        assert host_config["PidsLimit"] == PIDS_LIMIT
+        assert nproc == []
 
-    script = (
-        "import os, signal, time\n"
-        "children, blocked = [], False\n"
-        "try:\n"
-        "    for _ in range(400):\n"
-        "        pid = os.fork()\n"
-        "        if pid == 0:\n"
-        "            time.sleep(60)\n"
-        "            os._exit(0)\n"
-        "        children.append(pid)\n"
-        "except OSError:\n"
-        "    blocked = True\n"
-        "for pid in children:\n"
-        "    os.kill(pid, signal.SIGKILL)\n"
-        "print(blocked, len(children))\n"
-    )
-    result = await runtime.exec(
-        fresh_lab.id, ["python3", "-I", "-c", script], user="student", time_limit=60
-    )
-    blocked, created = result.stdout.split()
+    error, errno, created = await fork_until_blocked(runtime, fresh_lab)
 
-    assert blocked == b"True", result
-    assert 0 < int(created) < PIDS_LIMIT
+    # fork fails cleanly with EAGAIN before the limit, and the lab keeps working.
+    assert (error, errno) == ("BlockingIOError", "11")
+    assert 0 < created < STUDENT_PROCESS_LIMIT
     assert (await runtime.inspect(fresh_lab.id)).running
+    assert (await sh(runtime, fresh_lab, "true")).exit_code == 0
+
+
+async def test_labs_have_independent_process_budgets(
+    runtime: DockerRuntime, fresh_lab: ContainerInfo
+) -> None:
+    held = 100
+    await sh(runtime, fresh_lab, f"for i in $(seq {held}); do sleep 120 >/dev/null 2>&1 & done")
+    running = await sh(runtime, fresh_lab, "pgrep -c -x sleep")
+    assert int(running.stdout) >= held, running
+
+    async with running_lab(runtime) as other:
+        error, _errno, created = await fork_until_blocked(runtime, other)
+
+    assert error == "BlockingIOError"
+    assert created > held
 
 
 async def test_memory_limit_kills_oversized_allocation(
