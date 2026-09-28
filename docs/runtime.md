@@ -19,6 +19,7 @@ LabRuntime (protocol)          src/linuxlab/labs/runtime/base.py
 | `start(id)`, `stop(id)` | Start, or stop with a 2 second grace period |
 | `inspect(id)` | Name, running state and `linuxlab.*` labels |
 | `exec(id, argv, user, time_limit)` | Runs argv without a shell as `student` or `root` |
+| `open_terminal(id, size)` | Starts `bash --login` as the student on a PTY and returns a `TerminalSession` (read, write, resize, close); see [terminal.md](terminal.md) |
 | `remove(id)` | Force-removes the container; a missing container is not an error |
 
 `exec` details:
@@ -134,4 +135,4 @@ Every check runs commands inside a real lab and asserts what was allowed, not wh
 - Under gVisor a lab that exceeds its memory stops, including when many heavy processes are forked. The host and other labs are unaffected, but the student loses the environment. Detecting this and telling the student is left for the lab lifecycle work (increment 05).
 - The process limit under gVisor relies on `nproc` being reached before the sandbox's 512 host threads. This holds for 128 student processes (about 290 host threads observed), with margin for platform execs.
 - The CPU check measures one busy thread for 5 seconds. It shows the quota is applied, not how it behaves under contention.
-- What happens to an exec'd process when its client disconnects is left for the terminal (increment 03), which uses TTY execs.
+- Closing the connection to a TTY exec leaves the shell and its processes running; terminal sessions end them explicitly on close (see [terminal.md](terminal.md#disconnection-and-cleanup)).

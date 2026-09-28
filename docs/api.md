@@ -94,48 +94,17 @@ Creation is synchronous and takes a few seconds.
 
 ## Terminal
 
-### Handshake
+`WS /ws/labs/{id}/terminal`. The protocol, limits and connection lifecycle are described in [terminal.md](terminal.md).
 
-1. `Origin` must be listed in `ALLOWED_ORIGINS`, otherwise the handshake is rejected with HTTP 403.
-2. The connection is accepted.
-3. Invalid session: closed with `4401`.
-4. Lab missing, owned by another user, or not `ready`: closed with `4404`.
-5. The client sends `init` with the terminal size within 5 seconds.
-6. If another connection exists for the lab, it is closed with `4409`.
-7. The API starts the shell and begins streaming.
-
-### Messages
-
-Binary frames carry terminal bytes in both directions, up to 64 KB per message.
-
-Text frames carry JSON control messages.
-
-Client to server:
-
-```json
-{ "type": "init", "cols": 120, "rows": 32 }
-{ "type": "resize", "cols": 140, "rows": 40 }
-```
-
-`cols` and `rows` accept values from 1 to 500.
-
-Server to client:
-
-```json
-{ "type": "status", "state": "ready", "expires_at": "2026-09-27T18:00:00Z" }
-{ "type": "warning", "kind": "expiring", "seconds": 300 }
-{ "type": "exit", "code": 0 }
-```
-
-The server pings every 20 seconds and drops the connection after 60 seconds without a pong.
-
-### Close codes
+In short: binary frames carry terminal bytes both ways; the client sends `init` (then `resize`) as JSON with `cols` and `rows`; the server answers `ready`, and sends `exit` or `error` before closing.
 
 | Code | Meaning | Expected client behavior |
 |---|---|---|
+| HTTP 403 | `Origin` not allowed | None; the page is not served from an allowed origin |
+| 1008, 1009 | Invalid or oversized message | Report the error; a client bug |
+| 1011 | Runtime failure | Offer to reconnect |
 | 4000 | Shell exited | Offer a new shell; do not reconnect automatically |
-| 4401 | Invalid session | Redirect to login |
-| 4404 | Lab unavailable | Query `GET /api/labs/current` |
+| 4404 | Lab unavailable | Show that the lab is not available |
 | 4409 | Terminal opened by another connection | Tell the user and let them take it back; do not reconnect automatically |
-| 4410 | Lab ended (reset, expiry, mission switch) | Query `GET /api/labs/current` |
-| 1006, 1011 | Connection lost or server error | Reconnect with backoff from 0.5 s to 8 s, up to 6 attempts |
+
+Planned with authentication and lab sessions: a session check on the handshake (`4401`), closing when the lab ends (`4410`), status and expiry messages, and automatic reconnection with backoff.

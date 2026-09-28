@@ -101,7 +101,14 @@ Clone [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web) next to
 docker compose -f infra/compose.yml up --build
 ```
 
-This starts PostgreSQL, the API with auto-reload and the Vite dev server, and applies migrations on startup.
+This starts PostgreSQL, the API with auto-reload and the Vite dev server, and applies migrations on startup. The API gets the Docker socket and the terminal without authentication (`DEV_TERMINAL_ACCESS`), which are for local development only.
+
+To open a terminal, build the lab image, create a lab and open the address it prints:
+
+```sh
+docker build --tag linuxlab/lab-base:dev lab-image
+docker compose -f infra/compose.yml exec api python -m linuxlab.labs.devlab create
+```
 
 | Service | Address |
 |---|---|
@@ -131,7 +138,7 @@ uv run ruff format --check
 uv run mypy
 uv run pytest                  # unit tests
 uv run pytest -m integration   # requires PostgreSQL at DATABASE_URL
-uv run pytest -m docker        # lab runtime and isolation, requires Docker and the lab image
+uv run pytest -m docker        # lab runtime, isolation and terminal, requires Docker and the lab image
 ```
 
 Lab runtime tests, gVisor setup and the list of isolation checks are described in [docs/runtime.md](docs/runtime.md).
@@ -147,7 +154,7 @@ Planned coverage as the project grows:
 
 ## Status
 
-Increments 01 and 02 are implemented: application skeleton, database connection, local environment and CI, then the lab image and the lab runtime with isolation tests. The runtime is not yet used by the HTTP API. Planned order:
+Increments 01 to 03 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; and the terminal, a WebSocket to a real shell in the lab. Lab creation, authentication and ownership checks come next, so the terminal is only available in development. Planned order:
 
 | # | Increment |
 |---|---|
@@ -171,6 +178,7 @@ Increments 01 and 02 are implemented: application skeleton, database connection,
 - [docs/api.md](docs/api.md): HTTP endpoints and terminal protocol
 - [docs/missions.md](docs/missions.md): mission format and authoring rules
 - [docs/runtime.md](docs/runtime.md): lab runtime, gVisor setup and verification status
+- [docs/terminal.md](docs/terminal.md): terminal protocol, lifecycle and limits
 - [docs/threat-model.md](docs/threat-model.md): isolation, limits and accepted risks
 
 ## License

@@ -14,7 +14,7 @@ Controls that rely on the student not being root are defense in depth, never the
 | Lab to network | `network_mode: none` |
 | Lab to other labs | Separate containers, no network, per-cgroup resource limits |
 | Lab to API | No channel initiated by the lab; `labctl` output is treated as untrusted input |
-| Browser to another user's lab | Ownership check on every route and on the WebSocket handshake |
+| Browser to another user's lab | Ownership check on every route and on the WebSocket handshake. Until user sessions exist, the terminal is available only with `DEV_TERMINAL_ACCESS` and trusts any running platform lab whose id is known |
 | Third-party site to user session | `SameSite=Lax` cookie, `Origin` check, JSON-only API |
 
 ## Container configuration
@@ -55,7 +55,7 @@ Observed differences between the runtimes are listed in [runtime.md](runtime.md#
 | CPU loop | Capped at 0.5 CPU, measured from host cgroup statistics |
 | Memory allocation | runc: the OOM killer ends the offending process and the lab keeps running. runsc: the whole sandbox is OOM-killed and the lab stops. The host and other labs are unaffected in both cases |
 | Disk writes | `ENOSPC` once the tmpfs is full |
-| Continuous terminal output | Capped at about 256 KB/s; writes to the PTY block |
+| Continuous terminal output | Paced at about 256 KiB/s per connection; the PTY buffer fills and the writing process blocks |
 | Long-running processes | Killed with the container |
 | Repeated lab creation | One lab per user (constraint), rate limit and global cap |
 
@@ -88,7 +88,8 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 
 Isolation is checked by tests that run commands inside a real lab, under both runc and runsc; results and the environment each was run in are in [runtime.md](runtime.md#verification-status).
 
+A process started by `docker exec` keeps running when the client disconnects. Terminal sessions therefore end their shell and every process started from it when the connection ends, running the cleanup as the student ([terminal.md](terminal.md#disconnection-and-cleanup)).
+
 Still open:
 
-1. Behavior of a process started by `docker exec` when the client disconnects. This depends on TTY execs and is part of the terminal work.
-2. Detecting that a lab stopped because of OOM, which under runsc is the normal outcome of exceeding memory, and reporting it to the student. This is part of the lab lifecycle work.
+1. Detecting that a lab stopped because of OOM, which under runsc is the normal outcome of exceeding memory, and reporting it to the student. This is part of the lab lifecycle work.
