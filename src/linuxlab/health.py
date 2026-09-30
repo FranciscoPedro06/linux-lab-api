@@ -2,15 +2,17 @@ import asyncio
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Request, Response
+from fastapi import Request, Response
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from linuxlab.api import api_router
+
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = api_router()
 
 CHECK_TIMEOUT_SECONDS = 3
 
