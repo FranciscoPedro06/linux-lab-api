@@ -4,12 +4,13 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy.engine import Connection
 
+from linuxlab.auth import models as auth_models  # noqa: F401  (registers the tables)
 from linuxlab.config import get_settings
 from linuxlab.db import Base, create_engine
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
