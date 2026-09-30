@@ -7,8 +7,11 @@ from fastapi import FastAPI
 
 from linuxlab import health
 from linuxlab.api import install_error_handlers
+from linuxlab.auth import router as auth
+from linuxlab.auth.passwords import Passwords
+from linuxlab.auth.ratelimit import RateLimiter
 from linuxlab.config import Settings, get_settings
-from linuxlab.db import create_engine
+from linuxlab.db import create_engine, create_sessionmaker
 from linuxlab.labs.access import DevelopmentLabAccess
 from linuxlab.labs.runtime import LabRuntime
 from linuxlab.labs.runtime.docker import DockerRuntime
@@ -28,6 +31,9 @@ def create_app(
         engine = create_engine(settings.database_url)
         app.state.settings = settings
         app.state.engine = engine
+        app.state.sessionmaker = create_sessionmaker(engine)
+        app.state.passwords = Passwords()
+        app.state.auth_rate_limits = {"signup": RateLimiter(), "login": RateLimiter()}
         docker: aiodocker.Docker | None = None
         if settings.dev_terminal_access:
             runtime = lab_runtime
@@ -47,6 +53,7 @@ def create_app(
     app = FastAPI(title="Linux Lab API", lifespan=lifespan)
     install_error_handlers(app)
     app.include_router(health.router)
+    app.include_router(auth.router)
     if settings.dev_terminal_access:
         app.include_router(terminal.router)
     return app

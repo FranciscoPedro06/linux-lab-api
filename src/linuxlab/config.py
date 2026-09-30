@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Annotated, Any
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -17,8 +17,13 @@ class LabSettings(BaseSettings):
 class Settings(LabSettings):
     database_url: str
 
-    # Origins allowed to open a WebSocket, comma-separated in the environment.
+    # Origins allowed to send non-GET API requests and to open a WebSocket,
+    # comma-separated in the environment.
     allowed_origins: Annotated[frozenset[str], NoDecode] = frozenset()
+
+    # Invite code required to sign up during the closed beta. Unset or empty
+    # disables sign-up.
+    signup_invite_code: SecretStr | None = None
 
     # Enables the terminal WebSocket without authentication, for local development.
     # Anyone who can reach the API and knows a lab id can use that lab.
@@ -29,6 +34,13 @@ class Settings(LabSettings):
     def _split_origins(cls, value: Any) -> Any:
         if isinstance(value, str):
             return frozenset(origin.strip() for origin in value.split(",") if origin.strip())
+        return value
+
+    @field_validator("signup_invite_code", mode="before")
+    @classmethod
+    def _empty_invite_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
         return value
 
 
