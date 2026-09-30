@@ -156,25 +156,34 @@ Before storing, the API redacts common secret patterns (`password=`, `token=`, `
 
 ## Authentication
 
-Server-side sessions with an opaque cookie:
+Implemented in increment 04, in `src/linuxlab/auth/`. Server-side sessions with an opaque cookie:
 
-- 32-byte random token; the database stores only its SHA-256;
-- `__Host-sid` cookie with `HttpOnly`, `Secure`, `SameSite=Lax` and `Path=/`;
-- 7-day idle expiry and 30-day absolute expiry;
-- Argon2id password hashing, run in a thread pool so it does not block the event loop;
-- in-memory rate limits on login, sign-up, lab creation and validation;
-- sign-up gated by an invite code during the closed beta.
+- 32-byte random token (`secrets.token_urlsafe`); the database stores only its SHA-256, and the token reaches the client only in the cookie;
+- `__Host-sid` cookie with `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/` and no `Domain`, and a `Max-Age` of 30 days;
+- a session is valid while it has been used in the last 7 days (idle expiry) and is less than 30 days old (absolute expiry, fixed at creation and never extended). `last_seen_at` is updated at most once every 5 minutes, so authenticated requests do not each write to the database. An expired session is deleted when it is next presented;
+- logout deletes the current session and clears the cookie; other sessions of the same user are not affected. Ending the user's lab on logout comes with lab sessions (increment 05);
+- Argon2id password hashing (`argon2-cffi` defaults: RFC 9106 low-memory parameters) in worker threads, with at most two hashes running at once, so it neither blocks the event loop nor takes unbounded CPU and memory;
+- a login for an unknown email verifies the password against a dummy hash, so its timing and response match a wrong password;
+- passwords of 12 to 128 characters with no composition rules; emails stripped and lowercased, ASCII only, unique case-insensitively through a unique index on `lower(email)`; display names stripped, 1 to 80 characters, without control characters, stored as plain text;
+- in-memory rate limits on sign-up and login: 5 attempts per 15 minutes per endpoint and peer address, checked before any Argon2 work;
+- sign-up gated by a single invite code from `SIGNUP_INVITE_CODE`, compared in constant time. Without it, sign-up is disabled.
 
-CSRF protection: `SameSite=Lax`, a required `Origin` header matching the allowlist on every non-GET request, and a JSON-only API. The WebSocket checks `Origin` before accepting the connection.
+The rate limit uses the address of the TCP peer; `X-Forwarded-For` is ignored and uvicorn runs with `--no-proxy-headers`. Behind a reverse proxy every client would share the proxy's address, so the key has to change when Caddy is deployed. State lives in the single API process and resets on restart.
+
+CSRF protection: `SameSite=Lax`, a required `Origin` header matching the allowlist on every non-GET request, and a JSON-only API. Both are checked for every HTTP route under `/api` before the body is read (`ApiRoute` in `src/linuxlab/api.py`). The WebSocket checks `Origin` before accepting the connection.
+
+The terminal is not tied to accounts yet: it still uses `DevelopmentLabAccess` and exists only with `DEV_TERMINAL_ACCESS`. Checking the session on the handshake (`4401`) and lab ownership come with lab sessions in increment 05.
 
 OAuth, password reset and email verification are out of scope for the MVP. The last two are required before opening public sign-up.
 
 ## Data model
 
+Only `users` and `auth_sessions` exist so far, created by the first migration; the other tables are the target design.
+
 | Table | Contents |
 |---|---|
 | `users` | Account, password hash, display name |
-| `auth_sessions` | Sessions; the primary key is the token hash |
+| `auth_sessions` | Sessions: SHA-256 of the token (unique), creation, last activity and absolute expiry |
 | `modules` | Modules synced from `content/` |
 | `missions` | Stable mission identity (slug), module, position, status, current version |
 | `mission_versions` | Immutable specification per version; PK `(mission_id, version)` |

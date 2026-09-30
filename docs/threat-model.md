@@ -14,8 +14,9 @@ Controls that rely on the student not being root are defense in depth, never the
 | Lab to network | `network_mode: none` |
 | Lab to other labs | Separate containers, no network, per-cgroup resource limits |
 | Lab to API | No channel initiated by the lab; `labctl` output is treated as untrusted input |
-| Browser to another user's lab | Ownership check on every route and on the WebSocket handshake. Until user sessions exist, the terminal is available only with `DEV_TERMINAL_ACCESS` and trusts any running platform lab whose id is known |
-| Third-party site to user session | `SameSite=Lax` cookie, `Origin` check, JSON-only API |
+| Browser to another user's lab | Ownership check on every route and on the WebSocket handshake. Until lab sessions exist (increment 05), the terminal is not tied to accounts: it is available only with `DEV_TERMINAL_ACCESS` and trusts any running platform lab whose id is known |
+| Third-party site to user session | `SameSite=Lax` `__Host-` cookie, `Origin` and `Content-Type: application/json` required on every non-GET request, checked before the body is read |
+| Internet to accounts | Argon2id hashes, server-side sessions stored as SHA-256, rate limits on sign-up and login, invite code |
 
 ## Container configuration
 
@@ -61,6 +62,21 @@ Observed differences between the runtimes are listed in [runtime.md](runtime.md#
 
 Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with no input, or 2 hours in total.
 
+## Authentication
+
+| Threat | Control |
+|---|---|
+| Database leak | Passwords stored only as Argon2id hashes; sessions stored only as the SHA-256 of a 32-byte random token, so a leaked table cannot be replayed as cookies |
+| Session theft from JavaScript | `HttpOnly` cookie; the frontend never handles the token |
+| Cookie scoping | `__Host-` prefix: `Secure`, `Path=/`, no `Domain`, so no subdomain or plain-HTTP page can set or read it |
+| Long-lived stolen session | 7-day idle expiry and 30-day absolute expiry that activity cannot extend; logout deletes the session on the server |
+| CSRF | `SameSite=Lax`, required allowed `Origin` and JSON content type on every non-GET request |
+| Password guessing | 5 login attempts per 15 minutes per peer address, checked before Argon2 |
+| CPU and memory exhaustion through Argon2 | Rate limit first; at most two hashes at a time, in worker threads |
+| Account enumeration on login | Same status, code and message for unknown email and wrong password; an unknown email still runs one Argon2 verification |
+| Unwanted sign-ups | Invite code compared in constant time; sign-up disabled when none is configured |
+| Stored markup in names | Display names are stored as text, without control characters; the frontend renders them as text |
+
 ## Validation and setup
 
 - Mission content is treated as data. The API never executes mission content on the host.
@@ -82,7 +98,11 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 
 **Command history.** Secret redaction is heuristic. The risk is low because labs have no network.
 
-**Email enumeration on sign-up.** Accepted until there is an email flow.
+**Email enumeration on sign-up.** Accepted until there is an email flow. Only someone with the invite code gets past the check that precedes it.
+
+**Rate limiting by peer address, in memory.** Limits are kept in the API process, reset on restart and are not shared between processes, which matches the single-process closed beta. They key on the TCP peer: behind a reverse proxy all clients share one address and one budget, and one address can hold many users (NAT) or one user many addresses. `X-Forwarded-For` is ignored until a trusted proxy is configured. This has to be revisited together with the Caddy deployment.
+
+**No account lockout or password breach check.** Password guessing is slowed by the rate limit only. Password reset and email verification do not exist yet, which also rules out public sign-up.
 
 ## Verification
 
