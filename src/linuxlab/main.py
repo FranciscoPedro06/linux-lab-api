@@ -6,6 +6,7 @@ import aiodocker
 from fastapi import FastAPI
 
 from linuxlab import health
+from linuxlab.api import install_error_handlers
 from linuxlab.config import Settings, get_settings
 from linuxlab.db import create_engine
 from linuxlab.labs.access import DevelopmentLabAccess
@@ -44,6 +45,7 @@ def create_app(
             await engine.dispose()
 
     app = FastAPI(title="Linux Lab API", lifespan=lifespan)
+    install_error_handlers(app)
     app.include_router(health.router)
     if settings.dev_terminal_access:
         app.include_router(terminal.router)
