@@ -15,7 +15,7 @@ import uuid
 import aiodocker
 
 from linuxlab.config import LabSettings
-from linuxlab.labs.access import LAB_ID_PATTERN
+from linuxlab.labs.access import DEV_LAB_ID_PATTERN as LAB_ID_PATTERN
 from linuxlab.labs.runtime import LabContainerSpec
 from linuxlab.labs.runtime.docker import DockerRuntime
 from linuxlab.labs.runtime.spec import container_name

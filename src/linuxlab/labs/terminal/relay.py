@@ -2,9 +2,10 @@
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -24,6 +25,7 @@ class Outcome(Enum):
     SHELL_EXITED = "shell_exited"
     CLIENT_CLOSED = "client_closed"
     REPLACED = "replaced"
+    LAB_ENDED = "lab_ended"
 
 
 @dataclass
@@ -32,27 +34,66 @@ class RelayStats:
     bytes_out: int = 0
 
 
+@dataclass
+class TerminalClaim:
+    """A terminal connection's hold on its lab. `stop` is set when it must end."""
+
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    outcome: Outcome = Outcome.REPLACED
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class TerminalRegistry:
-    """At most one terminal connection per lab. A new connection replaces the old one."""
+    """Terminal connections by lab, and when each lab's terminal was last used.
+
+    At most one connection per lab: a new connection replaces the old one. Activity
+    (connecting, disconnecting, input) is recorded in memory with no I/O, and taken
+    by the reaper, which stores it with the lab session.
+    """
 
     def __init__(self) -> None:
-        self._active: dict[str, asyncio.Event] = {}
+        self._active: dict[str, TerminalClaim] = {}
+        self._activity: dict[str, datetime] = {}
 
     @asynccontextmanager
-    async def claim(self, lab_id: str) -> AsyncIterator[asyncio.Event]:
-        previous = self._active.get(lab_id)
+    async def claim(self, lab_key: str) -> AsyncIterator[TerminalClaim]:
+        previous = self._active.get(lab_key)
         if previous is not None:
-            previous.set()
-        replaced = asyncio.Event()
-        self._active[lab_id] = replaced
+            previous.outcome = Outcome.REPLACED
+            previous.stop.set()
+        claim = TerminalClaim()
+        self._active[lab_key] = claim
+        self.touch(lab_key)
         try:
-            yield replaced
+            yield claim
         finally:
-            if self._active.get(lab_id) is replaced:
-                del self._active[lab_id]
+            if self._active.get(lab_key) is claim:
+                del self._active[lab_key]
+            self.touch(lab_key)
+            claim.released.set()
+
+    async def end(self, lab_key: str) -> None:
+        """Close the lab's terminal, if any, and wait until its cleanup has finished."""
+        claim = self._active.get(lab_key)
+        if claim is None:
+            return
+        claim.outcome = Outcome.LAB_ENDED
+        claim.stop.set()
+        await claim.released.wait()
+
+    def connected(self, lab_key: str) -> bool:
+        return lab_key in self._active
 
     def active(self) -> int:
         return len(self._active)
+
+    def touch(self, lab_key: str) -> None:
+        self._activity[lab_key] = datetime.now(UTC)
+
+    def take_activity(self) -> dict[str, datetime]:
+        """Activity recorded since the last call, by lab."""
+        activity, self._activity = self._activity, {}
+        return activity
 
 
 class OutputPacer:
@@ -80,10 +121,12 @@ class OutputPacer:
 async def relay(
     websocket: WebSocket,
     terminal: TerminalSession,
-    replaced: asyncio.Event,
+    claim: TerminalClaim,
     stats: RelayStats,
+    on_input: Callable[[], None] = lambda: None,
 ) -> Outcome:
-    """Run until the shell exits, the client leaves or another connection takes over.
+    """Run until the shell exits, the client leaves, or the claim is stopped (another
+    connection took over or the lab ended).
 
     Raises ProtocolError for an invalid message and LabRuntimeError if the runtime
     fails. Both directions run as tasks; when one finishes, the others are cancelled
@@ -114,6 +157,7 @@ async def relay(
                 if len(data) > MAX_FRAME_BYTES:
                     raise ProtocolError("input frame too large", CloseCode.MESSAGE_TOO_BIG)
                 stats.bytes_in += len(data)
+                on_input()
                 await terminal.write(data)
             elif text is not None:
                 control = parse_control(text)
@@ -121,14 +165,14 @@ async def relay(
                     raise ProtocolError("init was already received")
                 await terminal.resize(control.size)
 
-    async def taken_over() -> Outcome:
-        await replaced.wait()
-        return Outcome.REPLACED
+    async def stopped() -> Outcome:
+        await claim.stop.wait()
+        return claim.outcome
 
     tasks = [
         asyncio.create_task(output(), name="terminal-output"),
         asyncio.create_task(input(), name="terminal-input"),
-        asyncio.create_task(taken_over(), name="terminal-replaced"),
+        asyncio.create_task(stopped(), name="terminal-stopped"),
     ]
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
