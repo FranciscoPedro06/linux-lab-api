@@ -18,10 +18,14 @@ from linuxlab.labs import router as labs
 from linuxlab.labs.lifecycle import Labs
 from linuxlab.labs.reaper import run_reaper
 from linuxlab.labs.router import CREATE_ATTEMPTS, CREATE_WINDOW_SECONDS
-from linuxlab.labs.runtime import LabRuntime
+from linuxlab.labs.runtime import LabRuntime, LabRuntimeError
 from linuxlab.labs.runtime.docker import DockerRuntime
 from linuxlab.labs.terminal import router as terminal
 from linuxlab.labs.terminal.relay import TerminalRegistry
+
+logger = logging.getLogger("linuxlab.main")
+
+STARTUP_CHECK_SECONDS = 10
 
 
 def create_app(
@@ -53,6 +57,13 @@ def create_app(
             docker = aiodocker.Docker()
             runtime = DockerRuntime(docker, oci_runtime=settings.lab_oci_runtime)
         app.state.runtime = runtime
+        try:
+            await _check_runtime(settings, runtime)
+        except BaseException:
+            if docker is not None:
+                await docker.close()
+            await engine.dispose()
+            raise
         app.state.terminals = TerminalRegistry()
         app.state.labs = Labs(
             app.state.sessionmaker,
@@ -83,6 +94,30 @@ def create_app(
     app.include_router(labs.router)
     app.include_router(terminal.router)
     return app
+
+
+class StartupError(Exception):
+    pass
+
+
+async def _check_runtime(settings: Settings, runtime: LabRuntime) -> None:
+    """In production, refuse to start unless Docker can run labs under gVisor.
+
+    Settings already require LAB_OCI_RUNTIME=runsc in production; this checks that
+    Docker is reachable and has runsc registered. In development an unavailable
+    runtime is only reported, by this log and by /api/health.
+    """
+    try:
+        async with asyncio.timeout(STARTUP_CHECK_SECONDS):
+            await runtime.ping()
+    except (LabRuntimeError, TimeoutError) as error:
+        if settings.environment == "production":
+            logger.critical("refusing to start: lab runtime unavailable: %s", error)
+            raise StartupError(
+                f"ENVIRONMENT=production requires Docker with the {settings.lab_oci_runtime} "
+                f"runtime: {error or 'no answer'}"
+            ) from error
+        logger.warning("lab runtime unavailable: %s", error)
 
 
 def _configure_logging() -> None:
