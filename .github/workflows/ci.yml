@@ -54,7 +54,41 @@ jobs:
           uv run alembic upgrade head
           uv run alembic check
       - run: uv run pytest
-      - run: uv run pytest -m integration
+      - name: Integration tests (PostgreSQL)
+        run: uv run pytest -m "integration and not docker"
+
+  labs:
+    name: Lab integration (Docker, runc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: linuxlab
+          POSTGRES_PASSWORD: linuxlab
+          POSTGRES_DB: linuxlab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U linuxlab -d linuxlab"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://linuxlab:linuxlab@localhost:5432/linuxlab
+      LINUXLAB_TEST_OCI_RUNTIME: runc
+      LINUXLAB_LAB_IMAGE: linuxlab/lab-base:ci
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.19"
+      - run: uv sync --locked
+      - run: docker build --tag "$LINUXLAB_LAB_IMAGE" lab-image
+      - run: uv run alembic upgrade head
+      - name: Lab runtime, lifecycle, reaper and terminal tests
+        run: uv run pytest -m docker -v -rA
 
   docker:
     name: Docker image
