@@ -23,9 +23,9 @@ from linuxlab.labs.runtime.spec import container_name
 WEB_URL = "http://localhost:5173"
 
 
-async def _create(runtime: DockerRuntime, image: str) -> str:
+async def _create(runtime: DockerRuntime, image: str, deployment: str) -> str:
     lab_id = uuid.uuid4().hex
-    info = await runtime.create(LabContainerSpec(lab_id=lab_id, image=image))
+    info = await runtime.create(LabContainerSpec(lab_id=lab_id, image=image, deployment=deployment))
     await runtime.start(info.id)
     return lab_id
 
@@ -36,7 +36,7 @@ async def _run(command: str, lab_id: str | None) -> int:
         runtime = DockerRuntime(client, oci_runtime=settings.lab_oci_runtime)
         await runtime.ping()
         if command == "create":
-            lab_id = await _create(runtime, settings.lab_image)
+            lab_id = await _create(runtime, settings.lab_image, settings.lab_deployment)
             print(f"lab {lab_id} running under {settings.lab_oci_runtime}")
             print(f"terminal: {WEB_URL}/?lab={lab_id}")
         else:

@@ -10,6 +10,10 @@ ExecUser = Literal["student", "root"]
 class LabContainerSpec:
     lab_id: str
     image: str
+    # Which API deployment owns the container. Reconciliation only ever touches
+    # containers of its own deployment, so several deployments (or the tests) can
+    # share a Docker Engine.
+    deployment: str
 
 
 @dataclass(frozen=True)
@@ -18,6 +22,8 @@ class ContainerInfo:
     name: str
     running: bool
     labels: Mapping[str, str] = field(default_factory=dict)
+    # Set by inspect when the container was killed for exceeding its memory limit.
+    oom_killed: bool = False
 
 
 # Bounds for a terminal size, checked before anything reaches Docker.
@@ -82,6 +88,13 @@ class LabRuntime(Protocol):
         """Raise RuntimeUnavailableError if containers cannot be created."""
 
     async def create(self, spec: LabContainerSpec) -> ContainerInfo: ...
+
+    async def list_labs(self, deployment: str) -> list[ContainerInfo]:
+        """Every lab container of the deployment, running or not.
+
+        Selected by the linuxlab.managed and linuxlab.deployment labels, never by name.
+        `oom_killed` is not filled in; inspect a container for it.
+        """
 
     async def start(self, container_id: str) -> None: ...
 
