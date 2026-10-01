@@ -41,3 +41,40 @@ def test_missing_invite_code_disables_signup(
         monkeypatch.setenv("SIGNUP_INVITE_CODE", value)
 
     assert Settings(_env_file=None).signup_invite_code is None
+
+
+def test_environment_defaults_to_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.delenv("LAB_OCI_RUNTIME", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.environment == "production"
+    assert settings.lab_oci_runtime == "runsc"
+
+
+@pytest.mark.parametrize("oci_runtime", ["runc", "io.containerd.runc.v2", "", "RUNSC"])
+def test_production_requires_runsc(monkeypatch: pytest.MonkeyPatch, oci_runtime: str) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app")
+    monkeypatch.setenv("LAB_OCI_RUNTIME", oci_runtime)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    with pytest.raises(ValidationError, match="requires LAB_OCI_RUNTIME=runsc"):
+        Settings(_env_file=None)
+
+
+def test_development_may_use_runc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app")
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("LAB_OCI_RUNTIME", "runc")
+
+    assert Settings(_env_file=None).lab_oci_runtime == "runc"
+
+
+def test_unknown_environment_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@db:5432/app")
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

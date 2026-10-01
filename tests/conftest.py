@@ -19,6 +19,7 @@ def pytest_report_header() -> str:
 
 def app_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
+        "environment": "development",
         "database_url": get_settings().database_url,
         "allowed_origins": frozenset({ORIGIN}),
         "signup_invite_code": INVITE_CODE,

@@ -26,6 +26,8 @@ services:
       context: ..
       target: dev
     environment:
+      # Development allows runc, which Docker Desktop provides; production requires runsc.
+      ENVIRONMENT: development
       DATABASE_URL: postgresql+asyncpg://linuxlab:linuxlab@postgres:5432/linuxlab
       ALLOWED_ORIGINS: http://localhost:5173
       # Sign-up is disabled unless an invite code is set in the environment.
