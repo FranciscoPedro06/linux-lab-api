@@ -62,6 +62,8 @@ TERMINAL_CONTROL_SECONDS = 5
 TERMINAL_CLEANUP_SECONDS = 10
 # How long a failed cleanup waits for the container to stop before reporting an error.
 SETTLE_SECONDS = 2
+# How long remove waits for a removal already started by someone else.
+REMOVAL_WAIT_SECONDS = 10
 
 # Closing the connection to a TTY exec does not end anything inside the container:
 # the shell and everything started from it keep running. On close, this runs as the
@@ -310,11 +312,24 @@ class DockerRuntime:
             raise _translate(error, container_id) from error
 
     async def remove(self, container_id: str) -> None:
+        container = self._client.containers.container(container_id)
         try:
-            await self._client.containers.container(container_id).delete(force=True)
+            await container.delete(force=True)
         except DockerError as error:
-            if error.status != 404:
+            if error.status == 404:
+                return
+            if error.status != 409 or "already in progress" not in error.message:
                 raise _translate(error, container_id) from error
+            # Someone else is removing it (another request, the reaper, an operator):
+            # done once it is gone.
+            try:
+                async with asyncio.timeout(REMOVAL_WAIT_SECONDS):
+                    await container.wait(condition="removed")
+            except TimeoutError:
+                raise LabRuntimeError(f"{container_id}: removal did not finish") from None
+            except DockerError as wait_error:
+                if wait_error.status != 404:
+                    raise _translate(wait_error, container_id) from wait_error
 
     async def _show(self, container_id: str) -> dict[str, Any]:
         try:
