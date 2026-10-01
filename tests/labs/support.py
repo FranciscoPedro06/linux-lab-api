@@ -18,11 +18,20 @@ from linuxlab.labs.runtime.docker import DockerRuntime
 
 OCI_RUNTIME = os.environ.get("LINUXLAB_TEST_OCI_RUNTIME", "runc")
 LAB_IMAGE = os.environ.get("LINUXLAB_LAB_IMAGE", "linuxlab/lab-base:dev")
+# Deployment label of containers created directly through the runtime by tests. No API
+# instance, in tests or in a local environment, reconciles this deployment.
+TEST_DEPLOYMENT = "runtime-tests"
+
+
+def lab_spec(lab_id: str | None = None) -> LabContainerSpec:
+    return LabContainerSpec(
+        lab_id=lab_id or uuid.uuid4().hex, image=LAB_IMAGE, deployment=TEST_DEPLOYMENT
+    )
 
 
 @asynccontextmanager
 async def running_lab(runtime: DockerRuntime) -> AsyncIterator[ContainerInfo]:
-    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec())
     try:
         await runtime.start(info.id)
         yield info

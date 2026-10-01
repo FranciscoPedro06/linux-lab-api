@@ -15,9 +15,10 @@ LabRuntime (protocol)          src/linuxlab/labs/runtime/base.py
 | Operation | Behavior |
 |---|---|
 | `ping()` | Fails with `RuntimeUnavailableError` if Docker is unreachable or the configured OCI runtime is not registered |
-| `create(spec)` | Creates `ll-lab-<lab_id>` with the isolation settings from `spec.py`; does not start it |
+| `create(spec)` | Creates `ll-lab-<lab_id>` with the isolation settings from `spec.py` and the labels `linuxlab.managed=true`, `linuxlab.lab_id` and `linuxlab.deployment`; does not start it |
+| `list_labs(deployment)` | Every container labeled `linuxlab.managed=true` and `linuxlab.deployment=<deployment>`, running or not. Selected by labels, never by name |
 | `start(id)`, `stop(id)` | Start, or stop with a 2 second grace period |
-| `inspect(id)` | Name, running state and `linuxlab.*` labels |
+| `inspect(id)` | Name, running state, `linuxlab.*` labels, and whether the container was OOM-killed |
 | `exec(id, argv, user, time_limit)` | Runs argv without a shell as `student` or `root` |
 | `open_terminal(id, size)` | Starts `bash --login` as the student on a PTY and returns a `TerminalSession` (read, write, resize, close); see [terminal.md](terminal.md) |
 | `remove(id)` | Force-removes the container; a missing container is not an error |

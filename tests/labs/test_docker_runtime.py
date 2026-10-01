@@ -18,7 +18,15 @@ from linuxlab.labs.runtime import (
 )
 from linuxlab.labs.runtime.docker import MAX_OUTPUT_BYTES, DockerRuntime
 
-from .support import LAB_IMAGE, OCI_RUNTIME, processes, read_until, sh
+from .support import (
+    LAB_IMAGE,
+    OCI_RUNTIME,
+    TEST_DEPLOYMENT,
+    lab_spec,
+    processes,
+    read_until,
+    sh,
+)
 
 pytestmark = pytest.mark.docker
 
@@ -37,10 +45,15 @@ async def test_ping_rejects_unregistered_oci_runtime(docker_client: aiodocker.Do
 
 async def test_lifecycle(runtime: DockerRuntime) -> None:
     lab_id = uuid.uuid4().hex
-    info = await runtime.create(LabContainerSpec(lab_id=lab_id, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec(lab_id))
     try:
         assert info.name == f"ll-lab-{lab_id}"
-        assert info.labels == {"linuxlab.managed": "true", "linuxlab.lab_id": lab_id}
+        assert info.labels == {
+            "linuxlab.managed": "true",
+            "linuxlab.lab_id": lab_id,
+            "linuxlab.deployment": TEST_DEPLOYMENT,
+        }
+        assert not info.oom_killed
         assert not info.running
 
         await runtime.start(info.id)
@@ -56,6 +69,34 @@ async def test_lifecycle(runtime: DockerRuntime) -> None:
     with pytest.raises(ContainerNotFoundError):
         await runtime.inspect(info.id)
     await runtime.remove(info.id)
+
+
+async def test_list_labs_selects_by_deployment_and_managed_label(
+    runtime: DockerRuntime, docker_client: aiodocker.Docker
+) -> None:
+    mine = await runtime.create(lab_spec())
+    other_deployment = await runtime.create(
+        LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE, deployment="someone-else")
+    )
+    lookalike_name = f"ll-lab-{uuid.uuid4().hex}"
+    unmanaged = await docker_client.containers.create(
+        {"Image": LAB_IMAGE, "Labels": {"linuxlab.deployment": TEST_DEPLOYMENT}},
+        name=lookalike_name,
+    )
+    try:
+        await runtime.start(mine.id)
+        listed = {info.id: info for info in await runtime.list_labs(TEST_DEPLOYMENT)}
+
+        assert mine.id in listed
+        assert listed[mine.id].running
+        assert listed[mine.id].labels == mine.labels
+        assert listed[mine.id].name == mine.name
+        assert other_deployment.id not in listed
+        assert unmanaged.id not in listed
+    finally:
+        await runtime.remove(mine.id)
+        await runtime.remove(other_deployment.id)
+        await unmanaged.delete(force=True)
 
 
 async def test_exec_captures_output_and_exit_code(
@@ -201,7 +242,7 @@ async def test_closing_a_terminal_leaves_other_terminals_running(
 async def test_closing_a_terminal_after_its_lab_ended_is_not_an_error(
     runtime: DockerRuntime, ending: str
 ) -> None:
-    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec())
     try:
         await runtime.start(info.id)
         terminal = await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))
@@ -231,7 +272,7 @@ async def test_lab_ending_during_terminal_cleanup_is_not_an_error(
     died (137 under runc, 128 or 137 under runsc), and Docker keeps reporting the
     container as running for a moment after that. Neither is a cleanup failure.
     """
-    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec())
     try:
         await runtime.start(info.id)
         terminal = await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))
@@ -269,7 +310,7 @@ async def test_cleanup_failure_on_a_running_lab_is_reported(
 
 
 async def test_terminal_requires_a_running_container(runtime: DockerRuntime) -> None:
-    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec())
     try:
         with pytest.raises(ContainerNotRunningError):
             await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))

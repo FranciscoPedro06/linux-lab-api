@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Annotated, Any
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -12,6 +12,10 @@ class LabSettings(BaseSettings):
 
     lab_oci_runtime: str = "runsc"
     lab_image: str = "linuxlab/lab-base:dev"
+    # Written to the linuxlab.deployment label of every lab container. Reconciliation
+    # only touches containers with this deployment's label, so deployments sharing a
+    # Docker Engine (or the test suite) never remove each other's labs.
+    lab_deployment: str = Field(default="default", pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")
 
 
 class Settings(LabSettings):

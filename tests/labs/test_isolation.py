@@ -536,6 +536,7 @@ async def test_memory_limit_is_enforced(
         # sandbox, and with it the lab.
         state = await _wait_until_stopped(docker_client, fresh_lab)
         assert state["OOMKilled"] is True, state
+        assert (await runtime.inspect(fresh_lab.id)).oom_killed
     else:
         # The OOM killer picks the offending process; the lab keeps running.
         assert beyond.exit_code == 137, beyond

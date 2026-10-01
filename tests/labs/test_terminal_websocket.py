@@ -34,7 +34,9 @@ class Server:
     runtime: FakeRuntime
 
     async def lab(self, *, running: bool = True) -> ContainerInfo:
-        info = await self.runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image="test"))
+        info = await self.runtime.create(
+            LabContainerSpec(lab_id=uuid.uuid4().hex, image="test", deployment="tests")
+        )
         if running:
             await self.runtime.start(info.id)
         return info

@@ -8,7 +8,8 @@ test inject output, an exit or a failure.
 
 import asyncio
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Literal
 
 from linuxlab.labs.runtime.base import (
     ContainerInfo,
@@ -21,7 +22,12 @@ from linuxlab.labs.runtime.base import (
     RuntimeUnavailableError,
     TerminalSize,
 )
-from linuxlab.labs.runtime.spec import LAB_ID_LABEL, MANAGED_LABEL, container_name
+from linuxlab.labs.runtime.spec import (
+    DEPLOYMENT_LABEL,
+    LAB_ID_LABEL,
+    MANAGED_LABEL,
+    container_name,
+)
 
 ExecHandler = Callable[[Sequence[str], ExecUser], ExecResult]
 
@@ -40,6 +46,7 @@ class _Container:
     name: str
     labels: dict[str, str]
     running: bool = False
+    oom_killed: bool = False
 
 
 # bytes: output; int: the shell exited with that code; error: the runtime failed;
@@ -96,12 +103,25 @@ class FakeTerminalSession:
         return self._exit_code
 
 
+Operation = Literal["create", "start", "inspect", "list", "exec", "terminal", "stop", "remove"]
+
+
 @dataclass
 class FakeRuntime:
+    """In-memory runtime.
+
+    `available = False` makes every operation fail as if Docker could not be reached.
+    `fail` makes only the named operations fail. An operation named in `gates` waits
+    until its event is set, so a test can act while it is in progress.
+    """
+
     available: bool = True
     exec_handler: ExecHandler | None = None
     exec_calls: list[ExecCall] = field(default_factory=list)
     terminals: list[FakeTerminalSession] = field(default_factory=list)
+    fail: set[Operation] = field(default_factory=set)
+    gates: dict[Operation, asyncio.Event] = field(default_factory=dict)
+    calls: list[tuple[Operation, str]] = field(default_factory=list)
     _containers: dict[str, _Container] = field(default_factory=dict)
     _next_id: int = 0
 
@@ -110,6 +130,7 @@ class FakeRuntime:
             raise RuntimeUnavailableError("fake runtime marked unavailable")
 
     async def create(self, spec: LabContainerSpec) -> ContainerInfo:
+        await self._enter("create", spec.lab_id)
         name = container_name(spec.lab_id)
         if any(container.name == name for container in self._containers.values()):
             raise LabRuntimeError(f"Could not create container: name {name} is in use")
@@ -117,15 +138,32 @@ class FakeRuntime:
         container = _Container(
             id=f"fake-{self._next_id}",
             name=name,
-            labels={MANAGED_LABEL: "true", LAB_ID_LABEL: spec.lab_id},
+            labels={
+                MANAGED_LABEL: "true",
+                LAB_ID_LABEL: spec.lab_id,
+                DEPLOYMENT_LABEL: spec.deployment,
+            },
         )
         self._containers[container.id] = container
         return _info(container)
 
+    async def list_labs(self, deployment: str) -> list[ContainerInfo]:
+        await self._enter("list", deployment)
+        return [
+            replace(_info(container), oom_killed=False)
+            for container in self._containers.values()
+            if container.labels.get(MANAGED_LABEL) == "true"
+            and container.labels.get(DEPLOYMENT_LABEL) == deployment
+        ]
+
     async def start(self, container_id: str) -> None:
-        self._get(container_id).running = True
+        await self._enter("start", container_id)
+        container = self._get(container_id)
+        container.running = True
+        container.oom_killed = False
 
     async def inspect(self, container_id: str) -> ContainerInfo:
+        await self._enter("inspect", container_id)
         return _info(self._get(container_id))
 
     async def exec(
@@ -140,6 +178,7 @@ class FakeRuntime:
             raise ValueError("argv must not be empty")
         if time_limit <= 0:
             raise ValueError("time_limit must be positive")
+        await self._enter("exec", container_id)
         if not self._get(container_id).running:
             raise ContainerNotRunningError(container_id)
         self.exec_calls.append(ExecCall(container_id, tuple(argv), user, time_limit))
@@ -148,6 +187,7 @@ class FakeRuntime:
         return self.exec_handler(argv, user)
 
     async def open_terminal(self, container_id: str, size: TerminalSize) -> FakeTerminalSession:
+        await self._enter("terminal", container_id)
         container = self._get(container_id)
         if not container.running:
             raise ContainerNotRunningError(container_id)
@@ -156,12 +196,46 @@ class FakeRuntime:
         return terminal
 
     async def stop(self, container_id: str) -> None:
+        await self._enter("stop", container_id)
         self._get(container_id).running = False
 
     async def remove(self, container_id: str) -> None:
+        await self._enter("remove", container_id)
         container = self._find(container_id)
         if container is not None:
             del self._containers[container.id]
+            for terminal in self.terminals:
+                if terminal.container_id == container.id and not terminal.closed:
+                    terminal.exit(137)
+
+    # Test helpers
+
+    def add_container(self, name: str, labels: dict[str, str], *, running: bool = True) -> str:
+        """Add a container that was not created through create(), as another tool would."""
+        self._next_id += 1
+        container = _Container(f"fake-{self._next_id}", name, dict(labels), running)
+        self._containers[container.id] = container
+        return container.id
+
+    def crash(self, container_id: str, *, oom: bool = False) -> None:
+        """Stop the container as if it died, ending its terminals as Docker would."""
+        container = self._get(container_id)
+        container.running = False
+        container.oom_killed = oom
+        for terminal in self.terminals:
+            if terminal.container_id == container.id and not terminal.closed:
+                terminal.exit(137)
+
+    def containers(self) -> list[ContainerInfo]:
+        return [_info(container) for container in self._containers.values()]
+
+    async def _enter(self, operation: Operation, target: str) -> None:
+        self.calls.append((operation, target))
+        gate = self.gates.get(operation)
+        if gate is not None:
+            await gate.wait()
+        if not self.available or operation in self.fail:
+            raise LabRuntimeError(f"fake runtime: {operation} failed")
 
     def _find(self, container_id: str) -> _Container | None:
         # Like Docker, accept either the id or the name.
@@ -182,4 +256,5 @@ def _info(container: _Container) -> ContainerInfo:
         name=container.name,
         running=container.running,
         labels=dict(container.labels),
+        oom_killed=container.oom_killed,
     )

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -23,7 +24,9 @@ from linuxlab.labs.runtime.base import (
     TerminalSize,
 )
 from linuxlab.labs.runtime.spec import (
+    DEPLOYMENT_LABEL,
     LABEL_PREFIX,
+    MANAGED_LABEL,
     STUDENT_GID,
     STUDENT_HOME,
     STUDENT_UID,
@@ -152,6 +155,24 @@ class DockerRuntime:
             raise LabRuntimeError(f"Could not create container: {error.message}") from error
         return await self.inspect(container.id)
 
+    async def list_labs(self, deployment: str) -> list[ContainerInfo]:
+        labels = [f"{MANAGED_LABEL}=true", f"{DEPLOYMENT_LABEL}={deployment}"]
+        try:
+            containers = await self._client.containers.list(
+                all="true", filters=json.dumps({"label": labels})
+            )
+        except (DockerError, aiohttp.ClientError, OSError) as error:
+            raise LabRuntimeError(f"Could not list lab containers: {error}") from error
+        return [
+            ContainerInfo(
+                id=container["Id"],
+                name=(container["Names"] or [""])[0].lstrip("/"),
+                running=container["State"] == "running",
+                labels=_lab_labels(container["Labels"]),
+            )
+            for container in containers
+        ]
+
     async def start(self, container_id: str) -> None:
         try:
             await self._client.containers.container(container_id).start()
@@ -164,11 +185,8 @@ class DockerRuntime:
             id=data["Id"],
             name=data["Name"].lstrip("/"),
             running=bool(data["State"]["Running"]),
-            labels={
-                key: value
-                for key, value in (data["Config"].get("Labels") or {}).items()
-                if key.startswith(LABEL_PREFIX)
-            },
+            labels=_lab_labels(data["Config"].get("Labels")),
+            oom_killed=bool(data["State"].get("OOMKilled")),
         )
 
     async def exec(
@@ -395,6 +413,10 @@ class DockerTerminalSession:
                 return await _wait_exit_code(self._execution)
         except (DockerError, aiohttp.ClientError, OSError, TimeoutError):
             return None
+
+
+def _lab_labels(labels: dict[str, str] | None) -> dict[str, str]:
+    return {key: value for key, value in (labels or {}).items() if key.startswith(LABEL_PREFIX)}
 
 
 def _translate(error: DockerError, container_id: str) -> LabRuntimeError:

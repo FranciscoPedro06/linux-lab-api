@@ -4,7 +4,7 @@ from typing import Any
 from linuxlab.labs.runtime import LabContainerSpec
 from linuxlab.labs.runtime.spec import build_container_config, container_name
 
-SPEC = LabContainerSpec(lab_id="0b7c9d2e", image="linuxlab/lab-base:test")
+SPEC = LabContainerSpec(lab_id="0b7c9d2e", image="linuxlab/lab-base:test", deployment="prod")
 
 # Snapshot of the isolation settings. A change here is a change to the threat model:
 # update docs/threat-model.md in the same commit.
@@ -14,7 +14,11 @@ EXPECTED: dict[str, Any] = {
     "WorkingDir": "/home/student",
     "Hostname": "linuxlab",
     "Env": ["LANG=C.UTF-8"],
-    "Labels": {"linuxlab.managed": "true", "linuxlab.lab_id": "0b7c9d2e"},
+    "Labels": {
+        "linuxlab.managed": "true",
+        "linuxlab.lab_id": "0b7c9d2e",
+        "linuxlab.deployment": "prod",
+    },
     "HostConfig": {
         "Runtime": "runsc",
         "NetworkMode": "none",
