@@ -12,7 +12,10 @@ from linuxlab.auth.passwords import Passwords
 from linuxlab.auth.ratelimit import RateLimiter
 from linuxlab.config import Settings, get_settings
 from linuxlab.db import create_engine, create_sessionmaker
+from linuxlab.labs import router as labs
 from linuxlab.labs.access import DevelopmentLabAccess
+from linuxlab.labs.lifecycle import Labs
+from linuxlab.labs.router import CREATE_ATTEMPTS, CREATE_WINDOW_SECONDS
 from linuxlab.labs.runtime import LabRuntime
 from linuxlab.labs.runtime.docker import DockerRuntime
 from linuxlab.labs.terminal import router as terminal
@@ -34,15 +37,24 @@ def create_app(
         app.state.sessionmaker = create_sessionmaker(engine)
         app.state.passwords = Passwords()
         app.state.auth_rate_limits = {"signup": RateLimiter(), "login": RateLimiter()}
+        app.state.lab_rate_limit = RateLimiter(CREATE_ATTEMPTS, CREATE_WINDOW_SECONDS)
         docker: aiodocker.Docker | None = None
+        runtime = lab_runtime
+        if runtime is None:
+            docker = aiodocker.Docker()
+            runtime = DockerRuntime(docker, oci_runtime=settings.lab_oci_runtime)
+        app.state.runtime = runtime
+        app.state.terminals = TerminalRegistry()
+        app.state.labs = Labs(
+            app.state.sessionmaker,
+            runtime,
+            app.state.terminals,
+            image=settings.lab_image,
+            deployment=settings.lab_deployment,
+            capacity=settings.lab_capacity,
+        )
         if settings.dev_terminal_access:
-            runtime = lab_runtime
-            if runtime is None:
-                docker = aiodocker.Docker()
-                runtime = DockerRuntime(docker, oci_runtime=settings.lab_oci_runtime)
-            app.state.runtime = runtime
             app.state.lab_access = DevelopmentLabAccess(runtime)
-            app.state.terminals = TerminalRegistry()
         try:
             yield
         finally:
@@ -54,6 +66,7 @@ def create_app(
     install_error_handlers(app)
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(labs.router)
     if settings.dev_terminal_access:
         app.include_router(terminal.router)
     return app

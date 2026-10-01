@@ -58,7 +58,7 @@ async def terminal_endpoint(websocket: WebSocket, lab_id: str) -> None:
     if init is None:
         return
 
-    async with state.terminals.claim(lab_id) as replaced:
+    async with state.terminals.claim(lab_id) as claim:
         started = time.monotonic()
         try:
             terminal = await state.runtime.open_terminal(lab.id, init.size)
@@ -79,7 +79,7 @@ async def terminal_endpoint(websocket: WebSocket, lab_id: str) -> None:
         failure: Exception | None = None
         try:
             await websocket.send_text(ready_message())
-            outcome = await relay(websocket, terminal, replaced, stats)
+            outcome = await relay(websocket, terminal, claim, stats)
         except (ProtocolError, LabRuntimeError) as error:
             failure = error
         finally:

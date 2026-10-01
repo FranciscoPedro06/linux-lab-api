@@ -16,6 +16,9 @@ class LabSettings(BaseSettings):
     # only touches containers with this deployment's label, so deployments sharing a
     # Docker Engine (or the test suite) never remove each other's labs.
     lab_deployment: str = Field(default="default", pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")
+    # Labs in provisioning, ready or terminating across all users. Each lab may use
+    # 512 MB of memory and half a CPU.
+    lab_capacity: int = Field(default=10, ge=1)
 
 
 class Settings(LabSettings):
