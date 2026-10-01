@@ -33,10 +33,10 @@ def test_downgrade_and_upgrade_again() -> None:
     config = Config(str(ALEMBIC_INI))
 
     command.upgrade(config, "head")
-    assert {"users", "auth_sessions"} <= tables()
+    assert {"users", "auth_sessions", "lab_sessions"} <= tables()
 
     command.downgrade(config, "base")
     assert tables() == {"alembic_version"}
 
     command.upgrade(config, "head")
-    assert {"users", "auth_sessions"} <= tables()
+    assert {"users", "auth_sessions", "lab_sessions"} <= tables()

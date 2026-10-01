@@ -9,8 +9,8 @@ from fastapi.testclient import TestClient
 
 from linuxlab.auth.passwords import Passwords
 from linuxlab.auth.sessions import SESSION_IDLE, TOUCH_INTERVAL
+from tests.conftest import AppFactory
 
-from .conftest import AppFactory
 from .support import (
     INVITE_CODE,
     ORIGIN,
