@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 import uuid
 
@@ -11,6 +12,7 @@ from linuxlab.labs.runtime import (
     ContainerNotRunningError,
     LabContainerSpec,
     LabRuntime,
+    LabRuntimeError,
     RuntimeUnavailableError,
     TerminalSize,
 )
@@ -212,6 +214,58 @@ async def test_closing_a_terminal_after_its_lab_ended_is_not_an_error(
         await terminal.close()
     finally:
         await runtime.remove(info.id)
+
+
+@pytest.mark.parametrize("ending", ["kill", "remove"])
+@pytest.mark.parametrize("attempt", range(3))
+async def test_lab_ending_during_terminal_cleanup_is_not_an_error(
+    runtime: DockerRuntime,
+    docker_client: aiodocker.Docker,
+    caplog: pytest.LogCaptureFixture,
+    ending: str,
+    attempt: int,
+) -> None:
+    """The lab is killed or removed while the cleanup exec is running.
+
+    The exec then ends with whatever code the runtime gives a process whose container
+    died (137 under runc, 128 or 137 under runsc), and Docker keeps reporting the
+    container as running for a moment after that. Neither is a cleanup failure.
+    """
+    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    try:
+        await runtime.start(info.id)
+        terminal = await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))
+        # Ignoring SIGHUP keeps the cleanup waiting about a second before SIGKILL,
+        # so the lab ends while the cleanup exec is still running.
+        await terminal.write(b"trap '' HUP; sleep 361\r")
+        await asyncio.sleep(0.5)
+        container = docker_client.containers.container(info.id)
+
+        with caplog.at_level(logging.WARNING, logger="linuxlab"):
+            closing = asyncio.create_task(terminal.close())
+            await asyncio.sleep(0.4)
+            assert not closing.done()
+            if ending == "kill":
+                await container.kill()
+            else:
+                await container.delete(force=True)
+            async with asyncio.timeout(15):
+                await closing
+
+        assert [record.getMessage() for record in caplog.records] == []
+    finally:
+        await runtime.remove(info.id)
+
+
+async def test_cleanup_failure_on_a_running_lab_is_reported(
+    runtime: DockerRuntime, lab: ContainerInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("linuxlab.labs.runtime.docker.END_TERMINAL_SCRIPT", "raise SystemExit(3)")
+    monkeypatch.setattr("linuxlab.labs.runtime.docker.SETTLE_SECONDS", 0.5)
+
+    with pytest.raises(LabRuntimeError, match="terminal cleanup failed: exit 3"):
+        await runtime.end_terminal_processes(lab.id, "token")
+    assert (await runtime.inspect(lab.id)).running
 
 
 async def test_terminal_requires_a_running_container(runtime: DockerRuntime) -> None:

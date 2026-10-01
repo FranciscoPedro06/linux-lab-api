@@ -57,6 +57,8 @@ TERMINAL_COMMAND = ["bash", "--login"]
 TERMINAL_MARKER = "LINUXLAB_TERMINAL"
 TERMINAL_CONTROL_SECONDS = 5
 TERMINAL_CLEANUP_SECONDS = 10
+# How long a failed cleanup waits for the container to stop before reporting an error.
+SETTLE_SECONDS = 2
 
 # Closing the connection to a TTY exec does not end anything inside the container:
 # the shell and everything started from it keep running. On close, this runs as the
@@ -254,18 +256,34 @@ class DockerRuntime:
             time_limit=TERMINAL_CLEANUP_SECONDS,
         )
         if result.exit_code != 0:
-            # The lab may have been removed or stopped while the cleanup ran; then
+            # The lab may have been stopped or removed while the cleanup ran; then
             # there is nothing left to end.
-            try:
-                if not (await self.inspect(container_id)).running:
-                    return 0
-            except ContainerNotFoundError:
+            if await self._stops_soon(container_id):
                 return 0
             raise LabRuntimeError(
                 f"{container_id}: terminal cleanup failed: exit {result.exit_code}, "
                 f"timed out {result.timed_out}, stderr {result.stderr!r}"
             )
         return int(result.stdout)
+
+    async def _stops_soon(self, container_id: str) -> bool:
+        """Whether the container is gone or stops within SETTLE_SECONDS.
+
+        An exec ends as soon as its container is killed, but Docker keeps reporting
+        the container as running for some tens of milliseconds afterwards, under
+        runc and runsc alike, so a single inspect right after the exec can still
+        see it running.
+        """
+        try:
+            async with asyncio.timeout(SETTLE_SECONDS):
+                await self._client.containers.container(container_id).wait(condition="not-running")
+        except TimeoutError:
+            return False
+        except DockerError as error:
+            if error.status == 404:
+                return True
+            raise _translate(error, container_id) from error
+        return True
 
     async def stop(self, container_id: str) -> None:
         try:
