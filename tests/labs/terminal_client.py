@@ -11,6 +11,8 @@ from fastapi import FastAPI
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.typing import Origin
 
+from linuxlab.auth.cookies import SESSION_COOKIE
+
 ORIGIN = "http://localhost:5173"
 
 
@@ -32,11 +34,14 @@ async def serve(app: FastAPI) -> AsyncIterator[str]:
 
 @asynccontextmanager
 async def terminal(
-    base_url: str, lab_id: str, *, origin: str | None = ORIGIN
+    base_url: str, lab_id: str, token: str | None, *, origin: str | None = ORIGIN
 ) -> AsyncIterator[ClientConnection]:
+    """Open the lab's terminal WebSocket with the given session token, or none."""
+    headers = {"cookie": f"{SESSION_COOKIE}={token}"} if token is not None else None
     async with connect(
         f"{base_url}/ws/labs/{lab_id}/terminal",
         origin=Origin(origin) if origin else None,
+        additional_headers=headers,
         open_timeout=10,
     ) as websocket:
         yield websocket
