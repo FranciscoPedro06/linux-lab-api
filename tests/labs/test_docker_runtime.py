@@ -298,6 +298,16 @@ async def test_lab_ending_during_terminal_cleanup_is_not_an_error(
         await runtime.remove(info.id)
 
 
+async def test_concurrent_removals_all_succeed(runtime: DockerRuntime) -> None:
+    info = await runtime.create(lab_spec())
+    await runtime.start(info.id)
+
+    await asyncio.gather(*(runtime.remove(info.id) for _ in range(3)))
+
+    with pytest.raises(ContainerNotFoundError):
+        await runtime.inspect(info.id)
+
+
 async def test_cleanup_failure_on_a_running_lab_is_reported(
     runtime: DockerRuntime, lab: ContainerInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
