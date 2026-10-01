@@ -5,7 +5,7 @@ The terminal gives the browser an interactive shell inside a lab. Nothing is emu
 ```
 browser: xterm.js (linux-lab-web)
    | WebSocket, same origin (/ws)
-API: router.py -> access.py -> relay.py
+API: router.py -> session, access.py, lifecycle.py -> relay.py
    | LabRuntime.open_terminal
 DockerRuntime: docker exec with Tty=true, stdin attached, as the student
    |
@@ -14,10 +14,11 @@ lab container: bash --login, stdin/stdout on the exec's TTY
 
 | Module | Responsibility |
 |---|---|
-| `labs/terminal/router.py` | WebSocket endpoint: origin check, lab access, init, logging, close codes |
+| `labs/terminal/router.py` | WebSocket endpoint: origin, session and lab checks, init, logging, close codes |
 | `labs/terminal/protocol.py` | Message format, limits and close codes |
-| `labs/terminal/relay.py` | Moves bytes both ways; one connection per lab; output pacing |
-| `labs/access.py` | Decides which lab a request may use |
+| `labs/terminal/relay.py` | Moves bytes both ways; the terminal registry (one connection per lab, closing a lab's terminal, activity); output pacing |
+| `labs/access.py` | Resolves a lab id for a user: only that user's own lab |
+| `labs/lifecycle.py` | Lab state; checks the container and ends the lab when it died |
 | `labs/runtime/docker.py` | `open_terminal`, `DockerTerminalSession` and process cleanup |
 
 The API never parses or filters what is typed. The student can run anything the lab allows; isolation is the runtime's job (see [runtime.md](runtime.md) and [threat-model.md](threat-model.md)).
@@ -56,22 +57,30 @@ Server to client:
 | HTTP 403 | `Origin` is missing or not in `ALLOWED_ORIGINS` (the handshake is refused) |
 | 1008 | Invalid message: first message not `init`, bad JSON, unknown type, extra fields, size out of range, `init` sent twice, or no `init` in time |
 | 1009 | Input frame over 64 KiB or control message over 1 KiB |
-| 1011 | The runtime failed while starting or running the terminal |
+| 1011 | The runtime failed while starting or running the terminal, or the session or lab could not be checked |
 | 4000 | The shell exited (`exit`, Ctrl+D) |
-| 4404 | The lab does not exist, is not running, or may not be used |
+| 4401 | No session cookie, or the session is unknown or expired |
+| 4404 | The lab does not exist or belongs to another user |
 | 4409 | Another connection opened a terminal on the same lab |
+| 4410 | The lab is not ready (ended, ending or still provisioning), its container is no longer running, or it ended during the connection |
+
+4401 is about the session and 4410 about the lab: a valid session on someone else's lab is 4404, never 4410, so a lab's state is only revealed to its owner. How the web client reacts to each code, including automatic reconnection, is in [api.md](api.md#terminal).
 
 ## Connection lifecycle
 
 1. The `Origin` header is checked before the handshake is accepted. Browsers always send it on WebSocket handshakes, and it is the only protection against a third-party page opening a socket.
-2. `lab_access.resolve(lab_id)` returns the lab's running container or refuses with 4404. The container is never chosen from anything else the client sends.
-3. The client sends `init` with the size xterm.js computed for its container.
-4. If the lab already has a terminal connection, that one is closed with 4409 and its shell is ended.
-5. The runtime starts `bash --login` as the student on a PTY of the requested size, and the server sends `ready`.
-6. Input and output run as two asyncio tasks, with a third waiting for a replacement. When one finishes, the others are cancelled and awaited.
-7. Whatever ended the connection, the terminal session is closed (see below) before the WebSocket is closed with the matching code.
+2. The handshake is accepted, so that every later refusal can be a close code the page sees.
+3. The session cookie sent with the handshake is resolved like any API request: missing, unknown or expired closes with 4401.
+4. `owned_lab(user, lab_id)` returns the lab only if that user owns it (4404 otherwise). The lab must be `ready` (4410 otherwise), and its container must be running and carry this deployment's labels. A container found stopped or missing ends the lab (`oom` when Docker reports an OOM kill, `container_lost` otherwise) and closes with 4410. The container is never chosen from anything else the client sends.
+5. The client sends `init` with the size xterm.js computed for its container.
+6. The connection claims the lab in the terminal registry. If the lab already has a terminal connection, that one is closed with 4409 and its shell is ended. The lab's state is read again: if it ended between step 4 and the claim, the connection closes with 4410. From the claim on, ending the lab stops this connection.
+7. The runtime starts `bash --login` as the student on a PTY of the requested size, and the server sends `ready`.
+8. Input and output run as two asyncio tasks, with a third waiting for the claim to be stopped (replaced, or the lab ended). When one finishes, the others are cancelled and awaited.
+9. Whatever ended the connection, the terminal session is closed (see below) before the WebSocket is closed with the matching code. If the shell ended or the runtime failed, the container is checked: if it died, the lab is ended and the close code is 4410 rather than 4000 or 1011.
 
 Keepalive pings are handled by uvicorn at the WebSocket protocol level (every 20 seconds by default), so a connection whose network disappeared is detected and ends like any other disconnect.
+
+Connecting, disconnecting and every input frame are recorded as activity for the lab's idle timeouts ([architecture.md](architecture.md#timeouts)); output is not. Recording is an in-memory update; the reaper stores it.
 
 ## PTY
 
@@ -93,7 +102,9 @@ So when a terminal ends for any reason (tab closed, network lost, client closed,
 
 The effect is that of a hangup: everything started from that terminal ends with it, including `nohup` jobs. A process survives only if it left the session and removed the token from its environment. Other terminals on the same lab are not affected. If the lab itself has stopped (for example after an OOM), there is nothing left to clean up.
 
-There is no global cleanup yet: labs, and anything detached inside them, live until the lab is removed.
+Anything detached inside a lab lives until the lab is removed, which the reaper does once the lab times out ([architecture.md](architecture.md#timeouts)).
+
+If the lab is killed or removed while the cleanup runs, the cleanup exec dies with it (exit 137 under runc, 128 or 137 under runsc), and Docker keeps reporting the container as running for some tens of milliseconds. A failed cleanup therefore waits up to two seconds for the container to stop or disappear; only a cleanup that fails on a lab that keeps running is reported as an error. This removed a false `terminal cleanup failed: exit 128` error logged under runsc, and both cases are covered by tests under runc and runsc.
 
 ## Limits
 
@@ -112,18 +123,16 @@ Output is never truncated or dropped. Output frames are at most 64 KiB. The rate
 
 ## Access and authentication
 
-`LabAccess.resolve(lab_id)` is the only way the terminal obtains a container. It is the point where authentication and ownership will be checked.
+The terminal belongs to lab sessions ([architecture.md](architecture.md#labs)). A connection needs a valid session cookie and a ready lab owned by that session's user. Knowing a lab id, or a container name, grants nothing. There is no development mode: locally, sign up with the invite code, start a lab from the home page and open its terminal.
 
-The current implementation, `DevelopmentLabAccess`, grants any running lab created by the platform to whoever knows its id (32 random hex characters). It is enabled only with `DEV_TERMINAL_ACCESS=true`; otherwise the terminal route does not exist. With user sessions, it is replaced by a lookup of the caller's own active lab, and the handshake gains a session check.
+When a lab ends (delete, logout, a timeout, the container dying), its terminal is closed with 4410 and its cleanup finishes before the container is removed, so the order is always lab, terminal, exec cleanup, container. Ending a lab only ever closes that lab's connection.
 
 ## Development
 
-With the Compose environment running (see the README), create a lab and open the address it prints:
+With the Compose environment running (see the README), build the lab image once, sign up at http://localhost:5173/signup with the `SIGNUP_INVITE_CODE` Compose was started with, and start a lab from the home page:
 
 ```sh
 docker build --tag linuxlab/lab-base:dev lab-image
-docker compose -f infra/compose.yml exec api python -m linuxlab.labs.devlab create
-docker compose -f infra/compose.yml exec api python -m linuxlab.labs.devlab remove <lab-id>
 ```
 
 ## Logging
@@ -131,11 +140,11 @@ docker compose -f infra/compose.yml exec api python -m linuxlab.labs.devlab remo
 The API logs, for each connection, a short random connection id and the lab id, with:
 
 - `terminal opened`: terminal size;
-- `terminal closed`: reason (`shell_exited`, `client_closed`, `replaced`, or the error type), exit code, duration, bytes in and out;
-- `terminal rejected`: origin, lab unavailable, or protocol error;
+- `terminal closed`: reason (`shell_exited`, `client_closed`, `replaced`, `lab_ended`, or the error type), exit code, duration, bytes in and out;
+- `terminal rejected`: origin, `not_authenticated`, `lab_unavailable`, the lab's state (`lab_terminated`, `lab_provisioning`, ...), `lab_gone`, or a protocol error;
 - failures to start, run or clean up the terminal.
 
-Terminal content, typed commands and the terminal token are never logged.
+Terminal content, typed commands, session tokens and the terminal token are never logged.
 
 ## Known behavior
 
