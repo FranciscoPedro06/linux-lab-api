@@ -21,8 +21,13 @@ class CloseCode(IntEnum):
     MESSAGE_TOO_BIG = 1009
     SERVER_ERROR = 1011
     SHELL_EXITED = 4000
+    # No session cookie, or the session is unknown or expired.
+    NOT_AUTHENTICATED = 4401
+    # No such lab, or it belongs to another user.
     LAB_UNAVAILABLE = 4404
     REPLACED = 4409
+    # The lab is not ready: it has ended (or is ending), or is still provisioning.
+    LAB_ENDED = 4410
 
 
 class ProtocolError(Exception):

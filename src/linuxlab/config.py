@@ -32,10 +32,6 @@ class Settings(LabSettings):
     # disables sign-up.
     signup_invite_code: SecretStr | None = None
 
-    # Enables the terminal WebSocket without authentication, for local development.
-    # Anyone who can reach the API and knows a lab id can use that lab.
-    dev_terminal_access: bool = False
-
     @field_validator("allowed_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: Any) -> Any:

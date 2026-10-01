@@ -15,7 +15,6 @@ from linuxlab.auth.ratelimit import RateLimiter
 from linuxlab.config import Settings, get_settings
 from linuxlab.db import create_engine, create_sessionmaker
 from linuxlab.labs import router as labs
-from linuxlab.labs.access import DevelopmentLabAccess
 from linuxlab.labs.lifecycle import Labs
 from linuxlab.labs.reaper import run_reaper
 from linuxlab.labs.router import CREATE_ATTEMPTS, CREATE_WINDOW_SECONDS
@@ -63,8 +62,6 @@ def create_app(
             deployment=settings.lab_deployment,
             capacity=settings.lab_capacity,
         )
-        if settings.dev_terminal_access:
-            app.state.lab_access = DevelopmentLabAccess(runtime)
         reaper = None
         if start_reaper:
             reaper = asyncio.create_task(run_reaper(app.state.labs), name="lab-reaper")
@@ -84,8 +81,7 @@ def create_app(
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(labs.router)
-    if settings.dev_terminal_access:
-        app.include_router(terminal.router)
+    app.include_router(terminal.router)
     return app
 
 

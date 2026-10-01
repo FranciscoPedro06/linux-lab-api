@@ -11,8 +11,6 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from linuxlab.labs.models import LabSession
-from linuxlab.labs.runtime import ContainerInfo, ContainerNotFoundError, LabRuntime
-from linuxlab.labs.runtime.spec import LAB_ID_LABEL, MANAGED_LABEL, container_name
 
 # Lab ids appear in URLs in canonical UUID form only.
 LAB_ID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -36,32 +34,3 @@ async def owned_lab(db: AsyncSession, user_id: uuid.UUID, raw_id: str) -> LabSes
     if lab is None or lab.user_id != user_id:
         return None
     return lab
-
-
-# Development terminal access, removed together with DEV_TERMINAL_ACCESS once the
-# terminal is authenticated.
-
-DEV_LAB_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
-
-
-class LabUnavailableError(Exception):
-    pass
-
-
-class DevelopmentLabAccess:
-    """Grants any running lab created by the platform to whoever knows its id."""
-
-    def __init__(self, runtime: LabRuntime) -> None:
-        self._runtime = runtime
-
-    async def resolve(self, lab_id: str) -> ContainerInfo:
-        if not DEV_LAB_ID_PATTERN.fullmatch(lab_id):
-            raise LabUnavailableError(lab_id)
-        try:
-            info = await self._runtime.inspect(container_name(lab_id))
-        except ContainerNotFoundError:
-            raise LabUnavailableError(lab_id) from None
-        managed = info.labels.get(MANAGED_LABEL) == "true"
-        if not (managed and info.labels.get(LAB_ID_LABEL) == lab_id and info.running):
-            raise LabUnavailableError(lab_id)
-        return info

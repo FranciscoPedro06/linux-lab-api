@@ -3,7 +3,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Protocol
 
 import aiodocker
 
@@ -29,6 +29,11 @@ def lab_spec(lab_id: str | None = None) -> LabContainerSpec:
     )
 
 
+class Container(Protocol):
+    @property
+    def id(self) -> str: ...
+
+
 @asynccontextmanager
 async def running_lab(runtime: DockerRuntime) -> AsyncIterator[ContainerInfo]:
     info = await runtime.create(lab_spec())
@@ -41,7 +46,7 @@ async def running_lab(runtime: DockerRuntime) -> AsyncIterator[ContainerInfo]:
 
 async def sh(
     runtime: DockerRuntime,
-    lab: ContainerInfo,
+    lab: Container,
     script: str,
     *,
     user: ExecUser = "student",
@@ -66,6 +71,6 @@ async def read_until(terminal: TerminalSession, needle: bytes, seconds: float = 
     return output
 
 
-async def processes(runtime: DockerRuntime, lab: ContainerInfo, pattern: str) -> list[str]:
+async def processes(runtime: DockerRuntime, lab: Container, pattern: str) -> list[str]:
     result = await sh(runtime, lab, f"pgrep -a -f '{pattern}' || true")
     return [line for line in result.stdout.decode().splitlines() if "pgrep" not in line]
