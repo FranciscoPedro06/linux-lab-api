@@ -7,6 +7,7 @@ from sqlalchemy.engine import Connection
 from linuxlab.auth import models as auth_models  # noqa: F401  (registers the tables)
 from linuxlab.config import get_settings
 from linuxlab.db import Base, create_engine
+from linuxlab.labs import models as lab_models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
