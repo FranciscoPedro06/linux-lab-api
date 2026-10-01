@@ -27,20 +27,6 @@ jobs:
     name: Isolation tests (runsc)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: linuxlab
-          POSTGRES_PASSWORD: linuxlab
-          POSTGRES_DB: linuxlab
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U linuxlab -d linuxlab"
-          --health-interval 2s
-          --health-timeout 3s
-          --health-retries 15
     env:
       DATABASE_URL: postgresql+asyncpg://linuxlab:linuxlab@localhost:5432/linuxlab
       LINUXLAB_TEST_OCI_RUNTIME: runsc
@@ -71,6 +57,19 @@ jobs:
           output=$(docker run --rm --runtime=runsc --network=none ubuntu:24.04 dmesg)
           echo "$output"
           grep -q gVisor <<<"$output"
+
+      # Started here rather than as a service: installing gVisor restarts Docker,
+      # which would stop a service container.
+      - name: Start PostgreSQL
+        run: |
+          docker run --detach --name postgres --publish 5432:5432 \
+            --env POSTGRES_USER=linuxlab --env POSTGRES_PASSWORD=linuxlab \
+            --env POSTGRES_DB=linuxlab postgres:16-alpine
+          for _ in $(seq 30); do
+            docker exec postgres pg_isready -U linuxlab -d linuxlab && exit 0
+            sleep 1
+          done
+          exit 1
 
       - uses: astral-sh/setup-uv@v10.2.0
         with:
