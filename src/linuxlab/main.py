@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,6 +17,7 @@ from linuxlab.db import create_engine, create_sessionmaker
 from linuxlab.labs import router as labs
 from linuxlab.labs.access import DevelopmentLabAccess
 from linuxlab.labs.lifecycle import Labs
+from linuxlab.labs.reaper import run_reaper
 from linuxlab.labs.router import CREATE_ATTEMPTS, CREATE_WINDOW_SECONDS
 from linuxlab.labs.runtime import LabRuntime
 from linuxlab.labs.runtime.docker import DockerRuntime
@@ -23,9 +26,16 @@ from linuxlab.labs.terminal.relay import TerminalRegistry
 
 
 def create_app(
-    settings: Settings | None = None, *, lab_runtime: LabRuntime | None = None
+    settings: Settings | None = None,
+    *,
+    lab_runtime: LabRuntime | None = None,
+    start_reaper: bool = True,
 ) -> FastAPI:
-    """Build the application. `lab_runtime` replaces the Docker runtime in tests."""
+    """Build the application.
+
+    Tests replace the Docker runtime with `lab_runtime` and run reconciliation
+    themselves instead of starting the reaper.
+    """
     settings = settings or get_settings()
     _configure_logging()
 
@@ -55,9 +65,16 @@ def create_app(
         )
         if settings.dev_terminal_access:
             app.state.lab_access = DevelopmentLabAccess(runtime)
+        reaper = None
+        if start_reaper:
+            reaper = asyncio.create_task(run_reaper(app.state.labs), name="lab-reaper")
         try:
             yield
         finally:
+            if reaper is not None:
+                reaper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reaper
             if docker is not None:
                 await docker.close()
             await engine.dispose()

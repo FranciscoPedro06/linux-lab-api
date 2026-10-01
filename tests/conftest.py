@@ -31,13 +31,18 @@ def app_settings(**overrides: object) -> Settings:
 def make_client() -> Iterator[AppFactory]:
     """Start the API with the given settings on an emptied database.
 
-    Labs run on a FakeRuntime unless `runtime` is given. HTTPS base URL: the session
-    cookie is Secure and would not be sent over http.
+    Labs run on a FakeRuntime unless `runtime` is given, and the reaper only runs if
+    asked; tests call reconcile themselves. HTTPS base URL: the session cookie is
+    Secure and would not be sent over http.
     """
     clients: list[TestClient] = []
 
-    def make(*, runtime: LabRuntime | None = None, **overrides: object) -> TestClient:
-        app = create_app(app_settings(**overrides), lab_runtime=runtime or FakeRuntime())
+    def make(
+        *, runtime: LabRuntime | None = None, reaper: bool = False, **overrides: object
+    ) -> TestClient:
+        app = create_app(
+            app_settings(**overrides), lab_runtime=runtime or FakeRuntime(), start_reaper=reaper
+        )
         client = TestClient(app, base_url="https://testserver", headers={"origin": ORIGIN})
         client.__enter__()
         clients.append(client)

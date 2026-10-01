@@ -308,10 +308,21 @@ class Labs:
 
     # Reconciliation
 
-    async def reconcile(self, *, startup: bool = False) -> None:
-        """One reaper pass. See docs/architecture.md#labs."""
+    async def reconcile(self, *, startup: bool = False, now: datetime | None = None) -> None:
+        """One reaper pass. See docs/architecture.md#labs.
+
+        - stores terminal activity recorded since the last pass;
+        - ends ready labs past a timeout, and ready labs whose container stopped
+          (recording OOM kills) or disappeared;
+        - fails labs stuck in provisioning;
+        - finishes labs left in terminating or failed, after a grace period that does
+          not apply at startup;
+        - removes this deployment's lab containers that have no unfinished lab.
+
+        `now` replaces the current time, for tests.
+        """
         await self._store_activity()
-        now = utcnow()
+        now = now or utcnow()
         # Listed before the rows are read: a container is created only after its row
         # is committed, so every listed lab container has a visible row.
         containers = await self._runtime.list_labs(self._deployment)
