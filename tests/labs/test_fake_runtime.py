@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Sequence
 
 import pytest
@@ -15,7 +16,7 @@ from linuxlab.labs.runtime import (
 )
 from linuxlab.labs.runtime.fake import ExecCall, FakeRuntime
 
-SPEC = LabContainerSpec(lab_id="abc123", image="linuxlab/lab-base:test")
+SPEC = LabContainerSpec(lab_id="abc123", image="linuxlab/lab-base:test", deployment="tests")
 
 
 def test_fake_runtime_satisfies_protocol() -> None:
@@ -30,7 +31,11 @@ async def test_create_returns_stopped_container_with_labels() -> None:
 
     assert info.name == "ll-lab-abc123"
     assert not info.running
-    assert info.labels == {"linuxlab.managed": "true", "linuxlab.lab_id": "abc123"}
+    assert info.labels == {
+        "linuxlab.managed": "true",
+        "linuxlab.lab_id": "abc123",
+        "linuxlab.deployment": "tests",
+    }
 
 
 async def test_create_rejects_duplicate_name() -> None:
@@ -160,3 +165,49 @@ async def test_terminal_requires_running_container() -> None:
 
     with pytest.raises(ContainerNotRunningError):
         await runtime.open_terminal(info.id, TerminalSize(80, 24))
+
+
+async def test_list_labs_selects_by_deployment_and_managed_label() -> None:
+    runtime = FakeRuntime()
+    mine = await runtime.create(SPEC)
+    await runtime.create(LabContainerSpec(lab_id="def456", image="test", deployment="other"))
+    runtime.add_container("ll-lab-0000", {"linuxlab.deployment": "tests"})
+
+    assert [info.id for info in await runtime.list_labs("tests")] == [mine.id]
+
+
+async def test_crash_stops_the_container_and_ends_its_terminals() -> None:
+    runtime = FakeRuntime()
+    info = await runtime.create(SPEC)
+    await runtime.start(info.id)
+    terminal = await runtime.open_terminal(info.id, TerminalSize(80, 24))
+
+    runtime.crash(info.id, oom=True)
+
+    inspected = await runtime.inspect(info.id)
+    assert not inspected.running
+    assert inspected.oom_killed
+    assert await terminal.read() is None
+
+
+async def test_failures_can_be_injected_per_operation() -> None:
+    runtime = FakeRuntime(fail={"start"})
+    info = await runtime.create(SPEC)
+
+    with pytest.raises(LabRuntimeError):
+        await runtime.start(info.id)
+    runtime.available = False
+    with pytest.raises(LabRuntimeError):
+        await runtime.inspect(info.id)
+
+
+async def test_gated_operation_waits_for_its_event() -> None:
+    gate = asyncio.Event()
+    runtime = FakeRuntime(gates={"create": gate})
+
+    creating = asyncio.create_task(runtime.create(SPEC))
+    await asyncio.sleep(0.05)
+    assert not creating.done()
+    gate.set()
+
+    assert (await creating).name == "ll-lab-abc123"

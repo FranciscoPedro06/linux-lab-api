@@ -1,6 +1,6 @@
 # Lab runtime
 
-The lab runtime creates and controls the containers students work in. It is not connected to the HTTP API yet; it is exercised by tests.
+The lab runtime creates and controls the containers students work in. The lab lifecycle (`src/linuxlab/labs/lifecycle.py`, see [architecture.md](architecture.md#labs)) is its only caller in the application.
 
 ```
 application code
@@ -15,12 +15,13 @@ LabRuntime (protocol)          src/linuxlab/labs/runtime/base.py
 | Operation | Behavior |
 |---|---|
 | `ping()` | Fails with `RuntimeUnavailableError` if Docker is unreachable or the configured OCI runtime is not registered |
-| `create(spec)` | Creates `ll-lab-<lab_id>` with the isolation settings from `spec.py`; does not start it |
+| `create(spec)` | Creates `ll-lab-<lab_id>` with the isolation settings from `spec.py` and the labels `linuxlab.managed=true`, `linuxlab.lab_id` and `linuxlab.deployment`; does not start it |
+| `list_labs(deployment)` | Every container labeled `linuxlab.managed=true` and `linuxlab.deployment=<deployment>`, running or not. Selected by labels, never by name |
 | `start(id)`, `stop(id)` | Start, or stop with a 2 second grace period |
-| `inspect(id)` | Name, running state and `linuxlab.*` labels |
+| `inspect(id)` | Name, running state, `linuxlab.*` labels, and whether the container was OOM-killed |
 | `exec(id, argv, user, time_limit)` | Runs argv without a shell as `student` or `root` |
 | `open_terminal(id, size)` | Starts `bash --login` as the student on a PTY and returns a `TerminalSession` (read, write, resize, close); see [terminal.md](terminal.md) |
-| `remove(id)` | Force-removes the container; a missing container is not an error |
+| `remove(id)` | Force-removes the container; a missing container is not an error, and a removal already in progress is waited for (up to 10 s) |
 
 `exec` details:
 
@@ -92,13 +93,15 @@ docker run --rm --runtime=runsc --network=none ubuntu:24.04 dmesg         # gVis
 docker build --tag linuxlab/lab-base:dev lab-image
 
 uv run pytest                                   # unit tests, no Docker
-uv run pytest -m docker                         # integration and isolation under runc
+uv run pytest -m docker                         # runtime, isolation, terminal and lab lifecycle under runc
 LINUXLAB_TEST_OCI_RUNTIME=runsc uv run pytest -m "docker or runsc"
 ```
 
 `LINUXLAB_LAB_IMAGE` selects another image tag. The pytest header shows the runtime and image in use (`lab runtime: runsc, lab image: ...`). Tests marked `runsc` are skipped, with the reason shown, unless the runtime is `runsc`.
 
-The `Runtime` workflow installs gVisor on an Ubuntu runner and runs the last command. It runs on pushes to `main`, on pull requests that touch the runtime, the lab image or the workflow, and on demand. It is not a required check yet.
+Tests that use the lab lifecycle or the terminal also need PostgreSQL at `DATABASE_URL`, with migrations applied. Every lab container a test creates is labeled with a test-only `linuxlab.deployment`, so a local environment's reaper never removes it, and vice versa.
+
+The `CI` workflow runs the Docker tests under runc (job `Lab integration (Docker, runc)`). The `Runtime` workflow installs gVisor on an Ubuntu runner, with a PostgreSQL service, and runs the last command. It runs on pushes to `main`, on pull requests that touch application code, migrations, tests, the lab image or the workflow, and on demand. It is not a required check yet.
 
 ## Verification status
 
@@ -133,7 +136,7 @@ Every check runs commands inside a real lab and asserts what was allowed, not wh
 ## Known limitations
 
 - Under gVisor the Docker seccomp profile is not what filters the student's syscalls; the test records the reported value instead of asserting it.
-- Under gVisor a lab that exceeds its memory stops, including when many heavy processes are forked. The host and other labs are unaffected, but the student loses the environment. Detecting this and telling the student is left for the lab lifecycle work (increment 05).
+- Under gVisor a lab that exceeds its memory stops, including when many heavy processes are forked. The host and other labs are unaffected, but the student loses the environment. The lab lifecycle detects it from `OOMKilled` and ends the lab with `end_reason = oom`, which the web client shows.
 - The process limit under gVisor relies on `nproc` being reached before the sandbox's 512 host threads. This holds for 128 student processes (about 290 host threads observed), with margin for platform execs.
 - The CPU check measures one busy thread for 5 seconds. It shows the quota is applied, not how it behaves under contention.
 - Closing the connection to a TTY exec leaves the shell and its processes running; terminal sessions end them explicitly on close (see [terminal.md](terminal.md#disconnection-and-cleanup)).

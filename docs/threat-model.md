@@ -14,7 +14,7 @@ Controls that rely on the student not being root are defense in depth, never the
 | Lab to network | `network_mode: none` |
 | Lab to other labs | Separate containers, no network, per-cgroup resource limits |
 | Lab to API | No channel initiated by the lab; `labctl` output is treated as untrusted input |
-| Browser to another user's lab | Ownership check on every route and on the WebSocket handshake. Until lab sessions exist (increment 05), the terminal is not tied to accounts: it is available only with `DEV_TERMINAL_ACCESS` and trusts any running platform lab whose id is known |
+| Browser to another user's lab | Ownership check, from the session and the lab id together, on every lab route and on the WebSocket handshake (see [Lab sessions](#lab-sessions)) |
 | Third-party site to user session | `SameSite=Lax` `__Host-` cookie, `Origin` and `Content-Type: application/json` required on every non-GET request, checked before the body is read |
 | Internet to accounts | Argon2id hashes, server-side sessions stored as SHA-256, rate limits on sign-up and login, invite code |
 
@@ -24,7 +24,7 @@ Built by a single function and covered by a snapshot test. Any change requires a
 
 | Setting | Value |
 |---|---|
-| Runtime | `runsc` in production; the API refuses to start in production with any other runtime. `runc` in development only |
+| Runtime | `runsc` in production: with `ENVIRONMENT=production`, the default, the API refuses to start unless `LAB_OCI_RUNTIME=runsc` and Docker has `runsc` registered. `runc` only with `ENVIRONMENT=development` |
 | Network | `none` |
 | Rootfs | Read-only |
 | tmpfs | `/home/student` 64 MB and `/tmp` 32 MB with `exec`; `/run/lab` 1 MB with `noexec`; all `nosuid,nodev` |
@@ -58,9 +58,9 @@ Observed differences between the runtimes are listed in [runtime.md](runtime.md#
 | Disk writes | `ENOSPC` once the tmpfs is full |
 | Continuous terminal output | Paced at about 256 KiB/s per connection; the PTY buffer fills and the writing process blocks |
 | Long-running processes | Killed with the container |
-| Repeated lab creation | One lab per user (constraint), rate limit and global cap |
+| Repeated lab creation | One active lab per user (constraint), 10 creations per user per 10 minutes, and a global cap (`LAB_CAPACITY`) |
 
-Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with no input, or 2 hours in total.
+Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with no input, or 2 hours in total, by the reaper ([architecture.md](architecture.md#timeouts)).
 
 ## Authentication
 
@@ -76,6 +76,27 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 | Account enumeration on login | Same status, code and message for unknown email and wrong password; an unknown email still runs one Argon2 verification |
 | Unwanted sign-ups | Invite code compared in constant time; sign-up disabled when none is configured |
 | Stored markup in names | Display names are stored as text, without control characters; the frontend renders them as text |
+
+## Lab sessions
+
+| Threat | Control |
+|---|---|
+| Using another user's lab by its id (IDOR) | Every lab route and the terminal resolve the lab from the session's user and the id together. A missing lab and another user's lab return the same `404` / `4404`; a lab's state is only revealed to its owner |
+| Guessing or reusing lab ids, container names or ids | Lab ids are random UUIDs, and knowing one grants nothing without the owner's session. Container names and ids are never returned and are not accepted as lab ids |
+| Choosing the owner, container, image, runtime, user or limits | `POST /api/labs` takes `{}` and refuses extra fields. Image, runtime, deployment label and limits come from server configuration; the terminal runs as uid 1000, chosen by the API. No route forwards anything to the Docker API |
+| Unauthenticated or expired terminal | The handshake resolves the session cookie like any request and closes with `4401` |
+| Terminal kept open after its lab ended | Ending a lab closes its terminal (`4410`) before removing the container; reconnecting to an ended lab is refused with `4410` |
+| Two labs for one user through concurrent requests | Partial unique index `one_active_lab_per_user`; creation also serializes on an advisory lock for the global cap |
+| Reviving an ended lab | Conditional status updates and a database trigger that only allows the lifecycle's transitions |
+| Concurrent delete, logout and reaper on one lab | All three take the same idempotent path; the first end reason is kept |
+| Logout leaving a usable lab | Logout ends the lab before deleting the session, and keeps the session if ending the lab fails |
+| Orphan containers (API crash, failed removal) | The reaper removes this deployment's lab containers with no unfinished lab and retries unfinished removals |
+| Reaper removing containers that are not its own | Containers are selected by the `linuxlab.managed` and `linuxlab.deployment` labels and accepted only with the matching lab id and name. Containers without them, or of another deployment, are left alone |
+| One user's lab affecting another's | The reaper, delete and logout act on one lab id at a time; ending a lab closes only that lab's terminal. Covered by tests for delete, logout and the reaper |
+| Exhausting the host with labs | One active lab per user, at most 10 creations per user per 10 minutes, a global cap (`LAB_CAPACITY`), and idle and lifetime timeouts. The two numbers are provisional ([architecture.md](architecture.md#values-chosen-in-increment-05)) |
+| A lab silently gone (OOM under gVisor, container removed) | The terminal and the reaper detect the stopped container; the lab ends with `oom` or `container_lost` and the student is told why |
+| Information in the health check | `/api/health` returns only `ok` or `unavailable` per dependency |
+| Labs under runc in production | `ENVIRONMENT=production` (the default) refuses to start unless `LAB_OCI_RUNTIME=runsc` and Docker has `runsc` registered |
 
 ## Validation and setup
 
@@ -102,6 +123,10 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 
 **Rate limiting by peer address, in memory.** Limits are kept in the API process, reset on restart and are not shared between processes, which matches the single-process closed beta. They key on the TCP peer: behind a reverse proxy all clients share one address and one budget, and one address can hold many users (NAT) or one user many addresses. `X-Forwarded-For` is ignored until a trusted proxy is configured. This has to be revisited together with the Caddy deployment.
 
+**Lab state in one process.** Terminal connections and their activity live in the single API process; activity reaches the database at most 30 seconds late, and is lost if the API crashes in between, which can only shorten a lab's idle time. Running more than one API process requires moving lab control into its own service (`lab-agent`).
+
+**Deployment label.** Reconciliation trusts the `linuxlab.deployment` label. Two deployments configured with the same `LAB_DEPLOYMENT` on one Docker Engine would remove each other's labs as orphans; each deployment must use its own value. Changing a deployment's value while it has labs leaves their containers outside its reconciliation: the labs end as `container_lost` and their containers must be removed by hand, so the value has to stay fixed for a deployment's lifetime.
+
 **No account lockout or password breach check.** Password guessing is slowed by the rate limit only. Password reset and email verification do not exist yet, which also rules out public sign-up.
 
 ## Verification
@@ -110,6 +135,4 @@ Isolation is checked by tests that run commands inside a real lab, under both ru
 
 A process started by `docker exec` keeps running when the client disconnects. Terminal sessions therefore end their shell and every process started from it when the connection ends, running the cleanup as the student ([terminal.md](terminal.md#disconnection-and-cleanup)).
 
-Still open:
-
-1. Detecting that a lab stopped because of OOM, which under runsc is the normal outcome of exceeding memory, and reporting it to the student. This is part of the lab lifecycle work.
+A lab stopped by an OOM kill, the normal outcome of exceeding memory under runsc, is detected and reported to the student (`end_reason = oom`), checked by tests under runc and runsc.

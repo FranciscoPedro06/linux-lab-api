@@ -12,6 +12,7 @@ from linuxlab.labs.runtime.base import LabContainerSpec
 LABEL_PREFIX = "linuxlab."
 MANAGED_LABEL = f"{LABEL_PREFIX}managed"
 LAB_ID_LABEL = f"{LABEL_PREFIX}lab_id"
+DEPLOYMENT_LABEL = f"{LABEL_PREFIX}deployment"
 CONTAINER_NAME_PREFIX = "ll-lab-"
 
 STUDENT_UID = 1000
@@ -58,7 +59,11 @@ def build_container_config(spec: LabContainerSpec, oci_runtime: str) -> dict[str
         "WorkingDir": STUDENT_HOME,
         "Hostname": "linuxlab",
         "Env": ["LANG=C.UTF-8"],
-        "Labels": {MANAGED_LABEL: "true", LAB_ID_LABEL: spec.lab_id},
+        "Labels": {
+            MANAGED_LABEL: "true",
+            LAB_ID_LABEL: spec.lab_id,
+            DEPLOYMENT_LABEL: spec.deployment,
+        },
         "HostConfig": {
             "Runtime": oci_runtime,
             "NetworkMode": "none",

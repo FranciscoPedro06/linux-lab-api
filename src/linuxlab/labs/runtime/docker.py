@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -23,7 +24,9 @@ from linuxlab.labs.runtime.base import (
     TerminalSize,
 )
 from linuxlab.labs.runtime.spec import (
+    DEPLOYMENT_LABEL,
     LABEL_PREFIX,
+    MANAGED_LABEL,
     STUDENT_GID,
     STUDENT_HOME,
     STUDENT_UID,
@@ -57,6 +60,10 @@ TERMINAL_COMMAND = ["bash", "--login"]
 TERMINAL_MARKER = "LINUXLAB_TERMINAL"
 TERMINAL_CONTROL_SECONDS = 5
 TERMINAL_CLEANUP_SECONDS = 10
+# How long a failed cleanup waits for the container to stop before reporting an error.
+SETTLE_SECONDS = 2
+# How long remove waits for a removal already started by someone else.
+REMOVAL_WAIT_SECONDS = 10
 
 # Closing the connection to a TTY exec does not end anything inside the container:
 # the shell and everything started from it keep running. On close, this runs as the
@@ -150,6 +157,24 @@ class DockerRuntime:
             raise LabRuntimeError(f"Could not create container: {error.message}") from error
         return await self.inspect(container.id)
 
+    async def list_labs(self, deployment: str) -> list[ContainerInfo]:
+        labels = [f"{MANAGED_LABEL}=true", f"{DEPLOYMENT_LABEL}={deployment}"]
+        try:
+            containers = await self._client.containers.list(
+                all="true", filters=json.dumps({"label": labels})
+            )
+        except (DockerError, aiohttp.ClientError, OSError) as error:
+            raise LabRuntimeError(f"Could not list lab containers: {error}") from error
+        return [
+            ContainerInfo(
+                id=container["Id"],
+                name=(container["Names"] or [""])[0].lstrip("/"),
+                running=container["State"] == "running",
+                labels=_lab_labels(container["Labels"]),
+            )
+            for container in containers
+        ]
+
     async def start(self, container_id: str) -> None:
         try:
             await self._client.containers.container(container_id).start()
@@ -162,11 +187,8 @@ class DockerRuntime:
             id=data["Id"],
             name=data["Name"].lstrip("/"),
             running=bool(data["State"]["Running"]),
-            labels={
-                key: value
-                for key, value in (data["Config"].get("Labels") or {}).items()
-                if key.startswith(LABEL_PREFIX)
-            },
+            labels=_lab_labels(data["Config"].get("Labels")),
+            oom_killed=bool(data["State"].get("OOMKilled")),
         )
 
     async def exec(
@@ -254,18 +276,34 @@ class DockerRuntime:
             time_limit=TERMINAL_CLEANUP_SECONDS,
         )
         if result.exit_code != 0:
-            # The lab may have been removed or stopped while the cleanup ran; then
+            # The lab may have been stopped or removed while the cleanup ran; then
             # there is nothing left to end.
-            try:
-                if not (await self.inspect(container_id)).running:
-                    return 0
-            except ContainerNotFoundError:
+            if await self._stops_soon(container_id):
                 return 0
             raise LabRuntimeError(
                 f"{container_id}: terminal cleanup failed: exit {result.exit_code}, "
                 f"timed out {result.timed_out}, stderr {result.stderr!r}"
             )
         return int(result.stdout)
+
+    async def _stops_soon(self, container_id: str) -> bool:
+        """Whether the container is gone or stops within SETTLE_SECONDS.
+
+        An exec ends as soon as its container is killed, but Docker keeps reporting
+        the container as running for some tens of milliseconds afterwards, under
+        runc and runsc alike, so a single inspect right after the exec can still
+        see it running.
+        """
+        try:
+            async with asyncio.timeout(SETTLE_SECONDS):
+                await self._client.containers.container(container_id).wait(condition="not-running")
+        except TimeoutError:
+            return False
+        except DockerError as error:
+            if error.status == 404:
+                return True
+            raise _translate(error, container_id) from error
+        return True
 
     async def stop(self, container_id: str) -> None:
         try:
@@ -274,11 +312,24 @@ class DockerRuntime:
             raise _translate(error, container_id) from error
 
     async def remove(self, container_id: str) -> None:
+        container = self._client.containers.container(container_id)
         try:
-            await self._client.containers.container(container_id).delete(force=True)
+            await container.delete(force=True)
         except DockerError as error:
-            if error.status != 404:
+            if error.status == 404:
+                return
+            if error.status != 409 or "already in progress" not in error.message:
                 raise _translate(error, container_id) from error
+            # Someone else is removing it (another request, the reaper, an operator):
+            # done once it is gone.
+            try:
+                async with asyncio.timeout(REMOVAL_WAIT_SECONDS):
+                    await container.wait(condition="removed")
+            except TimeoutError:
+                raise LabRuntimeError(f"{container_id}: removal did not finish") from None
+            except DockerError as wait_error:
+                if wait_error.status != 404:
+                    raise _translate(wait_error, container_id) from wait_error
 
     async def _show(self, container_id: str) -> dict[str, Any]:
         try:
@@ -377,6 +428,10 @@ class DockerTerminalSession:
                 return await _wait_exit_code(self._execution)
         except (DockerError, aiohttp.ClientError, OSError, TimeoutError):
             return None
+
+
+def _lab_labels(labels: dict[str, str] | None) -> dict[str, str]:
+    return {key: value for key, value in (labels or {}).items() if key.startswith(LABEL_PREFIX)}
 
 
 def _translate(error: DockerError, container_id: str) -> LabRuntimeError:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 
@@ -12,7 +13,7 @@ from linuxlab.labs.terminal.protocol import (
     Resize,
     parse_control,
 )
-from linuxlab.labs.terminal.relay import OutputPacer, TerminalRegistry
+from linuxlab.labs.terminal.relay import Outcome, OutputPacer, TerminalRegistry
 
 
 def test_parses_init_and_resize() -> None:
@@ -68,7 +69,42 @@ async def test_registry_replaces_the_previous_connection() -> None:
 
     async with registry.claim("lab") as first:
         async with registry.claim("lab") as second:
-            assert first.is_set()
-            assert not second.is_set()
+            assert first.stop.is_set()
+            assert first.outcome is Outcome.REPLACED
+            assert not second.stop.is_set()
+            assert registry.connected("lab")
         assert registry.active() == 0
+        assert not registry.connected("lab")
     assert registry.active() == 0
+
+
+async def test_ending_a_lab_stops_its_terminal_and_waits_for_cleanup() -> None:
+    registry = TerminalRegistry()
+    cleaned = asyncio.Event()
+
+    async def connection() -> None:
+        async with registry.claim("lab-a") as claim, registry.claim("lab-b") as other:
+            await claim.stop.wait()
+            assert claim.outcome is Outcome.LAB_ENDED
+            assert not other.stop.is_set()
+            await asyncio.sleep(0.05)  # the terminal's cleanup
+            cleaned.set()
+
+    task = asyncio.create_task(connection())
+    await asyncio.sleep(0)
+    await registry.end("lab-a")
+
+    assert cleaned.is_set()
+    await task
+    await registry.end("lab-without-terminal")
+
+
+async def test_activity_is_recorded_per_lab_and_taken_once() -> None:
+    registry = TerminalRegistry()
+
+    async with registry.claim("lab-a"):
+        registry.touch("lab-a")
+
+    activity = registry.take_activity()
+    assert set(activity) == {"lab-a"}
+    assert registry.take_activity() == {}

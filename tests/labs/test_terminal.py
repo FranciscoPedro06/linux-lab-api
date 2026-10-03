@@ -1,45 +1,72 @@
 """End to end: WebSocket -> FastAPI -> docker exec with a PTY -> bash in a real lab.
 
-The terminal echoes what is typed, so each check waits for text only the shell can
-produce, such as the result of `$((1+1))`, never for text that was sent.
+The lab is created through the lab lifecycle and the terminal is opened with a real
+session cookie. The terminal echoes what is typed, so each check waits for text only
+the shell can produce, such as the result of `$((1+1))`, never for text that was sent.
 """
 
 import asyncio
 import json
 import re
+import uuid
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 
+import aiodocker
 import pytest
 from websockets.asyncio.client import ClientConnection
 
-from linuxlab.config import Settings
-from linuxlab.labs.runtime import ContainerInfo
+from linuxlab.labs.models import LabSession
 from linuxlab.labs.runtime.docker import DockerRuntime
-from linuxlab.main import create_app
 
-from .support import LAB_IMAGE, OCI_RUNTIME, processes, running_lab
-from .terminal_client import ORIGIN, close_code, next_control, read_until, serve, start, terminal
+from .app_support import Account, Api, running_api
+from .support import LAB_IMAGE, OCI_RUNTIME, processes
+from .terminal_client import close_code, next_control, read_until, start
+from .terminal_client import terminal as open_terminal
 
-pytestmark = pytest.mark.docker
+pytestmark = [pytest.mark.docker, pytest.mark.integration]
 
-UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://linuxlab:linuxlab@127.0.0.1:1/linuxlab"
+
+@dataclass
+class Lab:
+    api: Api
+    account: Account
+    session: LabSession
+
+    @property
+    def id(self) -> str:
+        """The container id, for inspecting the lab from the tests."""
+        return f"ll-lab-{self.session.lab_key}"
+
+    def terminal(self) -> AbstractAsyncContextManager[ClientConnection]:
+        return open_terminal(self.api.url, str(self.session.id), self.account.token)
 
 
 @pytest.fixture(scope="module")
-async def api() -> AsyncIterator[str]:
-    settings = Settings(
-        database_url=UNREACHABLE_DATABASE_URL,
-        dev_terminal_access=True,
-        allowed_origins=frozenset({ORIGIN}),
+async def api(docker_client: aiodocker.Docker) -> AsyncIterator[Api]:
+    runtime = DockerRuntime(docker_client, oci_runtime=OCI_RUNTIME)
+    async with running_api(
+        runtime,
         lab_oci_runtime=OCI_RUNTIME,
         lab_image=LAB_IMAGE,
-    )
-    async with serve(create_app(settings)) as url:
-        yield url
+        lab_deployment=f"tests-{uuid.uuid4().hex[:12]}",
+    ) as api:
+        yield api
 
 
-def lab_id(lab: ContainerInfo) -> str:
-    return lab.labels["linuxlab.lab_id"]
+@pytest.fixture(scope="module")
+async def lab(api: Api) -> AsyncIterator[Lab]:
+    account = await api.account("ana@example.com")
+    session = await api.lab(account)
+    yield Lab(api, account, session)
+    await api.end(session)
+
+
+@pytest.fixture(scope="module")
+def runtime(api: Api) -> DockerRuntime:
+    docker_runtime: DockerRuntime = api.app.state.runtime
+    return docker_runtime
 
 
 async def open_shell(websocket: ClientConnection, cols: int = 80, rows: int = 24) -> None:
@@ -66,8 +93,8 @@ async def run(websocket: ClientConnection, command: str, done: str) -> bytes:
     return await read_until(websocket, f"{done}1\r\n".encode())
 
 
-async def test_commands_run_in_the_lab_shell(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_commands_run_in_the_lab_shell(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
 
         assert b"/home/student\r\n" in await run(websocket, "pwd", "a")
@@ -82,8 +109,8 @@ async def test_commands_run_in_the_lab_shell(api: str, lab: ContainerInfo) -> No
         assert b"ola\r\n" in await run(websocket, "echo $GREETING", "h")
 
 
-async def test_ctrl_c_interrupts_the_foreground_command(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_ctrl_c_interrupts_the_foreground_command(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         await websocket.send(b"sleep 30\r")
         await asyncio.sleep(0.5)
@@ -93,8 +120,8 @@ async def test_ctrl_c_interrupts_the_foreground_command(api: str, lab: Container
     assert b"status=130\r\n" in output
 
 
-async def test_ctrl_c_stops_a_flood_of_output(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_ctrl_c_stops_a_flood_of_output(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         await websocket.send(b"yes\r")
         await read_until(websocket, b"y\r\n" * 1000)
@@ -103,8 +130,8 @@ async def test_ctrl_c_stops_a_flood_of_output(api: str, lab: ContainerInfo) -> N
         await run(websocket, "true", "stopped")
 
 
-async def test_ctrl_d_ends_the_shell(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_ctrl_d_ends_the_shell(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         await websocket.send(b"\x04")
 
@@ -112,8 +139,8 @@ async def test_ctrl_d_ends_the_shell(api: str, lab: ContainerInfo) -> None:
         assert await close_code(websocket) == 4000
 
 
-async def test_line_editing_and_history(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_line_editing_and_history(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         # Backspace (DEL) removes the X before the line runs.
         assert b"abc1\r\n" in await run(websocket, "echo abX\x7fc$((1))", "bs")
@@ -123,8 +150,8 @@ async def test_line_editing_and_history(api: str, lab: ContainerInfo) -> None:
         assert b"recall2\r\n" in await read_until(websocket, b"recall2\r\n")
 
 
-async def test_interactive_program_reads_input(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_interactive_program_reads_input(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         await websocket.send(b"read -r name; echo hi-$name-$((1))\r")
         await asyncio.sleep(0.3)
@@ -132,8 +159,8 @@ async def test_interactive_program_reads_input(api: str, lab: ContainerInfo) -> 
         assert b"hi-maria-1\r\n" in await read_until(websocket, b"hi-maria-1\r\n")
 
 
-async def test_init_size_and_resize_reach_the_pty(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_init_size_and_resize_reach_the_pty(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket, cols=90, rows=25)
         assert b"25 90\r\n" in await run(websocket, "stty size", "init")
 
@@ -141,15 +168,15 @@ async def test_init_size_and_resize_reach_the_pty(api: str, lab: ContainerInfo) 
         assert b"32 120\r\n" in await run(websocket, "stty size", "resized")
 
 
-async def test_large_output_arrives_complete(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_large_output_arrives_complete(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         output = await run(websocket, "head -c 300000 /dev/zero | tr '\\0' a; echo", "big")
     assert output.count(b"a") >= 300000
 
 
-async def test_terminal_stays_unprivileged_and_isolated(api: str, lab: ContainerInfo) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+async def test_terminal_stays_unprivileged_and_isolated(lab: Lab) -> None:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         output = await run(
             websocket,
@@ -165,24 +192,29 @@ async def test_terminal_stays_unprivileged_and_isolated(api: str, lab: Container
     assert "eth0" not in result
 
 
-async def test_two_labs_do_not_share_state(
-    api: str, runtime: DockerRuntime, lab: ContainerInfo
-) -> None:
-    async with running_lab(runtime) as other:
-        async with terminal(api, lab_id(lab)) as first:
+async def test_two_users_labs_do_not_share_state(api: Api, lab: Lab) -> None:
+    bia = await api.account("bia@example.com")
+    other = Lab(api, bia, await api.lab(bia))
+    try:
+        async with lab.terminal() as first:
             await open_shell(first)
             await run(first, "touch ~/only-in-first", "made")
-        async with terminal(api, lab_id(other)) as second:
+        async with other.terminal() as second:
             await open_shell(second)
             output = await run(second, "ls ~/only-in-first 2>&1", "looked")
+        # Neither user can open the other's terminal.
+        async with open_terminal(api.url, str(other.session.id), lab.account.token) as foreign:
+            assert await close_code(foreign) == 4404
+    finally:
+        await api.end(other.session)
     assert b"No such file or directory" in output
 
 
 @pytest.mark.parametrize("ending", ["close", "abort"])
 async def test_disconnect_ends_the_shell_and_its_processes(
-    api: str, runtime: DockerRuntime, lab: ContainerInfo, ending: str
+    runtime: DockerRuntime, lab: Lab, ending: str
 ) -> None:
-    async with terminal(api, lab_id(lab)) as websocket:
+    async with lab.terminal() as websocket:
         await open_shell(websocket)
         await websocket.send(b"sleep 341 & sleep 342\r")
         await asyncio.sleep(1)

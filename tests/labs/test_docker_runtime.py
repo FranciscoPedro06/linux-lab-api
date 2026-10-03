@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 import uuid
 
@@ -11,12 +12,21 @@ from linuxlab.labs.runtime import (
     ContainerNotRunningError,
     LabContainerSpec,
     LabRuntime,
+    LabRuntimeError,
     RuntimeUnavailableError,
     TerminalSize,
 )
 from linuxlab.labs.runtime.docker import MAX_OUTPUT_BYTES, DockerRuntime
 
-from .support import LAB_IMAGE, OCI_RUNTIME, processes, read_until, sh
+from .support import (
+    LAB_IMAGE,
+    OCI_RUNTIME,
+    TEST_DEPLOYMENT,
+    lab_spec,
+    processes,
+    read_until,
+    sh,
+)
 
 pytestmark = pytest.mark.docker
 
@@ -35,10 +45,15 @@ async def test_ping_rejects_unregistered_oci_runtime(docker_client: aiodocker.Do
 
 async def test_lifecycle(runtime: DockerRuntime) -> None:
     lab_id = uuid.uuid4().hex
-    info = await runtime.create(LabContainerSpec(lab_id=lab_id, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec(lab_id))
     try:
         assert info.name == f"ll-lab-{lab_id}"
-        assert info.labels == {"linuxlab.managed": "true", "linuxlab.lab_id": lab_id}
+        assert info.labels == {
+            "linuxlab.managed": "true",
+            "linuxlab.lab_id": lab_id,
+            "linuxlab.deployment": TEST_DEPLOYMENT,
+        }
+        assert not info.oom_killed
         assert not info.running
 
         await runtime.start(info.id)
@@ -54,6 +69,34 @@ async def test_lifecycle(runtime: DockerRuntime) -> None:
     with pytest.raises(ContainerNotFoundError):
         await runtime.inspect(info.id)
     await runtime.remove(info.id)
+
+
+async def test_list_labs_selects_by_deployment_and_managed_label(
+    runtime: DockerRuntime, docker_client: aiodocker.Docker
+) -> None:
+    mine = await runtime.create(lab_spec())
+    other_deployment = await runtime.create(
+        LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE, deployment="someone-else")
+    )
+    lookalike_name = f"ll-lab-{uuid.uuid4().hex}"
+    unmanaged = await docker_client.containers.create(
+        {"Image": LAB_IMAGE, "Labels": {"linuxlab.deployment": TEST_DEPLOYMENT}},
+        name=lookalike_name,
+    )
+    try:
+        await runtime.start(mine.id)
+        listed = {info.id: info for info in await runtime.list_labs(TEST_DEPLOYMENT)}
+
+        assert mine.id in listed
+        assert listed[mine.id].running
+        assert listed[mine.id].labels == mine.labels
+        assert listed[mine.id].name == mine.name
+        assert other_deployment.id not in listed
+        assert unmanaged.id not in listed
+    finally:
+        await runtime.remove(mine.id)
+        await runtime.remove(other_deployment.id)
+        await unmanaged.delete(force=True)
 
 
 async def test_exec_captures_output_and_exit_code(
@@ -199,7 +242,7 @@ async def test_closing_a_terminal_leaves_other_terminals_running(
 async def test_closing_a_terminal_after_its_lab_ended_is_not_an_error(
     runtime: DockerRuntime, ending: str
 ) -> None:
-    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec())
     try:
         await runtime.start(info.id)
         terminal = await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))
@@ -214,8 +257,70 @@ async def test_closing_a_terminal_after_its_lab_ended_is_not_an_error(
         await runtime.remove(info.id)
 
 
+@pytest.mark.parametrize("ending", ["kill", "remove"])
+@pytest.mark.parametrize("attempt", range(3))
+async def test_lab_ending_during_terminal_cleanup_is_not_an_error(
+    runtime: DockerRuntime,
+    docker_client: aiodocker.Docker,
+    caplog: pytest.LogCaptureFixture,
+    ending: str,
+    attempt: int,
+) -> None:
+    """The lab is killed or removed while the cleanup exec is running.
+
+    The exec then ends with whatever code the runtime gives a process whose container
+    died (137 under runc, 128 or 137 under runsc), and Docker keeps reporting the
+    container as running for a moment after that. Neither is a cleanup failure.
+    """
+    info = await runtime.create(lab_spec())
+    try:
+        await runtime.start(info.id)
+        terminal = await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))
+        # Ignoring SIGHUP keeps the cleanup waiting about a second before SIGKILL,
+        # so the lab ends while the cleanup exec is still running.
+        await terminal.write(b"trap '' HUP; sleep 361\r")
+        await asyncio.sleep(0.5)
+        container = docker_client.containers.container(info.id)
+
+        with caplog.at_level(logging.WARNING, logger="linuxlab"):
+            closing = asyncio.create_task(terminal.close())
+            await asyncio.sleep(0.4)
+            assert not closing.done()
+            if ending == "kill":
+                await container.kill()
+            else:
+                await container.delete(force=True)
+            async with asyncio.timeout(15):
+                await closing
+
+        assert [record.getMessage() for record in caplog.records] == []
+    finally:
+        await runtime.remove(info.id)
+
+
+async def test_concurrent_removals_all_succeed(runtime: DockerRuntime) -> None:
+    info = await runtime.create(lab_spec())
+    await runtime.start(info.id)
+
+    await asyncio.gather(*(runtime.remove(info.id) for _ in range(3)))
+
+    with pytest.raises(ContainerNotFoundError):
+        await runtime.inspect(info.id)
+
+
+async def test_cleanup_failure_on_a_running_lab_is_reported(
+    runtime: DockerRuntime, lab: ContainerInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("linuxlab.labs.runtime.docker.END_TERMINAL_SCRIPT", "raise SystemExit(3)")
+    monkeypatch.setattr("linuxlab.labs.runtime.docker.SETTLE_SECONDS", 0.5)
+
+    with pytest.raises(LabRuntimeError, match="terminal cleanup failed: exit 3"):
+        await runtime.end_terminal_processes(lab.id, "token")
+    assert (await runtime.inspect(lab.id)).running
+
+
 async def test_terminal_requires_a_running_container(runtime: DockerRuntime) -> None:
-    info = await runtime.create(LabContainerSpec(lab_id=uuid.uuid4().hex, image=LAB_IMAGE))
+    info = await runtime.create(lab_spec())
     try:
         with pytest.raises(ContainerNotRunningError):
             await runtime.open_terminal(info.id, TerminalSize(cols=80, rows=24))

@@ -14,12 +14,13 @@ In Linux Lab the student gets a problem ("the deploy script is readable by every
 
 What exists today:
 
-1. A lab is an isolated container created from the lab image, with no network, a read-only root filesystem and CPU, memory and process limits. For now labs are created by hand with a development command.
+1. A signed-in student starts a lab: an isolated container created from the lab image, with no network, a read-only root filesystem and CPU, memory and process limits. Each lab belongs to one account, and an account has at most one active lab.
 2. The browser opens a terminal (xterm.js) connected over WebSocket to a `bash` shell inside that container, running as an unprivileged user.
 3. The student works with whatever commands they prefer; nothing typed is parsed or filtered.
-4. Accounts exist: sign-up with an invite code, login and logout, with a server-side session in an `HttpOnly` cookie. Labs are not tied to accounts yet.
+4. Accounts exist: sign-up with an invite code, login and logout, with a server-side session in an `HttpOnly` cookie. Only the owner's session can see a lab or open its terminal.
+5. Labs end when the student ends them, logs out, leaves them idle (15 minutes without a terminal, 30 without typing), after 2 hours, or when they run out of memory. A background reaper reconciles the database with Docker and removes anything left behind. The student is told why a lab ended.
 
-Planned, not implemented yet: labs owned by users, missions with their initial state, validation of the final state, progress and resetting a lab.
+Planned, not implemented yet: missions with their initial state, validation of the final state, progress and resetting a lab.
 
 Missions will declare conditions rather than run validation code:
 
@@ -105,17 +106,16 @@ Clone [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web) next to
 docker compose -f infra/compose.yml up --build
 ```
 
-This starts PostgreSQL, the API with auto-reload and the Vite dev server, and applies migrations on startup. The API gets the Docker socket and the terminal without authentication (`DEV_TERMINAL_ACCESS`), which are for local development only.
+This starts PostgreSQL, the API with auto-reload and the Vite dev server, and applies migrations on startup. The API runs with `ENVIRONMENT=development`, which allows runc, and gets the Docker socket (local development only; see the threat model).
 
 Sign-up is disabled unless `SIGNUP_INVITE_CODE` is set in the environment that runs Compose, for example `SIGNUP_INVITE_CODE=<any value> docker compose -f infra/compose.yml up --build`; that value is then the invite code for the local sign-up page.
 
 The session cookie is `Secure`. Browsers that treat `http://localhost` as a secure context, such as Chrome, Edge and Firefox, accept it there; a browser that does not will not keep the session on the local environment.
 
-To open a terminal, build the lab image, create a lab and open the address it prints:
+To use a terminal, build the lab image once, sign up with the invite code, and start a lab from the home page:
 
 ```sh
 docker build --tag linuxlab/lab-base:dev lab-image
-docker compose -f infra/compose.yml exec api python -m linuxlab.labs.devlab create
 ```
 
 | Service | Address |
@@ -138,6 +138,8 @@ uv run uvicorn --factory linuxlab.main:create_app --reload
 
 Configuration comes from environment variables or `.env`; see [.env.example](.env.example).
 
+`ENVIRONMENT` defaults to `production`, which refuses to start unless labs run under gVisor (`LAB_OCI_RUNTIME=runsc`, registered with Docker). `.env.example` and Compose set `development`. `GET /api/health` reports the database and the lab runtime separately.
+
 ## Tests
 
 ```sh
@@ -145,15 +147,15 @@ uv run ruff check
 uv run ruff format --check
 uv run mypy
 uv run pytest                  # unit tests
-uv run pytest -m integration   # authentication, schema and migrations; requires PostgreSQL at DATABASE_URL
-uv run pytest -m docker        # lab runtime, isolation and terminal, requires Docker and the lab image
+uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), schema, migrations; PostgreSQL at DATABASE_URL
+uv run pytest -m docker                         # lab runtime, isolation, terminal and lab lifecycle; Docker, the lab image and PostgreSQL
 ```
 
 Lab runtime tests, gVisor setup and the list of isolation checks are described in [docs/runtime.md](docs/runtime.md).
 
-The integration tests empty the `users` and `auth_sessions` tables and run the migrations down and up again, so point `DATABASE_URL` at a development database. On Windows, use `127.0.0.1` rather than `localhost` in `DATABASE_URL`; each connection to `localhost` can wait about two seconds for IPv6 first.
+The integration tests empty the `users`, `auth_sessions` and `lab_sessions` tables and run the migrations down and up again, so point `DATABASE_URL` at a development database. On Windows, use `127.0.0.1` rather than `localhost` in `DATABASE_URL`; each connection to `localhost` can wait about two seconds for IPv6 first.
 
-CI runs the same checks, the integration tests against a PostgreSQL service, a migration downgrade and upgrade, and builds the API and lab images. A separate `Runtime` workflow runs the lab tests under gVisor.
+CI runs the same checks, the integration tests against a PostgreSQL service, the Docker tests under runc, a migration downgrade and upgrade, and builds the API and lab images. A separate `Runtime` workflow runs the Docker tests under gVisor.
 
 Planned coverage as the project grows:
 
@@ -164,7 +166,7 @@ Planned coverage as the project grows:
 
 ## Status
 
-Increments 01 to 04 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; and accounts with server-side sessions. Lab sessions, ownership checks and lab cleanup come next (increment 05); until then the terminal is not tied to accounts and is only available in development. Planned order:
+Increments 01 to 05 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; and lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal. The mission catalog comes next (increment 06). Planned order:
 
 | # | Increment |
 |---|---|

@@ -1,6 +1,6 @@
 name: Runtime
 
-# Runs the Docker integration and isolation tests under gVisor (runsc).
+# Runs the Docker integration, isolation and lab lifecycle tests under gVisor (runsc).
 # Kept separate from CI because it installs a container runtime on the runner.
 
 on:
@@ -8,8 +8,9 @@ on:
     branches: [main]
   pull_request:
     paths:
-      - "src/linuxlab/labs/**"
-      - "tests/labs/**"
+      - "src/linuxlab/**"
+      - "migrations/**"
+      - "tests/**"
       - "lab-image/**"
       - ".github/workflows/runtime.yml"
   workflow_dispatch:
@@ -27,6 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
+      DATABASE_URL: postgresql+asyncpg://linuxlab:linuxlab@localhost:5432/linuxlab
       LINUXLAB_TEST_OCI_RUNTIME: runsc
       LINUXLAB_LAB_IMAGE: linuxlab/lab-base:ci
     steps:
@@ -56,11 +58,25 @@ jobs:
           echo "$output"
           grep -q gVisor <<<"$output"
 
+      # Started here rather than as a service: installing gVisor restarts Docker,
+      # which would stop a service container.
+      - name: Start PostgreSQL
+        run: |
+          docker run --detach --name postgres --publish 5432:5432 \
+            --env POSTGRES_USER=linuxlab --env POSTGRES_PASSWORD=linuxlab \
+            --env POSTGRES_DB=linuxlab postgres:16-alpine
+          for _ in $(seq 30); do
+            docker exec postgres pg_isready -U linuxlab -d linuxlab && exit 0
+            sleep 1
+          done
+          exit 1
+
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.12.19"
       - run: uv sync --locked
       - run: docker build --tag "$LINUXLAB_LAB_IMAGE" lab-image
+      - run: uv run alembic upgrade head
 
       - name: Run tests under ${{ env.LINUXLAB_TEST_OCI_RUNTIME }}
         run: uv run pytest -m "docker or runsc" -v -rA

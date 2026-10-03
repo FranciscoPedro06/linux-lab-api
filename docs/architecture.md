@@ -42,44 +42,101 @@ The API runs as a single process in the MVP. WebSocket connections, rate limitin
 
 ## Labs
 
-A lab is an ephemeral container tied to a user and to a specific version of a mission.
+Implemented in increment 05 (`src/linuxlab/labs/`): `models.py` (lab sessions), `lifecycle.py` (creation, ending, reconciliation), `reaper.py`, `access.py` (ownership) and `router.py` (HTTP). A lab is an ephemeral container owned by one user. From increment 06 it will also be tied to a specific version of a mission; today it is a plain lab with no mission.
 
 ```
 provisioning --> ready --> terminating --> terminated
-      |                                        ^
+      |  '-------------------^                 ^
       '----------> failed ---------------------'
 ```
 
+| State | Meaning |
+|---|---|
+| `provisioning` | The session exists; the container is being created and started |
+| `ready` | The container runs; the terminal may be used |
+| `terminating` | The lab has ended (`end_reason` says why); its terminal and container are being removed |
+| `failed` | Provisioning did not complete; the container may still exist |
+| `terminated` | The container has been removed. Final |
+
+`provisioning -> terminating` covers a lab ended (logout, delete) before it was ready. The database refuses every other transition, and any change to the owner or to a recorded end reason, with a trigger; the first reason recorded is the one kept.
+
+End reasons: `user` (`DELETE`), `logout`, `no_terminal`, `no_input`, `max_lifetime`, `oom`, `container_lost`, `provisioning_failed`, `provisioning_timeout`.
+
 Rules:
 
-- A user has at most one lab in `provisioning`, `ready` or `terminating`, enforced by a partial unique index. This also holds during a reset: the old container is removed before the new one is created.
-- A lab pins `(mission_id, mission_version)` at creation. Briefing and validation use that version until the lab ends.
-- Labs are only created by an explicit user action. Opening a mission page does not start a container.
-- Destroying a lab does not touch progress. The environment is disposable; `user_missions` is permanent.
-- Switching missions requires confirmation and ends the current lab with `end_reason = mission_switch`.
+- A user has at most one lab in `provisioning`, `ready` or `terminating`, enforced by the partial unique index `one_active_lab_per_user`. Concurrent creations by one user produce one lab; the others get the existing lab or `409`.
+- At most `LAB_CAPACITY` labs (default 10) are active across all users. Creations are serialized by a transaction-scoped advisory lock, so the cap cannot be raced. Each user may start at most 10 labs per 10 minutes. Both values are provisional; see [Values chosen in increment 05](#values-chosen-in-increment-05).
+- Labs are only created by an explicit user action.
+- Planned with missions (increments 06 and 10): pinning `(mission_id, mission_version)`, keeping progress when a lab is destroyed, and ending the lab with `end_reason = mission_switch` when switching missions.
 
-Creation:
+### Consistency between PostgreSQL and Docker
 
-1. Check authentication, rate limit, that the mission is published, and global capacity.
-2. Generate mission parameters.
-3. Insert `lab_sessions` with status `provisioning`. The constraint rejects a concurrent second creation.
-4. Outside any transaction: create and start the container, run `labctl init` and the mission setup.
-5. Mark the lab `ready` and create or update `user_missions`.
+There is no transaction spanning the database and Docker. PostgreSQL is the source of truth for ownership and lifecycle; Docker is the source of truth for whether a container exists and runs. Every step is ordered so that repeating it, or running it concurrently with another actor (a request, the reaper, an API that crashed and restarted), is safe:
 
-Any failure removes the container and marks the lab `failed`.
+- Creation commits the `provisioning` row before creating the container, so every lab container has a row by the time it can be listed.
+- Ending commits `terminating` before touching the terminal or the container, so a lab is never reported usable while it is being removed.
+- Only a confirmed removal moves a lab to `terminated`. If Docker fails, the lab stays `terminating` (or `failed`) and the reaper retries.
+- Every status change is a conditional `UPDATE ... WHERE status IN (...)` from the expected state. Two actors ending the same lab both succeed, and a lab ended while provisioning never becomes `ready`: the creation's own update fails and it removes the container it made.
 
-Timeouts:
+Containers are found by their deterministic name, `ll-lab-<lab id hex>`, and accepted only if their labels say they are this deployment's container for that lab (`linuxlab.managed=true`, `linuxlab.lab_id`, `linuxlab.deployment`). A container with the name but other labels is never touched. `LAB_DEPLOYMENT` keeps API instances that share a Docker Engine, including the test suite, from removing each other's labs.
 
-| Condition | Limit |
-|---|---|
-| No terminal connected | 15 min |
-| Terminal connected, no user input | 30 min |
-| Maximum lifetime | 2 h |
-| Stuck in `provisioning` | 2 min |
+### Creation
 
-Running processes do not count as activity.
+1. Check the session and the per-user rate limit.
+2. Under the creation lock: return the user's active lab if there is one, check global capacity, insert `lab_sessions` with status `provisioning`.
+3. Outside any transaction: create and start the container (at most 2 minutes).
+4. Mark the lab `ready`, starting its idle timer.
 
-Reconciliation: the reaper runs every 30 seconds and at API startup. It destroys expired labs, finishes interrupted removals (`terminating`), removes containers labeled `linuxlab.managed=true` that have no active session in the database, and marks sessions whose container no longer exists as `terminated`. Container names are deterministic (`ll-lab-<lab_id>`), so reconciliation works even if the API crashed before storing the `container_id`. Restarting the API does not destroy labs.
+A failure marks the lab `failed`, removes the container and marks it `terminated` (`provisioning_failed`). If the lab was ended meanwhile, the container is removed and the lab is returned as it is.
+
+### Ending
+
+`DELETE /api/labs/{id}`, logout and the reaper all end a lab the same way:
+
+1. `ready` or `provisioning` → `terminating`, with the end reason and time.
+2. The lab's terminal connection is closed with `4410`, and ending waits (up to 15 seconds) for the terminal's cleanup exec to finish.
+3. The container is removed. A removal already in progress (by another actor) is waited for.
+4. `terminating` → `terminated`.
+
+### Timeouts
+
+| Condition | Limit | End reason |
+|---|---|---|
+| No terminal connected | 15 min | `no_terminal` |
+| Terminal connected, no user input | 30 min | `no_input` |
+| Maximum lifetime, from creation | 2 h | `max_lifetime` |
+| Stuck in `provisioning` | 2 min | `provisioning_timeout` |
+| Left in `terminating` or `failed` | 1 min (chosen in increment 05, see below), then the reaper finishes it | (kept) |
+
+Activity is connecting, disconnecting and typing in the terminal. Running processes and terminal output do not count. Activity is recorded in memory by the terminal registry, with no I/O on the terminal's path, and stored in `last_activity_at` by the reaper at the start of each pass, so it is at most 30 seconds stale.
+
+### Values chosen in increment 05
+
+The design already called for a global capacity check and a rate limit on lab creation (creation step 1, `503` when capacity is reached, and the threat model's control against repeated creation), and for the reaper to finish interrupted removals, but did not give numbers. Increment 05 picked these, and they are decisions to revisit, not measured limits:
+
+| Value | Where | Purpose | Status |
+|---|---|---|---|
+| `LAB_CAPACITY` = 10 active labs, all users | Setting (`LAB_CAPACITY`) | Bounds what labs can take from the single host: each may use 512 MB and half a CPU, so 10 labs reserve up to 5 GB and 5 CPUs | Provisional. To be sized against the real VM before the closed beta (increment 13); configurable without code changes |
+| 10 creations per user per 10 minutes | Constant in `labs/router.py` | Bounds container churn (create, start, remove) by one account; the one-lab rule already prevents parallel labs, so this only limits repetition | Provisional. In memory, per process, reset on restart, like the authentication limits |
+| 1 minute before the reaper finishes a lab left in `terminating` or `failed` | Constant `TERMINATION_GRACE` in `labs/lifecycle.py` | Lets the request that ended the lab finish its own removal (it waits up to 15 s for the terminal and up to 10 s for a removal in progress) before the reaper repeats it. Repeating it would be harmless, since every step is idempotent; the grace only avoids duplicate work and log noise. The startup pass ignores it | Lifecycle decision |
+
+### Reaper and reconciliation
+
+The reaper (`reaper.py`) runs at API startup and every 30 seconds. Each pass:
+
+1. stores terminal activity recorded since the last pass;
+2. lists this deployment's lab containers by label, then reads the unfinished sessions (in that order: a container is created only after its row is committed, so every listed container has a visible row);
+3. ends `ready` labs past a timeout;
+4. ends `ready` labs whose container stopped or disappeared: `oom` when Docker reports an OOM kill, otherwise `container_lost`. A container missing from the listing is inspected directly first, since it may have been created after the listing;
+5. fails labs stuck in `provisioning`;
+6. finishes labs left in `terminating` or `failed` after the grace period, immediately on the startup pass, when no request can still be working on them;
+7. removes this deployment's lab containers with no unfinished lab (no row, or a terminated one).
+
+Errors are handled per lab, so one lab cannot stop the pass, and the startup pass is repeated until one completes. Restarting the API does not destroy labs: a ready lab with a running container keeps running, and its idle timer continues from the stored activity.
+
+### Out of memory
+
+Under gVisor the memory cgroup covers the whole sandbox, so a lab that exceeds 512 MB is stopped with `OOMKilled=true` (see [runtime.md](runtime.md#differences-between-runc-and-runsc)). The API notices it in two places: when the terminal's shell ends because the container died, and in the next reaper pass. Either way the lab ends with `end_reason = oom`, the terminal closes with `4410`, and the client reads the reason from the API. Under runc only the offending process is killed and the lab keeps running.
 
 ## Terminal
 
@@ -87,13 +144,14 @@ Reconciliation: the reaper runs every 30 seconds and at API startup. It destroys
 xterm.js <-> WebSocket <-> API <-> Docker API (exec, tty) <-> PTY in container <-> bash
 ```
 
+- The handshake checks `Origin`, then the session cookie (`4401`), then that the lab belongs to the session's user (`4404`) and is ready with a running container (`4410`).
 - The API does not interpret commands. It forwards bytes.
 - Each connection starts a new shell. Files and background processes survive reconnects; the working directory and shell variables do not.
 - There is at most one connection per lab. A new connection closes the previous one.
-- On disconnect the API kills the shell explicitly (`labctl kill-shell`), because a process started through `docker exec` can outlive its client.
+- On disconnect the API ends the shell and everything started from it with a cleanup exec run as the student, because a process started through `docker exec` can outlive its client. When the lab ends, its terminal is closed and cleaned up before the container is removed.
 - Output is capped at about 256 KB/s per terminal. The sender awaits the WebSocket before reading the next chunk, with no unbounded queue in between. `yes` or `cat /dev/urandom` cannot grow API memory, and `Ctrl+C` still gets through.
 
-Handshake, messages and close codes are in [api.md](api.md#terminal).
+Handshake, messages and close codes are in [api.md](api.md#terminal) and [terminal.md](terminal.md).
 
 ## Validation
 
@@ -161,7 +219,7 @@ Implemented in increment 04, in `src/linuxlab/auth/`. Server-side sessions with 
 - 32-byte random token (`secrets.token_urlsafe`); the database stores only its SHA-256, and the token reaches the client only in the cookie;
 - `__Host-sid` cookie with `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/` and no `Domain`, and a `Max-Age` of 30 days;
 - a session is valid while it has been used in the last 7 days (idle expiry) and is less than 30 days old (absolute expiry, fixed at creation and never extended). `last_seen_at` is updated at most once every 5 minutes, so authenticated requests do not each write to the database. An expired session is deleted when it is next presented;
-- logout deletes the current session and clears the cookie; other sessions of the same user are not affected. Ending the user's lab on logout comes with lab sessions (increment 05);
+- logout first ends the user's active lab (`end_reason = logout`), then deletes the current session and clears the cookie. If ending the lab fails, the session is kept so the client can retry; if only removing the container fails, the lab stays `terminating` for the reaper and logout completes. Other sessions of the same user stay valid, but the lab belonged to the user and has ended;
 - Argon2id password hashing (`argon2-cffi` defaults: RFC 9106 low-memory parameters) in worker threads, with at most two hashes running at once, so it neither blocks the event loop nor takes unbounded CPU and memory;
 - a login for an unknown email verifies the password against a dummy hash, so its timing and response match a wrong password;
 - passwords of 12 to 128 characters with no composition rules; emails stripped and lowercased, ASCII only, unique case-insensitively through a unique index on `lower(email)`; display names stripped, 1 to 80 characters, without control characters, stored as plain text;
@@ -172,13 +230,13 @@ The rate limit uses the address of the TCP peer; `X-Forwarded-For` is ignored an
 
 CSRF protection: `SameSite=Lax`, a required `Origin` header matching the allowlist on every non-GET request, and a JSON-only API. Both are checked for every HTTP route under `/api` before the body is read (`ApiRoute` in `src/linuxlab/api.py`). The WebSocket checks `Origin` before accepting the connection.
 
-The terminal is not tied to accounts yet: it still uses `DevelopmentLabAccess` and exists only with `DEV_TERMINAL_ACCESS`. Checking the session on the handshake (`4401`) and lab ownership come with lab sessions in increment 05.
+The terminal WebSocket checks the session cookie on the handshake (`4401`) and that the lab belongs to the session's user (see [Terminal](#terminal)). There is no development bypass: labs are created through the API in every environment.
 
 OAuth, password reset and email verification are out of scope for the MVP. The last two are required before opening public sign-up.
 
 ## Data model
 
-Only `users` and `auth_sessions` exist so far, created by the first migration; the other tables are the target design.
+`users`, `auth_sessions` and `lab_sessions` exist (migrations for increments 04 and 05); the other tables are the target design.
 
 | Table | Contents |
 |---|---|
@@ -188,7 +246,7 @@ Only `users` and `auth_sessions` exist so far, created by the first migration; t
 | `missions` | Stable mission identity (slug), module, position, status, current version |
 | `mission_versions` | Immutable specification per version; PK `(mission_id, version)` |
 | `user_missions` | Progress per user and mission; PK `(user_id, mission_id)` |
-| `lab_sessions` | Labs, with pinned version, parameters, state and end reason |
+| `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time. The pinned mission version and parameters are added with missions |
 | `validation_runs` | Every validation, with the full result and the version used |
 | `command_history` | Collected commands; unique on `(lab_session_id, seq)` |
 
@@ -217,6 +275,8 @@ Other rules:
 - `lab_sessions.params` holds answers for discovery missions and is never sent to the client.
 - `mission_versions` has a trigger that rejects `UPDATE`.
 - States and reasons are `text` columns with `CHECK` constraints rather than `ENUM`, which keeps schema changes simple.
+- `lab_sessions` has `CHECK` constraints tying `end_reason` and `ended_at` to the ended states, and a trigger that allows only the lifecycle's transitions and never changes the owner, the creation or expiry time, or a recorded end reason.
+- No container id is stored: the container name is derived from the lab id, so reconciliation works even if the API crashed between creating the container and recording anything about it.
 
 Organizations and classes, when they exist, will be new tables. Content and progress tables stay as they are.
 

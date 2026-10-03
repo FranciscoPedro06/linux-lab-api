@@ -32,6 +32,8 @@ from linuxlab.auth.passwords import (
 from linuxlab.auth.ratelimit import RateLimiter
 from linuxlab.auth.tokens import MAX_TOKEN_LENGTH
 from linuxlab.config import Settings
+from linuxlab.labs.lifecycle import Labs
+from linuxlab.labs.models import EndReason
 
 logger = logging.getLogger(__name__)
 
@@ -199,9 +201,22 @@ async def login(
 
 @router.post("/logout", status_code=204)
 async def logout(request: Request, db: Database) -> Response:
-    """Ends the request's session, if any. Labs are not affected."""
+    """Ends the user's active lab, then the request's session, if any.
+
+    The lab goes first. If ending it fails, the session is kept and the client can
+    retry, so the session is never gone while its lab still counts as ready. If only
+    removing the container fails, the lab stays terminating, the reaper finishes it,
+    and logout completes.
+    """
     token = request.cookies.get(SESSION_COOKIE)
     if token and len(token) <= MAX_TOKEN_LENGTH:
+        active = await sessions.resolve(db, token, sessions.utcnow())
+        if active is not None:
+            user_id = active.user.id
+            # No transaction stays open while the lab is removed.
+            await db.rollback()
+            labs: Labs = request.app.state.labs
+            await labs.end_active(user_id, EndReason.LOGOUT)
         await sessions.revoke(db, token)
     response = Response(status_code=204)
     clear_session_cookie(response)

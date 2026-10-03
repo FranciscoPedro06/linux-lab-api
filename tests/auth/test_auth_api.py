@@ -9,8 +9,8 @@ from fastapi.testclient import TestClient
 
 from linuxlab.auth.passwords import Passwords
 from linuxlab.auth.sessions import SESSION_IDLE, TOUCH_INTERVAL
+from tests.conftest import AppFactory
 
-from .conftest import AppFactory
 from .support import (
     INVITE_CODE,
     ORIGIN,
@@ -458,7 +458,7 @@ def test_health_needs_no_origin(client: TestClient) -> None:
     response = client.get("/api/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "database": "ok"}
+    assert response.json() == {"status": "ok", "database": "ok", "runtime": "ok"}
 
 
 def test_terminal_route_absent_without_dev_access(client: TestClient) -> None:
