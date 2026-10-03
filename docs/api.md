@@ -161,6 +161,8 @@ Body `{}`. Creation is synchronous and takes about a second.
 
 If the lab is ended while it is being created (logout, delete), the response is `201` with the lab in its ended state.
 
+The rate limit and the default capacity are provisional values chosen in increment 05 ([architecture.md](architecture.md#values-chosen-in-increment-05)).
+
 With missions (increment 06) the body gains `mission_slug` and `replace`.
 
 ### `DELETE /api/labs/{id}`
