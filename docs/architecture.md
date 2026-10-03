@@ -65,7 +65,7 @@ End reasons: `user` (`DELETE`), `logout`, `no_terminal`, `no_input`, `max_lifeti
 Rules:
 
 - A user has at most one lab in `provisioning`, `ready` or `terminating`, enforced by the partial unique index `one_active_lab_per_user`. Concurrent creations by one user produce one lab; the others get the existing lab or `409`.
-- At most `LAB_CAPACITY` labs (default 10) are active across all users. Creations are serialized by a transaction-scoped advisory lock, so the cap cannot be raced. Each user may start at most 10 labs per 10 minutes.
+- At most `LAB_CAPACITY` labs (default 10) are active across all users. Creations are serialized by a transaction-scoped advisory lock, so the cap cannot be raced. Each user may start at most 10 labs per 10 minutes. Both values are provisional; see [Values chosen in increment 05](#values-chosen-in-increment-05).
 - Labs are only created by an explicit user action.
 - Planned with missions (increments 06 and 10): pinning `(mission_id, mission_version)`, keeping progress when a lab is destroyed, and ending the lab with `end_reason = mission_switch` when switching missions.
 
@@ -106,9 +106,19 @@ A failure marks the lab `failed`, removes the container and marks it `terminated
 | Terminal connected, no user input | 30 min | `no_input` |
 | Maximum lifetime, from creation | 2 h | `max_lifetime` |
 | Stuck in `provisioning` | 2 min | `provisioning_timeout` |
-| Left in `terminating` or `failed` | 1 min, then the reaper finishes it | (kept) |
+| Left in `terminating` or `failed` | 1 min (chosen in increment 05, see below), then the reaper finishes it | (kept) |
 
 Activity is connecting, disconnecting and typing in the terminal. Running processes and terminal output do not count. Activity is recorded in memory by the terminal registry, with no I/O on the terminal's path, and stored in `last_activity_at` by the reaper at the start of each pass, so it is at most 30 seconds stale.
+
+### Values chosen in increment 05
+
+The design already called for a global capacity check and a rate limit on lab creation (creation step 1, `503` when capacity is reached, and the threat model's control against repeated creation), and for the reaper to finish interrupted removals, but did not give numbers. Increment 05 picked these, and they are decisions to revisit, not measured limits:
+
+| Value | Where | Purpose | Status |
+|---|---|---|---|
+| `LAB_CAPACITY` = 10 active labs, all users | Setting (`LAB_CAPACITY`) | Bounds what labs can take from the single host: each may use 512 MB and half a CPU, so 10 labs reserve up to 5 GB and 5 CPUs | Provisional. To be sized against the real VM before the closed beta (increment 13); configurable without code changes |
+| 10 creations per user per 10 minutes | Constant in `labs/router.py` | Bounds container churn (create, start, remove) by one account; the one-lab rule already prevents parallel labs, so this only limits repetition | Provisional. In memory, per process, reset on restart, like the authentication limits |
+| 1 minute before the reaper finishes a lab left in `terminating` or `failed` | Constant `TERMINATION_GRACE` in `labs/lifecycle.py` | Lets the request that ended the lab finish its own removal (it waits up to 15 s for the terminal and up to 10 s for a removal in progress) before the reaper repeats it. Repeating it would be harmless, since every step is idempotent; the grace only avoids duplicate work and log noise. The startup pass ignores it | Lifecycle decision |
 
 ### Reaper and reconciliation
 

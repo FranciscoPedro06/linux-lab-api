@@ -93,7 +93,7 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 | Orphan containers (API crash, failed removal) | The reaper removes this deployment's lab containers with no unfinished lab and retries unfinished removals |
 | Reaper removing containers that are not its own | Containers are selected by the `linuxlab.managed` and `linuxlab.deployment` labels and accepted only with the matching lab id and name. Containers without them, or of another deployment, are left alone |
 | One user's lab affecting another's | The reaper, delete and logout act on one lab id at a time; ending a lab closes only that lab's terminal. Covered by tests for delete, logout and the reaper |
-| Exhausting the host with labs | One active lab per user, at most 10 creations per user per 10 minutes, a global cap (`LAB_CAPACITY`), and idle and lifetime timeouts |
+| Exhausting the host with labs | One active lab per user, at most 10 creations per user per 10 minutes, a global cap (`LAB_CAPACITY`), and idle and lifetime timeouts. The two numbers are provisional ([architecture.md](architecture.md#values-chosen-in-increment-05)) |
 | A lab silently gone (OOM under gVisor, container removed) | The terminal and the reaper detect the stopped container; the lab ends with `oom` or `container_lost` and the student is told why |
 | Information in the health check | `/api/health` returns only `ok` or `unavailable` per dependency |
 | Labs under runc in production | `ENVIRONMENT=production` (the default) refuses to start unless `LAB_OCI_RUNTIME=runsc` and Docker has `runsc` registered |
@@ -125,7 +125,7 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 
 **Lab state in one process.** Terminal connections and their activity live in the single API process; activity reaches the database at most 30 seconds late, and is lost if the API crashes in between, which can only shorten a lab's idle time. Running more than one API process requires moving lab control into its own service (`lab-agent`).
 
-**Deployment label.** Reconciliation trusts the `linuxlab.deployment` label. Two deployments configured with the same `LAB_DEPLOYMENT` on one Docker Engine would remove each other's labs as orphans; each deployment must use its own value.
+**Deployment label.** Reconciliation trusts the `linuxlab.deployment` label. Two deployments configured with the same `LAB_DEPLOYMENT` on one Docker Engine would remove each other's labs as orphans; each deployment must use its own value. Changing a deployment's value while it has labs leaves their containers outside its reconciliation: the labs end as `container_lost` and their containers must be removed by hand, so the value has to stay fixed for a deployment's lifetime.
 
 **No account lockout or password breach check.** Password guessing is slowed by the rate limit only. Password reset and email verification do not exist yet, which also rules out public sign-up.
 
