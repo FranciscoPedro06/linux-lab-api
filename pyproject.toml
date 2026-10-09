@@ -19,6 +19,9 @@ dependencies = [
     "uvicorn[standard]>=0.54.0",
 ]
 
+[project.scripts]
+linuxlab = "linuxlab.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
