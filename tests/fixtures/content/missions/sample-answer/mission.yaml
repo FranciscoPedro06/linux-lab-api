@@ -1,0 +1,40 @@
+schema: 1
+slug: sample-answer
+title: Resposta de teste
+summary: Missão sintética que espera uma resposta.
+difficulty: 2
+estimated_minutes: 10
+status: published
+
+briefing: briefing.md
+explanation: explanation.md
+objectives:
+  - "Descubra a palavra guardada em um arquivo oculto."
+
+environment:
+  image: base
+  profile: default
+
+params:
+  word: { generator: word }
+
+setup:
+  script: setup.sh
+  timeout_seconds: 10
+
+validation:
+  id: word
+  type: answer
+  equals_param: word
+  normalize: [trim, lowercase]
+  fail_message: "Essa não é a palavra."
+
+solutions:
+  - label: Listar arquivos ocultos
+    script: tests/solution-ls.sh
+  - label: Procurar com find
+    script: tests/solution-find.sh
+
+counterexamples:
+  - label: Resposta vazia
+    script: tests/counter-empty.sh

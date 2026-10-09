@@ -1,0 +1,53 @@
+schema: 1
+slug: sample-file
+title: Arquivo de teste
+summary: Missão sintética sobre permissões de um arquivo.
+difficulty: 1
+estimated_minutes: 5
+status: published
+tags: [permissions, chmod]
+
+briefing: briefing.md
+explanation: explanation.md
+objectives:
+  - "`~/sample.sh` continua existindo."
+  - "Somente o dono pode ler e escrever o arquivo."
+
+environment:
+  image: base
+  profile: default
+
+params:
+  token: { generator: hex, length: 8 }
+
+setup:
+  script: setup.sh
+  timeout_seconds: 20
+
+hints:
+  - "Veja as permissões atuais com `ls -l`."
+
+validation:
+  all:
+    - id: exists
+      type: file_exists
+      path: /home/student/sample.sh
+      fail_message: "O arquivo não existe."
+    - id: content-kept
+      type: file_content
+      path: /home/student/sample.sh
+      contains: "TOKEN={{ token }}"
+    - id: mode
+      type: file_permissions
+      path: /home/student/sample.sh
+      mode: "0600"
+
+solutions:
+  - label: Octal
+    script: tests/solution-octal.sh
+  - label: Simbólico
+    script: tests/solution-symbolic.sh
+
+counterexamples:
+  - label: Recriar o arquivo vazio
+    script: tests/counter-empty.sh

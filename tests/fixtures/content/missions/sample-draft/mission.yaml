@@ -1,0 +1,38 @@
+schema: 1
+slug: sample-draft
+title: Rascunho de teste
+summary: Missão sintética ainda não publicada.
+difficulty: 3
+estimated_minutes: 15
+status: draft
+
+briefing: briefing.md
+explanation: briefing.md
+objectives:
+  - "Crie o diretório `~/out`."
+
+environment:
+  image: base
+  profile: default
+
+setup:
+  script: setup.sh
+  user: root
+  timeout_seconds: 5
+
+validation:
+  not:
+    id: out-missing
+    type: path_absent
+    path: /home/student/out
+  fail_message: "O diretório ~/out ainda não existe."
+
+solutions:
+  - label: mkdir
+    script: tests/solution-mkdir.sh
+  - label: install
+    script: tests/solution-install.sh
+
+counterexamples:
+  - label: Arquivo no lugar do diretório
+    script: tests/counter-file.sh
