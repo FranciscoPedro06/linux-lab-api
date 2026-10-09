@@ -1,0 +1,7 @@
+schema: 1
+slug: beta
+title: Módulo de teste B
+description: Módulo sem missões publicadas.
+status: published
+missions:
+  - sample-draft

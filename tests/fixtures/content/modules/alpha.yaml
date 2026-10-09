@@ -1,0 +1,8 @@
+schema: 1
+slug: alpha
+title: Módulo de teste A
+description: Conteúdo sintético usado pelos testes.
+status: published
+missions:
+  - sample-file
+  - sample-answer
