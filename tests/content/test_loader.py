@@ -279,6 +279,18 @@ def test_errors_carry_the_file_and_field(root: Path) -> None:
     assert error.message == "Input should be a valid string"
 
 
+@pytest.mark.parametrize("value", ["true", "1.0"])
+def test_schema_version_errors_name_the_file_and_field(root: Path, value: str) -> None:
+    for path in (module_file(root, "alpha"), mission_file(root, "sample-file")):
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace("schema: 1\n", f"schema: {value}\n", 1), encoding="utf-8")
+
+    assert messages(root) == [
+        "modules/alpha.yaml: schema: must be the integer 1",
+        "missions/sample-file/mission.yaml: schema: must be the integer 1",
+    ]
+
+
 # File references
 
 
