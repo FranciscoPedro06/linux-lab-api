@@ -12,6 +12,7 @@ from linuxlab.api import install_error_handlers
 from linuxlab.auth import router as auth
 from linuxlab.auth.passwords import Passwords
 from linuxlab.auth.ratelimit import RateLimiter
+from linuxlab.catalog import router as catalog
 from linuxlab.config import Settings, get_settings
 from linuxlab.db import create_engine, create_sessionmaker
 from linuxlab.labs import router as labs
@@ -91,6 +92,7 @@ def create_app(
     install_error_handlers(app)
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(catalog.router)
     app.include_router(labs.router)
     app.include_router(terminal.router)
     return app
