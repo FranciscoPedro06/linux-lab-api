@@ -47,7 +47,10 @@ def make_client() -> Iterator[AppFactory]:
         client = TestClient(app, base_url="https://testserver", headers={"origin": ORIGIN})
         client.__enter__()
         clients.append(client)
-        sql(client, "TRUNCATE users, auth_sessions, lab_sessions")
+        sql(
+            client,
+            "TRUNCATE users, auth_sessions, lab_sessions, modules, missions, mission_versions",
+        )
         return client
 
     yield make
