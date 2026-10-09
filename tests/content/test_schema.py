@@ -167,6 +167,38 @@ def test_invalid_parameters(params: dict[str, Any]) -> None:
     errors(params=params, validation=check("c"))
 
 
+# YAML `true` and `1.0` equal 1 in Python; only the integer 1 is the format version.
+INVALID_SCHEMA_VERSIONS = [True, False, 1.0, "1", 0, 2, None]
+
+
+def module_data(**changes: Any) -> dict[str, Any]:
+    module: dict[str, Any] = {
+        "schema": 1,
+        "slug": "alpha",
+        "title": "Módulo",
+        "description": "Descrição.",
+        "status": "published",
+        "missions": ["a", "b"],
+    }
+    return {**module, **changes}
+
+
+@pytest.mark.parametrize("value", INVALID_SCHEMA_VERSIONS)
+def test_mission_schema_version_must_be_the_integer_1(value: Any) -> None:
+    assert parse(schema=1).schema_ == 1
+    with pytest.raises(ValidationError) as error:
+        parse(schema=value)
+    assert [item["loc"] for item in error.value.errors()] == [("schema",)]
+
+
+@pytest.mark.parametrize("value", INVALID_SCHEMA_VERSIONS)
+def test_module_schema_version_must_be_the_integer_1(value: Any) -> None:
+    assert ModuleFile.model_validate(module_data()).schema_ == 1
+    with pytest.raises(ValidationError) as error:
+        ModuleFile.model_validate(module_data(schema=value))
+    assert [item["loc"] for item in error.value.errors()] == [("schema",)]
+
+
 def test_module_file() -> None:
     module = {
         "schema": 1,

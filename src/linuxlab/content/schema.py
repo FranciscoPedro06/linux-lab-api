@@ -13,6 +13,7 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Discriminator,
     Field,
@@ -57,12 +58,20 @@ def _relative_path(value: str) -> str:
     return value
 
 
+def _schema_version(value: Any) -> Any:
+    """Literal[1] compares by equality, so True and 1.0 would pass as 1."""
+    if type(value) is not int:
+        raise ValueError(f"must be the integer {SCHEMA_VERSION}")
+    return value
+
+
 def _container_path(value: str) -> str:
     if not value.startswith("/") or "\x00" in value:
         raise ValueError("must be an absolute path inside the lab")
     return value
 
 
+SchemaVersion = Annotated[Literal[1], BeforeValidator(_schema_version)]
 Text = Annotated[str, AfterValidator(_not_blank)]
 FilePath = Annotated[str, Field(max_length=255), AfterValidator(_relative_path)]
 ContainerPath = Annotated[str, Field(max_length=4096), AfterValidator(_container_path)]
@@ -82,7 +91,7 @@ def _exactly_one(model: BaseModel, fields: tuple[str, ...]) -> None:
 
 
 class ModuleFile(_Strict):
-    schema_: Literal[1] = Field(alias="schema")
+    schema_: SchemaVersion = Field(alias="schema")
     slug: Slug
     title: Text
     description: Text
@@ -354,7 +363,7 @@ class Script(_Strict):
 
 
 class MissionFile(_Strict):
-    schema_: Literal[1] = Field(alias="schema")
+    schema_: SchemaVersion = Field(alias="schema")
     slug: Slug
     title: Text
     summary: Text
