@@ -45,6 +45,8 @@ services:
     volumes:
       - ../src:/app/src
       - ../migrations:/app/migrations
+      # Mission content for `linuxlab content sync`. Read-only: the API never writes it.
+      - ../content:/app/content:ro
       # The API creates lab containers and terminal execs. Access to the Docker socket
       # is equivalent to root on the host (see docs/threat-model.md). Labs never get it.
       - /var/run/docker.sock:/var/run/docker.sock
