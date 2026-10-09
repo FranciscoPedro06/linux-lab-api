@@ -22,9 +22,45 @@ content/
         counter-recreate-empty.sh
 ```
 
-- The directory name is the mission slug.
+- The directory name is the mission slug, and the module file name is the module slug.
 - The module file lists which missions belong to it and in what order. It is the only place where that is defined.
 - `briefing.md` is the problem statement. `explanation.md` is shown only after completion.
+
+## Content rules
+
+`linuxlab content sync` reads `content/`, checks everything below, and writes nothing unless all of it holds. Errors name the file and, where there is one, the field (`missions/x/mission.yaml: validation.all.2.mode: Input should be a valid string`).
+
+- `content/` holds only `modules/` and `missions/`; `modules/` only `<slug>.yaml` files; `missions/` only mission directories, each with a `mission.yaml`. `.gitkeep` files are ignored.
+- Every mission is listed by exactly one module, and every slug a module lists has a mission directory. A mission in no module, in two modules or twice in one module is an error.
+- Slugs (`[a-z0-9-]`, up to 64 characters) match the file or directory name.
+- No symbolic links, and nothing but regular files and directories, anywhere under `content/`.
+- Files named in `mission.yaml` (`briefing`, `explanation`, `setup.script`, the scripts of `solutions` and `counterexamples`) are relative paths with `/`, inside the mission directory: no absolute paths, `..`, `.` or empty components.
+- Files are UTF-8. Line endings are normalized to LF before hashing.
+- YAML is read with a safe loader. Duplicate keys and aliases (`&a` / `*a`) are errors.
+- Nothing is executed or compiled during the sync: scripts, conditions and parameters are checked as data.
+
+Size limits, in bytes:
+
+| File | Limit |
+|---|---|
+| Module file | 64 KiB |
+| `mission.yaml` | 64 KiB |
+| `briefing` and `explanation` (Markdown) | 64 KiB each |
+| `setup.script` | 32 KiB |
+| Each script in `solutions` and `counterexamples` | 64 KiB |
+| A mission's `mission.yaml` and every file it names, each counted once | 256 KiB |
+
+## Sync
+
+```sh
+linuxlab content sync                  # content/ of this repository, or CONTENT_DIR
+linuxlab content sync --content-dir DIR
+linuxlab content sync --allow-empty    # only to archive the whole catalog on purpose
+```
+
+It exits with `0` when the database matches the content (printing what was created, updated and archived), and `1` when the content is invalid, the directory is empty without `--allow-empty`, or the database write failed; in every case `1` means nothing changed. Run it again on the same content and it writes nothing. A changed mission gets a new version; a removed module or mission is archived with its versions kept. Details in [architecture.md](architecture.md#missions-and-versioning).
+
+In the Compose environment: `docker compose -f infra/compose.yml exec api linuxlab content sync`.
 
 ## Module
 
@@ -111,20 +147,33 @@ counterexamples:
 
 | Field | Rule |
 |---|---|
-| `schema` | Version of the file format, not of the mission |
-| `slug` | `[a-z0-9-]+`, equal to the directory name, never changed |
+| `schema` | Version of the file format, not of the mission. Only `1` exists |
+| `slug` | `[a-z0-9-]`, 1 to 64 characters, equal to the directory name, never changed |
+| `title`, `summary` | Required, not blank |
 | `difficulty` | 1 to 5 |
-| `status` | `draft`, `published` or `archived` |
+| `estimated_minutes` | At least 1 |
+| `status` | `draft`, `published` or `archived`. Only `published` missions in a `published` module appear in the catalog |
+| `tags` | Optional list of distinct slugs |
+| `objectives` | At least one |
+| `hints` | Optional |
 | `environment.image` | Alias resolved by platform configuration to a pinned digest |
 | `environment.profile` | Container security profile. Only `default` exists in the MVP |
+| `params` | Optional. Names match `[a-z][a-z0-9_]*`, up to 32 characters |
+| `setup` | Required |
 | `setup.user` | `student` (default) or `root` |
-| `setup.timeout_seconds` | Up to 60 |
+| `setup.timeout_seconds` | 1 to 60 |
+| `solutions` | At least two, each with a different script |
+| `counterexamples` | At least one |
 
-The mission version is not declared in the file. It is derived from the content during sync (see [architecture.md](architecture.md#missions-and-versioning)).
+Module files take `schema`, `slug` (equal to the file name), `title`, `description`, `status` (same values as missions) and `missions`, a list of distinct mission slugs. Modules are listed by slug.
 
-Unknown fields are rejected by the parser.
+The mission version is not declared in the file. It is derived from the content during sync (see [architecture.md](architecture.md#missions-and-versioning)). Everything in `mission.yaml` except `status`, and the content of every file it names, is part of the version; changing the status, or the module and position of a mission, does not create one.
+
+Values are not coerced: a field that expects a string refuses a number, a boolean or a date, and the reverse. Unknown fields are rejected by the parser.
 
 ## Validation tree
+
+This section and the next four describe how conditions, parameters, setup and mission tests behave once they are implemented (increments 07, 08 and 11). The sync already checks their structure and stores them in each version; it does not run them.
 
 The root of `validation` is a single node. A node is either:
 
@@ -151,7 +200,7 @@ validation:
       fail_message: "Não há uma cópia das notas em ~/backup."
 ```
 
-Limits: 50 leaves and a depth of 5. Each leaf `id` is unique within the mission and is used to report which conditions fail most often.
+Limits: 50 leaves and a depth of 5, counting the root as level 1. Each leaf `id` is a slug, unique within the mission, and is used to report which conditions fail most often.
 
 ## Validators
 
@@ -170,7 +219,7 @@ Limits: 50 leaves and a depth of 5. Each leaf `id` is unique within the mission 
 
 Every leaf accepts `fail_message` and `pass_message`.
 
-- `mode` must be a string (`"0700"`). In YAML, an unquoted `700` is read as a decimal integer and `0700` as octal 448; the parser rejects both.
+- `mode` must be a string of four octal digits (`"0700"`). In YAML, an unquoted `700` is read as a decimal integer and `0700` as octal 448; the parser rejects both.
 - `regex` uses RE2 syntax.
 - `answer` is compared by the API. The answer is never sent to the container.
 
@@ -188,7 +237,7 @@ Parameters are generated by the API for each lab.
 - Every generated value must match `^[a-z0-9_-]{1,64}$`.
 - No parameter comes from user input.
 - In setup, parameters are only available as `LAB_PARAM_<NAME>` environment variables. The script text is never modified.
-- In conditions, `{{ name }}` is replaced by a plain lookup. There is no template engine.
+- In conditions, `{{ name }}` is replaced by a plain lookup. There is no template engine. Every placeholder, and every `equals_param`, must name a declared parameter.
 - Values are stored in `lab_sessions.params` and never sent to the client.
 
 ## Setup

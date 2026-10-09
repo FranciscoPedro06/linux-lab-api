@@ -98,6 +98,23 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 | Information in the health check | `/api/health` returns only `ok` or `unavailable` per dependency |
 | Labs under runc in production | `ENVIRONMENT=production` (the default) refuses to start unless `LAB_OCI_RUNTIME=runsc` and Docker has `runsc` registered |
 
+## Mission content
+
+Content in `content/` is reviewed in the repository, but the sync still treats it as untrusted input ([missions.md](missions.md#content-rules)).
+
+| Threat | Control |
+|---|---|
+| Malformed or ambiguous YAML | Safe loader only; duplicate keys and aliases rejected; strict schema with no type coercion and no unknown fields |
+| Oversized files or alias expansion exhausting memory | Byte limits per file and per mission, checked before parsing; aliases rejected |
+| Reading files outside a mission | References are relative, without `..`; symbolic links anywhere under `content/` are rejected |
+| Code in content running on the host | Nothing in a mission is executed, imported or compiled during the sync; `{{ }}` placeholders are plain names checked against the declared parameters |
+| A published version changing after the fact | `mission_versions` rejects `UPDATE` and `DELETE`; a change always becomes a new version |
+| A partial sync after an error | Content is validated completely before the transaction starts, and the write is a single transaction |
+| Two syncs racing for the same version number | Transaction-scoped advisory lock taken before the current state is read |
+| An empty or wrong directory archiving the whole catalog | Empty content is refused unless `--allow-empty` is given |
+| Hidden mission data reaching students | Catalog responses use explicit response models with presentation fields only; setup, parameters, conditions, solutions, counterexamples and the explanation stay on the server |
+| Markup in briefings | The frontend renders Markdown with raw HTML disabled |
+
 ## Validation and setup
 
 - Mission content is treated as data. The API never executes mission content on the host.
