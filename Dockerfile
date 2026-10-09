@@ -17,6 +17,7 @@ RUN uv sync --locked --no-install-project
 COPY README.md alembic.ini ./
 COPY src ./src
 COPY migrations ./migrations
+COPY content ./content
 RUN uv sync --locked
 EXPOSE 8000
 CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "65536", "--no-proxy-headers", "--reload", "--reload-dir", "src"]
@@ -33,12 +34,16 @@ RUN uv sync --locked --no-dev --no-editable
 
 FROM python:3.12-slim AS prod
 ENV PYTHONUNBUFFERED=1 \
-    PATH=/opt/venv/bin:$PATH
+    PATH=/opt/venv/bin:$PATH \
+    CONTENT_DIR=/app/content
 RUN useradd --system --uid 10001 --no-create-home linuxlab
 WORKDIR /app
 COPY --from=build /opt/venv /opt/venv
 COPY alembic.ini ./
 COPY migrations ./migrations
+# Read by `linuxlab content sync`, run on deploy. The API reads missions only from
+# the database.
+COPY content ./content
 USER linuxlab
 EXPOSE 8000
 CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "65536", "--no-proxy-headers"]
