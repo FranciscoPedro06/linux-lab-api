@@ -29,14 +29,17 @@ def tables() -> set[str]:
     return asyncio.run(read())
 
 
+TABLES = {"users", "auth_sessions", "lab_sessions", "modules", "missions", "mission_versions"}
+
+
 def test_downgrade_and_upgrade_again() -> None:
     config = Config(str(ALEMBIC_INI))
 
     command.upgrade(config, "head")
-    assert {"users", "auth_sessions", "lab_sessions"} <= tables()
+    assert tables() >= TABLES
 
     command.downgrade(config, "base")
     assert tables() == {"alembic_version"}
 
     command.upgrade(config, "head")
-    assert {"users", "auth_sessions", "lab_sessions"} <= tables()
+    assert tables() >= TABLES
