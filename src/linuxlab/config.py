@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -6,6 +7,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # The only OCI runtime production may run labs under (docs/threat-model.md).
 PRODUCTION_OCI_RUNTIME = "runsc"
+
+# src/linuxlab/config.py -> repository root.
+DEFAULT_CONTENT_DIR = Path(__file__).resolve().parents[2] / "content"
 
 
 class Settings(BaseSettings):
@@ -35,6 +39,11 @@ class Settings(BaseSettings):
     # Labs in provisioning, ready or terminating across all users. Each lab may use
     # 512 MB of memory and half a CPU.
     lab_capacity: int = Field(default=10, ge=1)
+
+    # Modules and missions read by `linuxlab content sync`. The default is the
+    # content/ directory of this repository when the package is installed from it;
+    # the production image sets CONTENT_DIR.
+    content_dir: Path = DEFAULT_CONTENT_DIR
 
     @field_validator("allowed_origins", mode="before")
     @classmethod
