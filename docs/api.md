@@ -40,12 +40,12 @@ General errors, shared by every route:
 | POST | `/api/auth/login` | Create session. Body: `email`, `password` |
 | POST | `/api/auth/logout` | End the user's active lab, then the session |
 | GET | `/api/auth/me` | Current user |
-| GET | `/api/modules` | Published modules with their missions and the user's progress |
-| GET | `/api/missions/{slug}` | Mission detail. Uses the version of the active lab if there is one for this mission, otherwise the current version |
+| GET | `/api/modules` | Published modules with their published missions (the user's progress from increment 09) |
+| GET | `/api/missions/{slug}` | Mission detail at its current version (from increment 07: the version of the active lab if there is one for this mission) |
 | GET | `/api/labs/current` | The user's active lab, or `null` |
 | GET | `/api/labs` | The user's recent labs |
 | GET | `/api/labs/{id}` | One of the user's labs, in any state |
-| POST | `/api/labs` | Create a lab. Body: `{}` (with missions: `mission_slug`, `replace`) |
+| POST | `/api/labs` | Create a lab. Body: `{}` (`mission_slug` from increment 07, `replace` from increment 10) |
 | POST | `/api/labs/{id}/reset` | Recreate the lab for the same mission and return the new one |
 | POST | `/api/labs/{id}/validate` | Validate the current state. Optional body: `answer` |
 | DELETE | `/api/labs/{id}` | End the lab |
@@ -54,7 +54,7 @@ General errors, shared by every route:
 
 Every route requires a session except `signup`, `login`, `logout` and `health`.
 
-Implemented so far: `health`, the four `auth` routes, the lab routes except `reset` and `validate`, and the terminal. The others are the target contract.
+Implemented so far: `health`, the four `auth` routes, the two catalog routes, the lab routes except `reset` and `validate`, and the terminal. The others are the target contract.
 
 ## Authentication
 
@@ -163,19 +163,75 @@ If the lab is ended while it is being created (logout, delete), the response is 
 
 The rate limit and the default capacity are provisional values chosen in increment 05 ([architecture.md](architecture.md#values-chosen-in-increment-05)).
 
-With missions (increment 06) the body gains `mission_slug` and `replace`.
+With missions the body gains `mission_slug` (increment 07, together with mission setup and parameters) and `replace` (increment 10, mission switching). Until then labs have no mission.
 
 ### `DELETE /api/labs/{id}`
 
 Body `{}`. Ends the lab with `end_reason = user`: closes its terminal (`4410`), removes the container and returns `200` with the lab, normally `terminated`. If the container could not be removed yet the lab is returned `terminating` and the reaper finishes it. Ending an ended lab returns it unchanged; concurrent requests all succeed.
 
-## Missions (planned)
+## Catalog
+
+Implemented in increment 06. Both routes require a session and return only published content: a mission is visible when it is `published` and listed in a `published` module, read at its current version. Content comes from `content/` through `linuxlab content sync` ([architecture.md](architecture.md#missions-and-versioning)). Neither route includes progress yet (increment 09).
+
+Mission card, as listed in a module:
+
+```json
+{
+  "slug": "secure-deploy-script",
+  "title": "Proteja o script de deploy",
+  "summary": "Qualquer usuário consegue ler um script que contém um token.",
+  "difficulty": 1,
+  "estimated_minutes": 5,
+  "tags": ["permissions", "chmod"],
+  "version": 2,
+  "requires_answer": false
+}
+```
+
+- `version`: the mission's current version.
+- `requires_answer`: validation expects the `answer` field, because the mission's conditions include an `answer` condition. Derived from the stored specification; nothing is evaluated.
+
+Setup, parameters, conditions, solutions, counterexamples and the explanation are never returned.
+
+### `GET /api/modules`
+
+Published modules that have at least one visible mission, ordered by slug. Missions follow the order of the module file.
+
+```json
+[
+  {
+    "slug": "fundamentals",
+    "title": "Fundamentos",
+    "description": "Navegar, criar e organizar arquivos.",
+    "missions": [ { "slug": "secure-deploy-script", "...": "mission card" } ]
+  }
+]
+```
+
+An empty catalog is `[]`.
 
 ### `GET /api/missions/{slug}`
 
-`explanation` and `solutions` are only included once the user has completed the mission. This is enforced by the server.
+The mission card plus:
 
-`requires_answer` tells the client that validation expects the `answer` field.
+```json
+{
+  "module": { "slug": "fundamentals", "title": "Fundamentos" },
+  "briefing": "# Proteja o script de deploy\n\n...",
+  "objectives": ["`~/deploy.sh` continua existindo, com o conteúdo original."],
+  "hints": ["Veja as permissões atuais com `ls -l`."]
+}
+```
+
+`briefing` is Markdown. The client renders it with raw HTML disabled.
+
+A mission that does not exist, is `draft` or `archived`, or is listed in a module that is not published returns `404 mission_not_found`; all look the same.
+
+## Missions (planned)
+
+### `GET /api/missions/{slug}` after completion
+
+From increment 09, `explanation` and `solutions` are included once the user has completed the mission. This is enforced by the server. From increment 07, the detail uses the version of the user's active lab for this mission, if there is one.
 
 ### `POST /api/labs/{id}/validate`
 

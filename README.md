@@ -19,8 +19,9 @@ What exists today:
 3. The student works with whatever commands they prefer; nothing typed is parsed or filtered.
 4. Accounts exist: sign-up with an invite code, login and logout, with a server-side session in an `HttpOnly` cookie. Only the owner's session can see a lab or open its terminal.
 5. Labs end when the student ends them, logs out, leaves them idle (15 minutes without a terminal, 30 without typing), after 2 hours, or when they run out of memory. A background reaper reconciles the database with Docker and removes anything left behind. The student is told why a lab ended.
+6. Modules and missions are kept in `content/` and synced to PostgreSQL by `linuxlab content sync`, which validates them and stores each change as a new immutable version. Signed-in users can browse the published catalog. Missions are not tied to labs yet.
 
-Planned, not implemented yet: missions with their initial state, validation of the final state, progress and resetting a lab.
+Planned, not implemented yet: mission setup and parameters, validation of the final state, progress and resetting a lab.
 
 Missions will declare conditions rather than run validation code:
 
@@ -138,6 +139,17 @@ uv run uvicorn --factory linuxlab.main:create_app --reload
 
 Configuration comes from environment variables or `.env`; see [.env.example](.env.example).
 
+### Mission content
+
+Modules and missions are files in `content/` ([docs/missions.md](docs/missions.md)); the API reads them only from the database. After changing them, sync:
+
+```sh
+uv run linuxlab content sync                                        # API on the host
+docker compose -f infra/compose.yml exec api linuxlab content sync   # Compose
+```
+
+The sync validates everything first and writes in one transaction, so invalid content changes nothing. It refuses an empty `content/` unless given `--allow-empty`. The repository holds no missions yet; the tests use synthetic content from `tests/fixtures/content/`.
+
 `ENVIRONMENT` defaults to `production`, which refuses to start unless labs run under gVisor (`LAB_OCI_RUNTIME=runsc`, registered with Docker). `.env.example` and Compose set `development`. `GET /api/health` reports the database and the lab runtime separately.
 
 ## Tests
@@ -147,13 +159,13 @@ uv run ruff check
 uv run ruff format --check
 uv run mypy
 uv run pytest                  # unit tests
-uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), schema, migrations; PostgreSQL at DATABASE_URL
+uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), content sync, catalog, schema, migrations; PostgreSQL at DATABASE_URL
 uv run pytest -m docker                         # lab runtime, isolation, terminal and lab lifecycle; Docker, the lab image and PostgreSQL
 ```
 
 Lab runtime tests, gVisor setup and the list of isolation checks are described in [docs/runtime.md](docs/runtime.md).
 
-The integration tests empty the `users`, `auth_sessions` and `lab_sessions` tables and run the migrations down and up again, so point `DATABASE_URL` at a development database. On Windows, use `127.0.0.1` rather than `localhost` in `DATABASE_URL`; each connection to `localhost` can wait about two seconds for IPv6 first.
+The integration tests empty the `users`, `auth_sessions`, `lab_sessions`, `modules`, `missions` and `mission_versions` tables and run the migrations down and up again, so point `DATABASE_URL` at a development database. On Windows, use `127.0.0.1` rather than `localhost` in `DATABASE_URL`; each connection to `localhost` can wait about two seconds for IPv6 first.
 
 CI runs the same checks, the integration tests against a PostgreSQL service, the Docker tests under runc, a migration downgrade and upgrade, and builds the API and lab images. A separate `Runtime` workflow runs the Docker tests under gVisor.
 
@@ -166,7 +178,7 @@ Planned coverage as the project grows:
 
 ## Status
 
-Increments 01 to 05 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; and lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal. The mission catalog comes next (increment 06). Planned order:
+Increments 01 to 06 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; and the mission catalog, with content validated and synced from `content/` into immutable versions. Mission setup and parameters come next (increment 07). Planned order:
 
 | # | Increment |
 |---|---|

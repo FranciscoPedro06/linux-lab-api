@@ -32,7 +32,7 @@ The API runs as a single process in the MVP. WebSocket connections, rate limitin
 | Module | Responsibility |
 |---|---|
 | `auth` | Sign-up, login, logout, sessions |
-| `catalog` | Read access to modules and missions, with the user's progress |
+| `catalog` | Read access to published modules and missions; the user's progress is added in increment 09 |
 | `content` | Parsing, schema validation and sync of missions from the repository |
 | `progress` | `user_missions` rules |
 | `labs` | Lab lifecycle, container configuration, reaper |
@@ -42,7 +42,7 @@ The API runs as a single process in the MVP. WebSocket connections, rate limitin
 
 ## Labs
 
-Implemented in increment 05 (`src/linuxlab/labs/`): `models.py` (lab sessions), `lifecycle.py` (creation, ending, reconciliation), `reaper.py`, `access.py` (ownership) and `router.py` (HTTP). A lab is an ephemeral container owned by one user. From increment 06 it will also be tied to a specific version of a mission; today it is a plain lab with no mission.
+Implemented in increment 05 (`src/linuxlab/labs/`): `models.py` (lab sessions), `lifecycle.py` (creation, ending, reconciliation), `reaper.py`, `access.py` (ownership) and `router.py` (HTTP). A lab is an ephemeral container owned by one user. From increment 07 it will also be tied to a specific version of a mission; today it is a plain lab with no mission.
 
 ```
 provisioning --> ready --> terminating --> terminated
@@ -67,7 +67,7 @@ Rules:
 - A user has at most one lab in `provisioning`, `ready` or `terminating`, enforced by the partial unique index `one_active_lab_per_user`. Concurrent creations by one user produce one lab; the others get the existing lab or `409`.
 - At most `LAB_CAPACITY` labs (default 10) are active across all users. Creations are serialized by a transaction-scoped advisory lock, so the cap cannot be raced. Each user may start at most 10 labs per 10 minutes. Both values are provisional; see [Values chosen in increment 05](#values-chosen-in-increment-05).
 - Labs are only created by an explicit user action.
-- Planned with missions (increments 06 and 10): pinning `(mission_id, mission_version)`, keeping progress when a lab is destroyed, and ending the lab with `end_reason = mission_switch` when switching missions.
+- Planned with missions: pinning `(mission_id, mission_version)` and the mission's parameters when the lab is created (increment 07), keeping progress when a lab is destroyed (increment 09), and ending the lab with `end_reason = mission_switch` when switching missions (increment 10).
 
 ### Consistency between PostgreSQL and Docker
 
@@ -180,22 +180,34 @@ The response sent to the client carries the status and message of each condition
 
 ## Missions and versioning
 
-Missions live in `content/` as YAML, Markdown and scripts. `linuxlab content sync`, run on deploy:
+Implemented in increment 06 (`src/linuxlab/content/` and `src/linuxlab/catalog/`). Missions live in `content/` as YAML, Markdown and scripts; that directory is the source of truth, and the database is its queryable copy plus every version ever published. At runtime the API reads only from the database.
 
-1. validates every mission against the schema;
-2. computes a `content_hash` over a canonical serialization of everything the student sees or runs;
-3. inserts a new row in `mission_versions` when the hash changes and updates `missions.current_version`;
-4. marks missions that were removed from the repository as `archived`.
+`linuxlab content sync` (run on deploy, and by hand in development) works in two phases:
 
-Versions are immutable and hold the complete specification, including setup and Markdown. At runtime the API reads only from the database.
+1. **Read and validate, without touching the database.** Every module and mission file is parsed and checked against the schema, file sizes and references, and the links between modules and missions ([missions.md](missions.md#content-rules)). Nothing in the content is executed. Any problem stops the sync with every error listed, each with its file and field.
+2. **Write, in one transaction.** The sync takes a transaction-scoped advisory lock before reading the current state, so concurrent syncs run one after the other and each decides version numbers on what the previous one committed. Any failure rolls the whole sync back.
+
+Within the transaction:
+
+- Modules and missions are matched by slug, created when new and updated in place. Title, description, status, module and position never create a version.
+- Each mission's specification (every field of `mission.yaml` except `status`, with the referenced Markdown and scripts inlined, defaults made explicit) is hashed: SHA-256 of its canonical JSON (keys sorted, UTF-8, no insignificant whitespace), with line endings in every file normalized to LF first. Hidden fields such as setup, parameters, conditions, solutions and counterexamples are part of it.
+- When the hash differs from the current version's, a row is inserted in `mission_versions` with the mission's highest version plus one, and `missions.current_version` points to it. Content that returns to an earlier state also gets a new number; there is no uniqueness on the hash.
+- Modules and missions no longer in `content/` are marked `archived`, never deleted, and keep their versions. An archived mission has no position. A slug that comes back reuses its row; it gets a new version only if its content differs from its current version.
+- With an empty `content/` (no modules and no missions) the sync refuses to run and changes nothing, unless `--allow-empty` asks for every module and mission to be archived. Deploys and CI never pass it.
+
+Running the sync again on the same content writes nothing.
+
+Versions are immutable: a trigger rejects `UPDATE` and `DELETE` on `mission_versions`, and they hold the complete specification, including setup and Markdown.
 
 | Situation | Behavior |
 |---|---|
-| Completed on version 1, version 2 released | Stays completed; `completed_version = 1` |
-| Lab active on version 1 | Stays on version 1 until it ends |
+| Completed on version 1, version 2 released | Stays completed; `completed_version = 1` (increment 09) |
+| Lab active on version 1 | Stays on version 1 until it ends (increment 07) |
 | Reset or new lab | Uses the current version |
 
 Students cannot pick an older version. A change that alters what the mission asks for should use a new slug.
+
+The catalog (`GET /api/modules`, `GET /api/missions/{slug}`) shows a mission only when it is `published` and listed in a `published` module, and reads it at its current version. A module appears only with at least one such mission. Until labs are tied to missions (increment 07), the detail always uses the current version.
 
 The format is described in [missions.md](missions.md).
 
@@ -236,15 +248,15 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 
 ## Data model
 
-`users`, `auth_sessions` and `lab_sessions` exist (migrations for increments 04 and 05); the other tables are the target design.
+`users`, `auth_sessions`, `lab_sessions` (migrations for increments 04 and 05), `modules`, `missions` and `mission_versions` (increment 06) exist; the other tables are the target design.
 
 | Table | Contents |
 |---|---|
 | `users` | Account, password hash, display name |
 | `auth_sessions` | Sessions: SHA-256 of the token (unique), creation, last activity and absolute expiry |
-| `modules` | Modules synced from `content/` |
-| `missions` | Stable mission identity (slug), module, position, status, current version |
-| `mission_versions` | Immutable specification per version; PK `(mission_id, version)` |
+| `modules` | Modules synced from `content/`: slug (unique), title, description, status |
+| `missions` | Stable mission identity (slug, unique), module, position in the module (unique per module, `NULL` once removed from `content/`), status, current version |
+| `mission_versions` | Immutable specification per version: content hash and the complete specification as `JSONB`; PK `(mission_id, version)` |
 | `user_missions` | Progress per user and mission; PK `(user_id, mission_id)` |
 | `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time. The pinned mission version and parameters are added with missions |
 | `validation_runs` | Every validation, with the full result and the version used |
@@ -273,7 +285,9 @@ Other rules:
 
 - `user_missions`: a missing row means the mission was never started. `completed_at` and `completed_version` are set together and never cleared.
 - `lab_sessions.params` holds answers for discovery missions and is never sent to the client.
-- `mission_versions` has a trigger that rejects `UPDATE`.
+- `mission_versions` has a trigger that rejects `UPDATE` and `DELETE`.
+- `missions` has a foreign key `(id, current_version)` to `mission_versions`, so the current version always exists and belongs to the mission. It and the uniqueness of `(module_id, position)` are checked at commit, which lets a sync insert a mission with its first version and reorder a module in one transaction.
+- `modules` and `missions` have `CHECK` constraints on the status (`draft`, `published`, `archived`) and the slug format; a mission without a position must be `archived`.
 - States and reasons are `text` columns with `CHECK` constraints rather than `ENUM`, which keeps schema changes simple.
 - `lab_sessions` has `CHECK` constraints tying `end_reason` and `ended_at` to the ended states, and a trigger that allows only the lifecycle's transitions and never changes the owner, the creation or expiry time, or a recorded end reason.
 - No container id is stored: the container name is derived from the lab id, so reconciliation works even if the API crashed between creating the container and recording anything about it.
