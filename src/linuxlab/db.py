@@ -28,6 +28,10 @@ def create_engine(database_url: str) -> AsyncEngine:
         database_url,
         pool_pre_ping=True,
         connect_args={"timeout": CONNECT_TIMEOUT_SECONDS},
+        # Statement errors name the SQL but not the bound values, which can be mission
+        # parameters, password hashes or session token hashes. Tracebacks of failed
+        # statements are logged.
+        hide_parameters=True,
     )
 
 
