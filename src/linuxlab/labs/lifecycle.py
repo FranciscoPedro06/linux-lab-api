@@ -20,12 +20,19 @@ actor (a request, the reaper, a crashed and restarted API), is safe:
 
 Containers are found by their deterministic name and accepted only if their labels
 say they are this deployment's container for that lab.
+
+A lab is created for a published mission. The mission's current version is pinned,
+and its parameters generated, in the transaction that inserts the row; everything
+after that reads the pinned version. The container is then prepared (`labctl init`,
+then the version's setup script) before the lab becomes ready. Only the request that
+inserted the row runs setup, once: a provisioning interrupted by a crash is failed by
+the reaper, never resumed.
 """
 
 import asyncio
 import logging
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,6 +42,9 @@ from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from linuxlab.content.models import Mission, MissionVersion, Module
+from linuxlab.content.params import ParamError, generate_params
+from linuxlab.content.stored import InvalidSpecError, SetupScript, provisioning_spec
 from linuxlab.labs.models import (
     ACTIVE_STATUSES,
     RUNNING_STATUSES,
@@ -72,6 +82,15 @@ TERMINATION_GRACE = timedelta(minutes=1)
 # cleanup exec (10 s), before removing the container anyway.
 TERMINAL_CLOSE_SECONDS = 15
 
+# Preparing a container, inside the provisioning timeout. labctl ships with the lab
+# image and runs as root; setup runs as the version's setup user and reads the script
+# from standard input, so the script is never written to the lab's filesystem.
+LABCTL_INIT = ("python3", "-I", "-S", "/opt/labctl/labctl", "init")
+LABCTL_INIT_SECONDS = 10
+SETUP_COMMAND = ("bash", "-euo", "pipefail")
+PARAM_ENV_PREFIX = "LAB_PARAM_"
+PUBLISHED = "published"
+
 UNIQUE_VIOLATION = "23505"
 # Serializes lab creation, so the global capacity check cannot be raced.
 CREATION_LOCK = 0x6C61_6273  # "labs"
@@ -83,6 +102,27 @@ class LabCapacityError(Exception):
 
 class LabStartError(Exception):
     """Provisioning failed. The lab has been marked failed and cleaned up."""
+
+
+class MissionNotFoundError(Exception):
+    """No published mission with this slug. Nothing was created."""
+
+
+class DifferentMissionError(Exception):
+    """The user already has a lab for another mission. Nothing was created."""
+
+    def __init__(self, lab: "LabSession") -> None:
+        super().__init__(lab.id)
+        self.lab = lab
+
+
+class MissionSpecError(Exception):
+    """The mission's current version cannot be provisioned: its stored specification
+    is invalid or its parameters could not be generated. Nothing was created."""
+
+
+class PreparationError(Exception):
+    """labctl init or setup did not complete. Carries no output and no parameter."""
 
 
 class LabGoneError(Exception):
@@ -113,7 +153,8 @@ class Labs:
         self._sessionmaker = sessionmaker
         self._runtime = runtime
         self._terminals = terminals
-        self._image = image
+        # Image aliases a mission may name, resolved from trusted configuration.
+        self._images = {"base": image}
         self._deployment = deployment
         self._capacity = capacity
 
@@ -129,26 +170,57 @@ class Labs:
 
     # Creation
 
-    async def create(self, user_id: uuid.UUID) -> Creation:
-        """Create a lab for the user, or return the active lab the user already has.
+    async def create(self, user_id: uuid.UUID, mission_slug: str) -> Creation:
+        """Create a lab for the user and the mission, or return the user's active lab.
 
-        Raises LabCapacityError when the global cap is reached and LabStartError if
-        the container could not be started.
+        An active lab for the same mission is returned as it is; one for another
+        mission raises DifferentMissionError, unless it is already terminating.
+        Raises MissionNotFoundError unless the mission is published, MissionSpecError
+        if its current version cannot be provisioned, LabCapacityError when the global
+        cap is reached and LabStartError if the container could not be started or
+        prepared.
         """
         now = utcnow()
-        lab = LabSession(
-            id=uuid.uuid4(),
-            user_id=user_id,
-            status=LabStatus.PROVISIONING,
-            created_at=now,
-            last_activity_at=now,
-            expires_at=now + MAX_LIFETIME,
-        )
         async with self._sessionmaker() as db:
             await db.execute(select(func.pg_advisory_xact_lock(CREATION_LOCK)))
             existing = await db.scalar(_active_lab(user_id))
             if existing is not None:
-                return Creation(existing, created=False)
+                return await self._existing(db, existing, mission_slug)
+            # The version is read, and pinned below, in the transaction that inserts
+            # the lab: a sync that publishes a new version afterwards does not change it.
+            pinned = (
+                await db.execute(
+                    select(Mission.id, MissionVersion.version, MissionVersion.spec)
+                    .join(Module, Module.id == Mission.module_id)
+                    .join(
+                        MissionVersion,
+                        (MissionVersion.mission_id == Mission.id)
+                        & (MissionVersion.version == Mission.current_version),
+                    )
+                    .where(
+                        (Mission.slug == mission_slug)
+                        & (Mission.status == PUBLISHED)
+                        & (Module.status == PUBLISHED)
+                        & Mission.position.is_not(None)
+                    )
+                )
+            ).one_or_none()
+            if pinned is None:
+                raise MissionNotFoundError(mission_slug)
+            mission_id, version, spec = pinned
+            try:
+                provisioning = provisioning_spec(spec)
+                image = self._images[provisioning.environment.image]
+                params = generate_params(provisioning.params)
+            except (InvalidSpecError, ParamError, KeyError) as error:
+                # These messages name fields and parameters, never values.
+                logger.error(
+                    "lab not created, mission version unusable: mission=%s version=%s error=%s",
+                    mission_slug,
+                    version,
+                    error,
+                )
+                raise MissionSpecError(mission_slug) from None
             active = await db.scalar(
                 select(func.count())
                 .select_from(LabSession)
@@ -156,6 +228,17 @@ class Labs:
             )
             if (active or 0) >= self._capacity:
                 raise LabCapacityError
+            lab = LabSession(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                status=LabStatus.PROVISIONING,
+                created_at=now,
+                last_activity_at=now,
+                expires_at=now + MAX_LIFETIME,
+                mission_id=mission_id,
+                mission_version=version,
+                params=params,
+            )
             db.add(lab)
             try:
                 # The partial unique index is what guarantees one active lab per user.
@@ -167,18 +250,23 @@ class Labs:
                 existing = await db.scalar(_active_lab(user_id))
                 if existing is None:
                     raise
-                return Creation(existing, created=False)
-        logger.info("lab provisioning: lab=%s user=%s", lab.id, user_id)
+                return await self._existing(db, existing, mission_slug)
+        logger.info(
+            "lab provisioning: lab=%s user=%s mission=%s version=%s",
+            lab.id,
+            user_id,
+            mission_slug,
+            version,
+        )
 
         try:
             async with asyncio.timeout(PROVISIONING_TIMEOUT.total_seconds()):
                 info = await self._runtime.create(
-                    LabContainerSpec(
-                        lab_id=lab.lab_key, image=self._image, deployment=self._deployment
-                    )
+                    LabContainerSpec(lab_id=lab.lab_key, image=image, deployment=self._deployment)
                 )
                 await self._runtime.start(info.id)
-        except (LabRuntimeError, TimeoutError) as error:
+                await self._prepare(lab.id, info.id, provisioning.setup, params)
+        except (LabRuntimeError, PreparationError, TimeoutError) as error:
             if await self._fail(lab.id, EndReason.PROVISIONING_FAILED):
                 logger.error("lab provisioning failed: lab=%s error=%s", lab.id, error)
                 raise LabStartError from error
@@ -192,6 +280,56 @@ class Labs:
             logger.info("lab ready: lab=%s", lab.id)
             return Creation(ready, created=True)
         return Creation(await self._ended_while_provisioning(lab.id), created=True)
+
+    async def _existing(
+        self, db: AsyncSession, existing: LabSession, mission_slug: str
+    ) -> Creation:
+        """The user's active lab, unless it is for another mission and not ending."""
+        if existing.status != LabStatus.TERMINATING:
+            slug = None
+            if existing.mission_id is not None:
+                slug = await db.scalar(
+                    select(Mission.slug).where(Mission.id == existing.mission_id)
+                )
+            if slug != mission_slug:
+                raise DifferentMissionError(existing)
+        return Creation(existing, created=False)
+
+    async def _prepare(
+        self,
+        lab_id: uuid.UUID,
+        container_id: str,
+        setup: SetupScript,
+        params: Mapping[str, str],
+    ) -> None:
+        """Run labctl init, then the setup script, in the lab's container.
+
+        Output is discarded, since it may contain parameters. Only the exit code and
+        whether the command timed out are reported.
+        """
+        init = await self._runtime.exec(
+            container_id, LABCTL_INIT, user="root", time_limit=LABCTL_INIT_SECONDS
+        )
+        if init.exit_code != 0 or init.timed_out:
+            raise PreparationError(
+                f"labctl init: exit {init.exit_code}, timed out {init.timed_out}"
+            )
+        result = await self._runtime.exec(
+            container_id,
+            SETUP_COMMAND,
+            user=setup.user,
+            time_limit=setup.timeout_seconds,
+            stdin=setup.script.encode("utf-8"),
+            env={f"{PARAM_ENV_PREFIX}{name.upper()}": value for name, value in params.items()},
+        )
+        logger.info(
+            "lab setup finished: lab=%s exit=%s timed_out=%s",
+            lab_id,
+            result.exit_code,
+            result.timed_out,
+        )
+        if result.exit_code != 0 or result.timed_out:
+            raise PreparationError(f"setup: exit {result.exit_code}, timed out {result.timed_out}")
 
     async def _ended_while_provisioning(self, lab_id: uuid.UUID) -> LabSession:
         # Ended by logout, delete or the reaper. Whoever ended it may have removed the
