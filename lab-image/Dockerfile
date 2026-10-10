@@ -21,8 +21,10 @@ RUN userdel --remove ubuntu \
 # No setuid or setgid binaries: the student has no path to uid 0.
 RUN find / -xdev -type f -perm /6000 -exec chmod a-s {} +
 
-# Reserved for platform utilities that run as root through docker exec.
+# Platform utilities that run as root through docker exec. Only root can open the
+# directory, and the rootfs is read-only, so the student can neither read nor change them.
 RUN install --directory --owner=root --group=root --mode=0700 /opt/labctl
+COPY --chown=root:root --chmod=0700 labctl /opt/labctl/labctl
 
 USER student
 WORKDIR /home/student

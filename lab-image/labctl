@@ -1,0 +1,89 @@
+"""Platform utility inside a lab. Runs as root through docker exec, as
+`python3 -I -S /opt/labctl/labctl <command>`, from a read-only directory only root
+can open. It never runs mission content.
+
+Commands:
+  init  Populate the student's home from /etc/skel: the same files, owned by the
+        student, with the modes they have in /etc/skel. Running it again gives the
+        same result. Nothing is followed through a symbolic link.
+"""
+
+import os
+import stat
+import sys
+
+SKEL = "/etc/skel"
+HOME = "/home/student"
+STUDENT_UID = 1000
+STUDENT_GID = 1000
+
+
+def fail(message):
+    print(f"labctl: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def copy_file(source, target, mode):
+    try:
+        existing = os.lstat(target)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        fail(f"{target}: exists and is not a regular file")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    with open(source, "rb") as reader:
+        data = reader.read()
+    descriptor = os.open(target, flags, 0o600)
+    try:
+        os.fchown(descriptor, STUDENT_UID, STUDENT_GID)
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb", closefd=False) as writer:
+            writer.write(data)
+    finally:
+        os.close(descriptor)
+
+
+def make_directory(target, mode):
+    try:
+        os.mkdir(target, 0o700)
+    except FileExistsError:
+        pass
+    existing = os.lstat(target)
+    if not stat.S_ISDIR(existing.st_mode):
+        fail(f"{target}: exists and is not a directory")
+    os.chown(target, STUDENT_UID, STUDENT_GID, follow_symlinks=False)
+    os.chmod(target, mode, follow_symlinks=False)
+
+
+def init():
+    home = os.lstat(HOME)
+    if not stat.S_ISDIR(home.st_mode):
+        fail(f"{HOME}: not a directory")
+    for directory, subdirectories, files in os.walk(SKEL):
+        relative = os.path.relpath(directory, SKEL)
+        target_directory = HOME if relative == "." else os.path.join(HOME, relative)
+        for name in sorted(subdirectories):
+            source = os.path.join(directory, name)
+            info = os.lstat(source)
+            if stat.S_ISDIR(info.st_mode):
+                make_directory(os.path.join(target_directory, name), stat.S_IMODE(info.st_mode))
+        for name in sorted(files):
+            source = os.path.join(directory, name)
+            info = os.lstat(source)
+            if stat.S_ISREG(info.st_mode):
+                copy_file(source, os.path.join(target_directory, name), stat.S_IMODE(info.st_mode))
+
+
+COMMANDS = {"init": init}
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+        fail(f"usage: labctl {{{'|'.join(COMMANDS)}}}")
+    if os.geteuid() != 0:
+        fail("must run as root")
+    COMMANDS[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()
