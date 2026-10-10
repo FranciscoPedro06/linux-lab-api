@@ -19,7 +19,7 @@ LabRuntime (protocol)          src/linuxlab/labs/runtime/base.py
 | `list_labs(deployment)` | Every container labeled `linuxlab.managed=true` and `linuxlab.deployment=<deployment>`, running or not. Selected by labels, never by name |
 | `start(id)`, `stop(id)` | Start, or stop with a 2 second grace period |
 | `inspect(id)` | Name, running state, `linuxlab.*` labels, and whether the container was OOM-killed |
-| `exec(id, argv, user, time_limit)` | Runs argv without a shell as `student` or `root` |
+| `exec(id, argv, user, time_limit, stdin, env)` | Runs argv without a shell as `student` or `root`, optionally writing `stdin` to it and adding mission parameters to its environment |
 | `open_terminal(id, size)` | Starts `bash --login` as the student on a PTY and returns a `TerminalSession` (read, write, resize, close); see [terminal.md](terminal.md) |
 | `remove(id)` | Force-removes the container; a missing container is not an error, and a removal already in progress is waited for (up to 10 s) |
 
@@ -29,15 +29,16 @@ LabRuntime (protocol)          src/linuxlab/labs/runtime/base.py
 - The command runs under coreutils `timeout`, which sends SIGTERM to the whole process group at `time_limit` and SIGKILL 2 seconds later. The client stops waiting 5 seconds after that.
 - `timed_out` is set when `timeout` reports expiry (exit code 124, or 137 after the deadline). A command that itself exits with 124 is indistinguishable.
 - stdout and stderr are captured separately, up to 1 MiB each; `truncated` is set if more was produced.
-- The environment is fixed (`PATH`, `LANG`). The working directory is `/home/student` for the student and `/` for root.
+- The environment is fixed (`PATH`, `LANG`). `env` can only add `LAB_PARAM_<NAME>` variables whose values match the parameter format (`^[a-z0-9_-]{1,64}$`); anything else is refused before Docker is called, with an error that names the variable and never its value. Nothing from the API's own environment reaches the lab. Docker adds `HOSTNAME` and `HOME`. The working directory is `/home/student` for the student and `/` for root.
+- Without `stdin`, the command's standard input is not attached and reads end of file at once. With `stdin`, the bytes are written to the exec connection and its sending side is then closed (a TCP-style half-close), so Docker closes the command's standard input while its output keeps arriving. Output is read while the input is written: a command that fills its output pipes before reading its input does not block either side. If the input cannot be delivered, the exec raises `LabRuntimeError`; if the command exits before reading all of it, its exit code is reported as usual.
 
 ## Container configuration
 
 Defined in one function, `build_container_config`, and covered by a snapshot test. The values and their reasons are in [threat-model.md](threat-model.md#container-configuration).
 
-The lab image is built from `lab-image/`: Ubuntu 24.04 pinned by digest, `bash`, `python3`, `tini`, `procps`, `iproute2`, user `student` (uid 1000), no `sudo`, no setuid or setgid binaries, and `/opt/labctl` reserved for platform utilities (root only, currently empty). The entrypoint is `tini -- sleep infinity`.
+The lab image is built from `lab-image/`: Ubuntu 24.04 pinned by digest, `bash`, `python3`, `tini`, `procps`, `iproute2`, user `student` (uid 1000), no `sudo`, no setuid or setgid binaries, and `/opt/labctl` for platform utilities (directory and files `0700`, owned by root). The entrypoint is `tini -- sleep infinity`.
 
-`/home/student` is a tmpfs, so it starts empty; populating it is left to `labctl init`, which does not exist yet. Docker mounts tmpfs `noexec` by default, so the configuration sets `exec` on `/home/student` and `/tmp`, where students run their own scripts, and keeps `noexec` on `/run/lab`.
+`/home/student` is a tmpfs, so it starts empty. When a lab is created, `labctl init` (`lab-image/labctl`, installed as `/opt/labctl/labctl`) runs as root with `python3 -I -S` and copies `/etc/skel` into it, owned by the student, without following symbolic links; then the mission's setup runs ([missions.md](missions.md#setup)). Docker mounts tmpfs `noexec` by default, so the configuration sets `exec` on `/home/student` and `/tmp`, where students run their own scripts, and keeps `noexec` on `/run/lab`.
 
 ## Differences between runc and runsc
 
@@ -64,6 +65,7 @@ The per-process memory and host thread figures were measured with runsc in a loc
 - Any Docker Engine runs the tests under `runc`.
 - gVisor requires Linux with a native Docker Engine. Docker Desktop cannot register `runsc`, so on Windows and macOS gVisor is only tested in CI.
 - `aiodocker` picks the active Docker context before `DOCKER_HOST`, unlike the Docker CLI. When pointing the API or the tests at another daemon, set `DOCKER_CONTEXT=default` together with `DOCKER_HOST`, or make sure no other context is active.
+- `exec` with `stdin` needs a connection to Docker that can be half-closed: the Unix socket (Linux, and the API container in Compose, which mounts it) or TCP. The Windows named pipe cannot, so an API or test run directly on Windows refuses to run setup (`LabRuntimeError`) instead of running a script whose end it cannot signal. Run the API through Compose, or the Docker tests from a Linux container or CI.
 
 Installing gVisor on a Linux host (the same steps as `.github/workflows/runtime.yml`):
 

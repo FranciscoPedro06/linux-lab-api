@@ -41,11 +41,11 @@ General errors, shared by every route:
 | POST | `/api/auth/logout` | End the user's active lab, then the session |
 | GET | `/api/auth/me` | Current user |
 | GET | `/api/modules` | Published modules with their published missions (the user's progress from increment 09) |
-| GET | `/api/missions/{slug}` | Mission detail at its current version (from increment 07: the version of the active lab if there is one for this mission) |
+| GET | `/api/missions/{slug}` | Mission detail: at the version of the user's active lab for this mission if there is one, otherwise at its current version |
 | GET | `/api/labs/current` | The user's active lab, or `null` |
 | GET | `/api/labs` | The user's recent labs |
 | GET | `/api/labs/{id}` | One of the user's labs, in any state |
-| POST | `/api/labs` | Create a lab. Body: `{}` (`mission_slug` from increment 07, `replace` from increment 10) |
+| POST | `/api/labs` | Create a lab for a mission. Body: `mission_slug` (`replace` from increment 10) |
 | POST | `/api/labs/{id}/reset` | Recreate the lab for the same mission and return the new one |
 | POST | `/api/labs/{id}/validate` | Validate the current state. Optional body: `answer` |
 | DELETE | `/api/labs/{id}` | End the lab |
@@ -123,15 +123,17 @@ Lab object:
   "end_reason": "oom",
   "created_at": "2026-10-01T12:00:00Z",
   "expires_at": "2026-10-01T14:00:00Z",
-  "ended_at": "2026-10-01T12:20:03Z"
+  "ended_at": "2026-10-01T12:20:03Z",
+  "mission": { "slug": "secure-deploy-script", "title": "Proteja o script de deploy", "version": 2 }
 }
 ```
 
 - `status`: `provisioning`, `ready`, `terminating`, `terminated` or `failed` ([architecture.md](architecture.md#labs)).
 - `end_reason`: `null` while the lab runs; otherwise `user`, `logout`, `no_terminal`, `no_input`, `max_lifetime`, `oom`, `container_lost`, `provisioning_failed` or `provisioning_timeout`.
 - `expires_at`: the maximum lifetime, 2 hours after creation.
+- `mission`: the mission version the lab was created for, with the title of that version; it does not change when the mission gets a new version or is archived. `null` only for labs created before increment 07.
 
-Container ids, container names, the owner and other internals are never returned. The client cannot choose the user, the container, the image, the runtime, the user inside the lab or any limit: the body of `POST /api/labs` is `{}` and extra fields are refused.
+Container ids, container names, the owner, the mission's parameters and other internals are never returned. The client cannot choose the user, the container, the image, the runtime, the user inside the lab, the mission version, its parameters or setup, or any limit: the body of `POST /api/labs` holds only `mission_slug`, and extra fields are refused.
 
 ### `GET /api/labs/current`
 
@@ -147,23 +149,31 @@ The lab, in any state, including after it ended, so the client can show why.
 
 ### `POST /api/labs`
 
-Body `{}`. Creation is synchronous and takes about a second.
+```json
+{ "mission_slug": "secure-deploy-script" }
+```
+
+Creates a lab for the mission's current version: the API pins that version, generates the mission's parameters, starts the container and runs the mission's setup inside it ([missions.md](missions.md#setup)). Creation is synchronous: the response comes when the lab is ready or has failed, which can take up to about 70 seconds when setup is slow. Clients should show that the lab is being prepared and not repeat the request meanwhile; a repeated request gets `409 lab_provisioning`.
 
 | Situation | Response |
 |---|---|
-| No active lab | `201` with the new lab in `ready` |
-| A ready lab already exists | `200` with that lab |
-| A lab is being started | `409 lab_provisioning` |
+| Published mission, no active lab | `201` with the new lab in `ready` |
+| Missing `mission_slug`, a value that is not a string, or any other field | `422 invalid_request` |
+| No such mission, or it is a draft, archived or in a module that is not published (including an empty catalog) | `404 mission_not_found`; nothing is created |
+| A ready lab for the same mission already exists | `200` with that lab, unchanged: no new container, parameters or setup |
+| An active lab for another mission (or one created before missions) exists | `409 active_lab_for_different_mission`; that lab is not touched |
+| A lab is being started for the same mission | `409 lab_provisioning` |
 | The previous lab is still being ended | `409 lab_terminating` |
 | More than 10 creations in 10 minutes by this user | `429 rate_limited`, with `Retry-After` |
 | `LAB_CAPACITY` labs active across all users | `503 lab_capacity_reached` |
-| The container could not be started | `503 lab_start_failed`; the lab ends as `provisioning_failed` |
+| The mission's version cannot be used (its parameters could not be generated) | `500 internal_error`; nothing is created |
+| The container could not be started, or `labctl init` or setup failed or timed out | `503 lab_start_failed`; the lab ends as `provisioning_failed` |
 
 If the lab is ended while it is being created (logout, delete), the response is `201` with the lab in its ended state.
 
 The rate limit and the default capacity are provisional values chosen in increment 05 ([architecture.md](architecture.md#values-chosen-in-increment-05)).
 
-With missions the body gains `mission_slug` (increment 07, together with mission setup and parameters) and `replace` (increment 10, mission switching). Until then labs have no mission.
+There is no way to replace the active lab with one for another mission yet: the body gains `replace` in increment 10 (mission switching). Until then the user ends the current lab first.
 
 ### `DELETE /api/labs/{id}`
 
@@ -227,11 +237,13 @@ The mission card plus:
 
 A mission that does not exist, is `draft` or `archived`, or is listed in a module that is not published returns `404 mission_not_found`; all look the same.
 
+When the user has an active lab (`provisioning`, `ready` or `terminating`) for this mission, the detail is read at the lab's pinned version, so it matches the lab even after a newer version is published. This holds even if the mission was archived meanwhile: its owner can still read it while that lab is active. `version` is then the lab's version. Nobody else sees an archived mission, and the owner no longer does once the lab ends.
+
 ## Missions (planned)
 
 ### `GET /api/missions/{slug}` after completion
 
-From increment 09, `explanation` and `solutions` are included once the user has completed the mission. This is enforced by the server. From increment 07, the detail uses the version of the user's active lab for this mission, if there is one.
+From increment 09, `explanation` and `solutions` are included once the user has completed the mission. This is enforced by the server.
 
 ### `POST /api/labs/{id}/validate`
 
