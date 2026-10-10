@@ -8,6 +8,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from linuxlab.labs.models import TRANSITIONS, LabStatus
 from tests.auth.support import sql
+from tests.labs.lab_support import publish_missions
 
 pytestmark = pytest.mark.integration
 
@@ -160,3 +161,126 @@ def test_deleting_a_user_deletes_their_labs(client: TestClient) -> None:
     sql(client, "DELETE FROM users WHERE id = :id", id=user_id)
 
     assert sql(client, "SELECT count(*) FROM lab_sessions") == [(0,)]
+
+
+# Mission version and parameters
+
+
+def published_versions(client: TestClient) -> dict[str, tuple[int, int]]:
+    """Sync the synthetic content; slug -> (mission id, current version)."""
+    publish_missions(client)
+    rows = sql(client, "SELECT slug, id, current_version FROM missions")
+    return {slug: (mission_id, version) for slug, mission_id, version in rows}
+
+
+def add_pinned_lab(
+    client: TestClient,
+    user_id: uuid.UUID,
+    mission_id: int | None,
+    version: int | None,
+    params: str | None,
+) -> uuid.UUID:
+    lab_id = uuid.uuid4()
+    sql(
+        client,
+        "INSERT INTO lab_sessions"
+        " (id, user_id, status, created_at, last_activity_at, expires_at,"
+        " mission_id, mission_version, params)"
+        " VALUES (:id, :user_id, 'provisioning', now(), now(), now() + interval '2 hours',"
+        " :mission_id, :version, CAST(:params AS jsonb))",
+        id=lab_id,
+        user_id=user_id,
+        mission_id=mission_id,
+        version=version,
+        params=params,
+    )
+    return lab_id
+
+
+def test_a_lab_is_pinned_to_an_existing_version_of_its_mission(client: TestClient) -> None:
+    versions = published_versions(client)
+    mission_id, version = versions["sample-file"]
+    other_id, _ = versions["sample-answer"]
+    user_id = add_user(client)
+
+    lab_id = add_pinned_lab(client, user_id, mission_id, version, '{"token": "ab12"}')
+    assert sql(
+        client,
+        "SELECT mission_id, mission_version, params FROM lab_sessions WHERE id = :id",
+        id=lab_id,
+    ) == [(mission_id, version, {"token": "ab12"})]
+    sql(client, "DELETE FROM lab_sessions")
+
+    for pin in ((mission_id, version + 1), (other_id + 1000, 1)):
+        with pytest.raises(IntegrityError, match="fk_lab_sessions_mission_id_mission_versions"):
+            add_pinned_lab(client, user_id, pin[0], pin[1], "{}")
+
+
+@pytest.mark.parametrize(
+    ("pinned", "params"),
+    [((True, False), "{}"), ((False, True), "{}"), ((True, True), None), ((False, False), "{}")],
+)
+def test_mission_version_and_params_are_set_together(
+    client: TestClient, pinned: tuple[bool, bool], params: str | None
+) -> None:
+    mission_id, version = published_versions(client)["sample-file"]
+
+    with pytest.raises(IntegrityError, match="ck_lab_sessions_mission_pinned"):
+        add_pinned_lab(
+            client,
+            add_user(client),
+            mission_id if pinned[0] else None,
+            version if pinned[1] else None,
+            params,
+        )
+
+
+def test_labs_without_a_mission_have_none_of_the_three(client: TestClient) -> None:
+    lab_id = add_lab(client, add_user(client))
+
+    assert sql(
+        client,
+        "SELECT mission_id, mission_version, params FROM lab_sessions WHERE id = :id",
+        id=lab_id,
+    ) == [(None, None, None)]
+
+
+@pytest.mark.parametrize("params", ['["a"]', '"a"', "1", "null"])
+def test_params_are_a_json_object(client: TestClient, params: str) -> None:
+    mission_id, version = published_versions(client)["sample-file"]
+
+    with pytest.raises(IntegrityError, match="ck_lab_sessions_params_object"):
+        add_pinned_lab(client, add_user(client), mission_id, version, params)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "mission_id = (SELECT id FROM missions WHERE slug = 'sample-answer')",
+        "mission_version = mission_version + 1",
+        "mission_id = NULL, mission_version = NULL, params = NULL",
+        'params = \'{"token": "ffff"}\'',
+        'params = params || \'{"extra": "x"}\'',
+    ],
+)
+def test_mission_version_and_params_never_change(client: TestClient, change: str) -> None:
+    versions = published_versions(client)
+    mission_id, version = versions["sample-file"]
+    lab_id = add_pinned_lab(client, add_user(client), mission_id, version, '{"token": "ab12"}')
+
+    with pytest.raises(DBAPIError, match="lab session mission cannot change"):
+        sql(client, f"UPDATE lab_sessions SET {change} WHERE id = :id", id=lab_id)
+
+    # The lifecycle itself still moves the lab.
+    set_status(client, lab_id, "ready")
+    assert sql(client, "SELECT status, params FROM lab_sessions WHERE id = :id", id=lab_id) == [
+        ("ready", {"token": "ab12"})
+    ]
+
+
+def test_a_mission_with_labs_cannot_lose_its_versions(client: TestClient) -> None:
+    mission_id, version = published_versions(client)["sample-file"]
+    add_pinned_lab(client, add_user(client), mission_id, version, "{}")
+
+    with pytest.raises(DBAPIError):
+        sql(client, "DELETE FROM mission_versions WHERE mission_id = :id", id=mission_id)

@@ -14,13 +14,29 @@
 provisioning -> terminating covers a lab ended (logout, delete) before it was ready.
 The database refuses any other transition, and refuses changing the owner or a
 recorded end reason (trigger in the migration that creates the table).
+
+A lab is created for one version of a mission, with the parameters generated for it.
+Both are fixed at creation: the trigger also refuses changing the mission, the
+version or the parameters, and the version itself is immutable. Labs created before
+missions existed have none of the three.
 """
 
 import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Text, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    Text,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from linuxlab.db import Base
@@ -82,6 +98,18 @@ class LabSession(Base):
             name="ended_at_when_ended",
         ),
         CheckConstraint("expires_at > created_at", name="expires_after_creation"),
+        # A lab has a mission, a version and parameters together, or none of them.
+        CheckConstraint(
+            "(mission_id IS NULL) = (mission_version IS NULL)"
+            " AND (mission_id IS NULL) = (params IS NULL)",
+            name="mission_pinned",
+        ),
+        CheckConstraint("params IS NULL OR jsonb_typeof(params) = 'object'", name="params_object"),
+        # The version belongs to the mission: both columns reference the version's key.
+        ForeignKeyConstraint(
+            ["mission_id", "mission_version"],
+            ["mission_versions.mission_id", "mission_versions.version"],
+        ),
         Index(
             "one_active_lab_per_user",
             "user_id",
@@ -102,6 +130,13 @@ class LabSession(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     # When the lab left provisioning or ready.
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The mission version pinned at creation. Provisioning, and everything after it,
+    # reads this version, never the mission's current one.
+    mission_id: Mapped[int | None] = mapped_column(BigInteger)
+    mission_version: Mapped[int | None] = mapped_column(Integer)
+    # Parameter name -> generated value, all strings. Secret: never sent to the client
+    # or written to a log.
+    params: Mapped[dict[str, str] | None] = mapped_column(JSONB)
 
     @property
     def lab_key(self) -> str:

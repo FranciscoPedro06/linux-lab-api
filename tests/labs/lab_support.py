@@ -10,11 +10,14 @@ from typing import Any
 from fastapi.testclient import TestClient
 from httpx2 import Response
 
+from linuxlab.content.loader import load_content
+from linuxlab.content.sync import sync_content
 from linuxlab.labs.lifecycle import Labs
 from linuxlab.labs.runtime import ContainerInfo
 from linuxlab.labs.runtime.fake import FakeRuntime, Operation
 from linuxlab.labs.runtime.spec import container_name
-from tests.auth.support import request, session_token, signup, sql
+from tests.auth.support import request, run, session_token, signup, sql
+from tests.content.support import FIXTURE
 
 LAB_FIELDS = {"id", "status", "end_reason", "created_at", "expires_at", "ended_at"}
 
@@ -22,6 +25,14 @@ LAB_FIELDS = {"id", "status", "end_reason", "created_at", "expires_at", "ended_a
 def user(client: TestClient, email: str) -> str:
     """Sign up a new account and return its session token."""
     return session_token(signup(client, email))
+
+
+def publish_missions(client: TestClient) -> None:
+    """Sync the synthetic content, once per emptied database."""
+    if sql(client, "SELECT count(*) FROM missions")[0][0]:
+        return
+    sessionmaker = client.app.state.sessionmaker  # type: ignore[attr-defined]
+    run(client, lambda: sync_content(sessionmaker, load_content(FIXTURE)))
 
 
 def create_lab(client: TestClient, token: str | None) -> Response:
