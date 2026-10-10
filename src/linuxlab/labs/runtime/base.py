@@ -1,9 +1,25 @@
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 # Only two identities ever run inside a lab: the student and the platform (root).
 ExecUser = Literal["student", "root"]
+
+# Variables an exec may receive on top of its fixed environment (PATH, LANG): mission
+# parameters, as LAB_PARAM_<NAME>, with values in the parameter format. Nothing else
+# can be passed, so no exec inherits the API's environment or anything from a request.
+EXEC_ENV_NAME = re.compile(r"LAB_PARAM_[A-Z][A-Z0-9_]{0,31}")
+EXEC_ENV_VALUE = re.compile(r"[a-z0-9_-]{1,64}")
+
+
+def check_exec_env(env: Mapping[str, str]) -> None:
+    """Refuse variables outside the allowed set. Errors name the variable, never its value."""
+    for name, value in env.items():
+        if not EXEC_ENV_NAME.fullmatch(name):
+            raise ValueError(f"exec environment: variable not allowed: {name!r}")
+        if not isinstance(value, str) or not EXEC_ENV_VALUE.fullmatch(value):
+            raise ValueError(f"exec environment: invalid value for {name}")
 
 
 @dataclass(frozen=True)
@@ -107,10 +123,15 @@ class LabRuntime(Protocol):
         *,
         user: ExecUser,
         time_limit: float,
+        stdin: bytes | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> ExecResult:
         """Run argv without a shell.
 
         time_limit is enforced inside the container; the call returns shortly after it.
+        `stdin`, if given, is written to the command's standard input, which is then
+        closed; output is read while it is written. `env` adds variables accepted by
+        check_exec_env to the fixed environment.
         """
 
     async def open_terminal(self, container_id: str, size: TerminalSize) -> TerminalSession:

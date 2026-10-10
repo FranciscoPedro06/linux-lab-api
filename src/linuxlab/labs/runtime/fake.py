@@ -1,13 +1,14 @@
 """In-memory LabRuntime for unit tests of code that depends on the runtime.
 
-It tracks container lifecycle and records exec calls. It does not run commands;
-exec results come from the handler passed by the test. Terminals echo their input
+It tracks container lifecycle and records exec calls, with their standard input and
+environment. It does not run commands; exec results come from the handler passed by
+the test. Terminals echo their input
 back as output, like a PTY with echo on and nothing reading from it, and let the
 test inject output, an exit or a failure.
 """
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
@@ -21,6 +22,7 @@ from linuxlab.labs.runtime.base import (
     LabRuntimeError,
     RuntimeUnavailableError,
     TerminalSize,
+    check_exec_env,
 )
 from linuxlab.labs.runtime.spec import (
     DEPLOYMENT_LABEL,
@@ -38,6 +40,8 @@ class ExecCall:
     argv: tuple[str, ...]
     user: ExecUser
     time_limit: float
+    stdin: bytes | None = None
+    env: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -173,15 +177,20 @@ class FakeRuntime:
         *,
         user: ExecUser,
         time_limit: float,
+        stdin: bytes | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> ExecResult:
         if not argv:
             raise ValueError("argv must not be empty")
         if time_limit <= 0:
             raise ValueError("time_limit must be positive")
+        check_exec_env(env or {})
         await self._enter("exec", container_id)
         if not self._get(container_id).running:
             raise ContainerNotRunningError(container_id)
-        self.exec_calls.append(ExecCall(container_id, tuple(argv), user, time_limit))
+        self.exec_calls.append(
+            ExecCall(container_id, tuple(argv), user, time_limit, stdin, dict(env or {}))
+        )
         if self.exec_handler is None:
             return ExecResult(exit_code=0, stdout=b"", stderr=b"")
         return self.exec_handler(argv, user)
