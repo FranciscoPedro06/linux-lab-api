@@ -460,8 +460,12 @@ async def _run(execution: Exec, stdin: bytes | None) -> tuple[bytes, bytes, bool
     async with execution.start(detach=False) as stream:
         if stdin is None:
             return await _read_output(stream)
+        # Checked before the first byte is written. A connection that cannot send the
+        # end of file on its own fails here, with nothing sent: the command then reads
+        # an empty input when the connection closes, never a script.
+        transport = _input_transport(stream)
         reader = asyncio.create_task(_read_output(stream))
-        writer = asyncio.create_task(_write_input(stream, stdin))
+        writer = asyncio.create_task(_write_input(stream, transport, stdin))
         try:
             done, _ = await asyncio.wait({reader, writer}, return_when=asyncio.FIRST_COMPLETED)
             if writer in done:
@@ -491,29 +495,44 @@ async def _read_output(stream: Stream) -> tuple[bytes, bytes, bool]:
     return bytes(stdout), bytes(stderr), truncated
 
 
-async def _write_input(stream: Stream, data: bytes) -> None:
+async def _write_input(stream: Stream, transport: asyncio.Transport, data: bytes) -> None:
+    """Write the input, then half-close the connection: the command reads end of file
+    on its standard input while its output keeps arriving.
+
+    A failure in the middle of the input is reported as LabRuntimeError; the command
+    may still have read part of it before the connection closes.
+    """
     try:
         for start in range(0, len(data), STDIN_CHUNK_BYTES):
             await stream.write_in(data[start : start + STDIN_CHUNK_BYTES])
-        _close_input(stream)
+        transport.write_eof()
     except (aiohttp.ClientError, OSError, RuntimeError) as error:
         raise LabRuntimeError(f"could not write the exec's standard input: {error}") from error
 
 
-def _close_input(stream: Stream) -> None:
-    """Half-close the exec connection: the command reads end of file on its standard
-    input while its output keeps arriving.
+def _input_transport(stream: Stream) -> asyncio.Transport:
+    """The transport Stream.write_in writes to, if it can half-close.
 
-    aiodocker's Stream.close() closes both directions, so this writes the end of file
-    on the connection's transport, the one Stream.write_in writes to. Docker then
-    closes the command's standard input.
+    aiodocker's Stream.close() closes both directions, so the end of file is written
+    on this transport instead; Docker then closes the command's standard input.
+    Raises LabRuntimeError when that is not possible or cannot be confirmed.
     """
-    response = stream._resp
-    connection = response.connection if response is not None else None
-    transport = connection.transport if connection is not None else None
-    if transport is None or not transport.can_write_eof():
-        raise LabRuntimeError("the Docker connection cannot close standard input separately")
-    transport.write_eof()
+    try:
+        response = stream._resp
+        connection = response.connection if response is not None else None
+        transport = connection.transport if connection is not None else None
+        closable = (
+            transport is not None and not transport.is_closing() and transport.can_write_eof()
+        )
+    except Exception as error:
+        raise LabRuntimeError(
+            f"could not check that the Docker connection can close standard input: {error}"
+        ) from error
+    if not closable or transport is None:
+        raise LabRuntimeError(
+            "the Docker connection cannot close standard input separately; nothing was sent"
+        )
+    return transport
 
 
 async def _wait_exit_code(execution: Exec) -> int:
