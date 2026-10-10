@@ -86,6 +86,12 @@ def test_setup_rules() -> None:
     errors(environment={"image": "base", "profile": "privileged"})
 
 
+def test_only_the_base_image_alias_is_known() -> None:
+    assert parse(environment={"image": "base", "profile": "default"}).environment.image == "base"
+    for alias in ("ubuntu", "base-2", "BASE", "linuxlab/lab-base:dev"):
+        assert "environment.image" in errors(environment={"image": alias, "profile": "default"})
+
+
 def test_solutions_and_counterexamples() -> None:
     one = [{"label": "A", "script": "tests/solution-octal.sh"}]
     errors(solutions=one)

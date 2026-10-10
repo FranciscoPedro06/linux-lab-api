@@ -33,8 +33,12 @@ SLUG = re.compile(r"[a-z0-9-]{1,64}")
 Slug = Annotated[str, Field(pattern=rf"^{SLUG.pattern}$")]
 ParamName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")]
 # Every generated parameter value, and every value a `choice` can produce.
-ParamValue = Annotated[str, Field(pattern=r"^[a-z0-9_-]{1,64}$")]
-ImageAlias = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+PARAM_VALUE = re.compile(r"[a-z0-9_-]{1,64}")
+ParamValue = Annotated[str, Field(pattern=rf"^{PARAM_VALUE.pattern}$")]
+# Lab images a mission can ask for. Each alias is resolved by platform configuration:
+# `base` is LAB_IMAGE. Unknown aliases are refused here, so a mission that names one
+# can never be synced.
+ImageAlias = Literal["base"]
 AccountName = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_-]{0,31}$")]
 Mode = Annotated[str, Field(pattern=r"^[0-7]{4}$")]
 
@@ -346,14 +350,17 @@ Param = Annotated[HexParam | WordParam | IntParam | ChoiceParam, Field(discrimin
 
 
 class Environment(_Strict):
-    # Alias resolved by platform configuration to a pinned image digest.
     image: ImageAlias
     profile: Literal["default"]
 
 
+# The identity setup runs as inside the lab.
+SetupUser = Literal["student", "root"]
+
+
 class Setup(_Strict):
     script: FilePath
-    user: Literal["student", "root"] = "student"
+    user: SetupUser = "student"
     timeout_seconds: int = Field(ge=1, le=60)
 
 
