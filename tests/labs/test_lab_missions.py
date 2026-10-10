@@ -24,7 +24,7 @@ from linuxlab.content.params import ParamError
 from linuxlab.content.sync import sync_content
 from linuxlab.labs import lifecycle
 from linuxlab.labs.lifecycle import LABCTL_INIT, PROVISIONING_TIMEOUT, SETUP_COMMAND
-from linuxlab.labs.runtime import ExecResult, ExecUser
+from linuxlab.labs.runtime import ExecResult, ExecUser, LabRuntimeError
 from linuxlab.labs.runtime.fake import ExecCall, FakeRuntime
 from tests.auth.support import request, run, sql
 from tests.conftest import AppFactory
@@ -435,6 +435,30 @@ def test_failed_setup_fails_the_lab(client: TestClient, result: ExecResult) -> N
     assert fake_runtime(client).containers() == []
     assert current_lab(client, ana) is None
     assert len(setup_calls(client)) == 1
+
+
+def test_connection_that_cannot_half_close_fails_the_lab(client: TestClient) -> None:
+    """DockerRuntime refuses setup before sending it; the lab fails and is cleaned up."""
+    ana = user(client, "ana@example.com")
+
+    def refuse_setup(argv: Sequence[str], user: ExecUser) -> ExecResult:
+        if tuple(argv) == SETUP_COMMAND:
+            raise LabRuntimeError(
+                "the Docker connection cannot close standard input separately; nothing was sent"
+            )
+        return ExecResult(exit_code=0, stdout=b"", stderr=b"")
+
+    fake_runtime(client).exec_handler = refuse_setup
+
+    response = create_lab(client, ana)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "lab_start_failed"
+    assert sql(client, "SELECT status, end_reason FROM lab_sessions") == [
+        ("terminated", "provisioning_failed")
+    ]
+    assert fake_runtime(client).containers() == []
+    assert current_lab(client, ana) is None
 
 
 def test_failed_init_skips_setup(client: TestClient) -> None:
