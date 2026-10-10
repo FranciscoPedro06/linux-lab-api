@@ -134,6 +134,12 @@ Every check runs commands inside a real lab and asserts what was allowed, not wh
 | CPU quota, from host cgroup statistics during a 5 s busy loop | 0.51 CPU, 50 throttled periods | 0.51 CPU, 50 throttled periods (in-lab ratio 0.90, not used) |
 | Seccomp in `/proc/self/status` | 2 | 0, reported and not asserted |
 | Create and start / exec latency | 0.19 s / 0.06 s | 0.12 s / 0.09 s |
+| Exec standard input delivered and closed; a command writing 3 MB before reading 2 MiB of input finishes | passed | passed |
+| Exec environment: only `PATH`, `LANG`, Docker's `HOSTNAME` and `HOME`, and the given `LAB_PARAM_*` | passed | passed |
+| `labctl init`: home populated from `/etc/skel`, owned by the student, same result when repeated, symbolic links refused; `/opt/labctl` closed to the student | passed | passed |
+| Setup as student: uid 1000, no capabilities, `NoNewPrivs` = 1; as root: writes only to home, `/tmp` and `/run/lab`, rootfs stays read-only | passed | passed |
+| Setup script not present in any writable directory afterwards; a background process started with `env -i` carries no `LAB_PARAM_` | passed | passed |
+| Setup failure and timeout end the lab and remove its container; another lab is unaffected | passed | passed |
 
 ## Known limitations
 
