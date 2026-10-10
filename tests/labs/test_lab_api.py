@@ -20,6 +20,7 @@ from .lab_support import (
     hold,
     in_background,
     lab_row,
+    publish_missions,
     ready_lab,
     user,
     wait_for_call,
@@ -78,14 +79,44 @@ def test_create_returns_the_ready_lab_the_user_already_has(client: TestClient) -
     assert len(fake_runtime(client).containers()) == 1
 
 
-def test_create_takes_an_empty_json_body(client: TestClient) -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"mission_slug": None},
+        {"mission_slug": 1},
+        {"mission_slug": ["sample-file"]},
+        {"mission_slug": "sample-file", "user_id": str(uuid.uuid4())},
+        {"mission_slug": "sample-file", "mission_id": 1},
+        {"mission_slug": "sample-file", "version": 1},
+        {"mission_slug": "sample-file", "content_hash": "0" * 64},
+        {"mission_slug": "sample-file", "params": {"token": "00"}},
+        {"mission_slug": "sample-file", "script": "id"},
+        {"mission_slug": "sample-file", "image": "ubuntu"},
+        {"mission_slug": "sample-file", "runtime": "runc"},
+        {"mission_slug": "sample-file", "user": "root"},
+        {"mission_slug": "sample-file", "memory": 1},
+    ],
+)
+def test_create_takes_only_a_mission_slug(client: TestClient, body: dict[str, object]) -> None:
     ana = user(client, "ana@example.com")
+    publish_missions(client)
 
-    extra = request(client, "POST", "/api/labs", token=ana, json={"user_id": str(uuid.uuid4())})
-    no_origin = request(client, "POST", "/api/labs", token=ana, json={}, headers={"origin": ""})
+    response = request(client, "POST", "/api/labs", token=ana, json=body)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert sql(client, "SELECT count(*) FROM lab_sessions") == [(0,)]
+    assert fake_runtime(client).containers() == []
+
+
+def test_create_requires_an_allowed_origin_and_json(client: TestClient) -> None:
+    ana = user(client, "ana@example.com")
+    body = {"mission_slug": "sample-file"}
+
+    no_origin = request(client, "POST", "/api/labs", token=ana, json=body, headers={"origin": ""})
     form = request(client, "POST", "/api/labs", token=ana, content=b"", headers={"origin": ORIGIN})
 
-    assert extra.status_code == 422
     assert no_origin.status_code == 403
     assert form.status_code == 415
     assert fake_runtime(client).containers() == []

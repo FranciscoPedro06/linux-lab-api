@@ -19,7 +19,9 @@ from linuxlab.labs.runtime.spec import container_name
 from tests.auth.support import request, run, session_token, signup, sql
 from tests.content.support import FIXTURE
 
-LAB_FIELDS = {"id", "status", "end_reason", "created_at", "expires_at", "ended_at"}
+LAB_FIELDS = {"id", "status", "end_reason", "created_at", "expires_at", "ended_at", "mission"}
+# A published mission of the synthetic content in tests/fixtures/content.
+MISSION = "sample-file"
 
 
 def user(client: TestClient, email: str) -> str:
@@ -35,8 +37,9 @@ def publish_missions(client: TestClient) -> None:
     run(client, lambda: sync_content(sessionmaker, load_content(FIXTURE)))
 
 
-def create_lab(client: TestClient, token: str | None) -> Response:
-    return request(client, "POST", "/api/labs", token=token, json={})
+def create_lab(client: TestClient, token: str | None, mission: str = MISSION) -> Response:
+    publish_missions(client)
+    return request(client, "POST", "/api/labs", token=token, json={"mission_slug": mission})
 
 
 def end_lab(client: TestClient, token: str | None, lab_id: str) -> Response:

@@ -4,20 +4,28 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from sqlalchemy import text
 
 from linuxlab.auth import sessions
 from linuxlab.auth.models import User
+from linuxlab.content.loader import load_content
+from linuxlab.content.sync import sync_content
 from linuxlab.labs.lifecycle import Labs
 from linuxlab.labs.models import EndReason, LabSession
 from linuxlab.labs.runtime import LabRuntime
 from linuxlab.labs.terminal.relay import TerminalRegistry
 from linuxlab.main import create_app
 from tests.conftest import app_settings
+from tests.content.support import FIXTURE
 
 from .terminal_client import serve
+
+# A published mission of the synthetic content in tests/fixtures/content.
+MISSION = "sample-file"
 
 
 @dataclass
@@ -50,8 +58,8 @@ class Api:
             await db.commit()
         return Account(user.id, token)
 
-    async def lab(self, account: Account) -> LabSession:
-        creation = await self.labs.create(account.id)
+    async def lab(self, account: Account, mission: str = MISSION) -> LabSession:
+        creation = await self.labs.create(account.id, mission)
         assert creation.lab.status == "ready", creation.lab.status
         return creation.lab
 
@@ -63,16 +71,25 @@ class Api:
     async def end(self, lab: LabSession, reason: EndReason = EndReason.USER) -> None:
         await self.labs.end(lab.id, reason)
 
-    async def sql(self, statement: str, **params: object) -> None:
+    async def sync(self, root: Path) -> None:
+        """Sync the content in `root`, as `linuxlab content sync` would."""
+        await sync_content(self.app.state.sessionmaker, load_content(root))
+
+    async def sql(self, statement: str, **params: object) -> list[Any]:
         async with self.app.state.engine.begin() as connection:
-            await connection.execute(text(statement), params)
+            result = await connection.execute(text(statement), params)
+            return list(result.all()) if result.returns_rows else []
 
 
 @asynccontextmanager
 async def running_api(runtime: LabRuntime, **settings: object) -> AsyncIterator[Api]:
-    """Serve the API on an emptied database. The reaper does not run."""
+    """Serve the API on an emptied database with the synthetic missions published.
+    The reaper does not run."""
     app = create_app(app_settings(**settings), lab_runtime=runtime, start_reaper=False)
     async with serve(app) as url:
         api = Api(url, app)
-        await api.sql("TRUNCATE users, auth_sessions, lab_sessions")
+        await api.sql(
+            "TRUNCATE users, auth_sessions, lab_sessions, modules, missions, mission_versions"
+        )
+        await api.sync(FIXTURE)
         yield api
