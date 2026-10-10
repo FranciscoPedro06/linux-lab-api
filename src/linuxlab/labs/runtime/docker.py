@@ -3,7 +3,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import aiodocker
@@ -22,6 +22,7 @@ from linuxlab.labs.runtime.base import (
     LabRuntimeError,
     RuntimeUnavailableError,
     TerminalSize,
+    check_exec_env,
 )
 from linuxlab.labs.runtime.spec import (
     DEPLOYMENT_LABEL,
@@ -45,6 +46,7 @@ EXEC_ENV = [
     "LANG=C.UTF-8",
 ]
 MAX_OUTPUT_BYTES = 1024 * 1024
+STDIN_CHUNK_BYTES = 64 * 1024
 
 # argv runs under coreutils `timeout`, which signals the whole process group:
 # SIGTERM at the deadline, SIGKILL KILL_AFTER_SECONDS later. The client gives up
@@ -198,23 +200,27 @@ class DockerRuntime:
         *,
         user: ExecUser,
         time_limit: float,
+        stdin: bytes | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> ExecResult:
         if not argv:
             raise ValueError("argv must not be empty")
         if time_limit <= 0:
             raise ValueError("time_limit must be positive")
+        check_exec_env(env or {})
         if not (await self.inspect(container_id)).running:
             raise ContainerNotRunningError(container_id)
 
         uid_gid, workdir = EXEC_IDENTITIES[user]
         command = ["timeout", f"--kill-after={KILL_AFTER_SECONDS}", f"{time_limit:g}", *argv]
+        environment = [*EXEC_ENV, *(f"{name}={value}" for name, value in (env or {}).items())]
         try:
             execution = await self._client.containers.container(container_id).exec(
                 cmd=command,
                 user=uid_gid,
-                environment=EXEC_ENV,
+                environment=environment,
                 workdir=workdir,
-                stdin=False,
+                stdin=stdin is not None,
                 stdout=True,
                 stderr=True,
                 tty=False,
@@ -225,10 +231,12 @@ class DockerRuntime:
         started = time.monotonic()
         try:
             async with asyncio.timeout(time_limit + KILL_AFTER_SECONDS + CLIENT_MARGIN_SECONDS):
-                stdout, stderr, truncated = await _collect_output(execution)
+                stdout, stderr, truncated = await _run(execution, stdin)
                 exit_code = await _wait_exit_code(execution)
         except TimeoutError:
             return ExecResult(exit_code=-1, stdout=b"", stderr=b"", timed_out=True)
+        except (aiohttp.ClientError, OSError) as error:
+            raise LabRuntimeError(f"{container_id}: exec failed: {error}") from error
 
         elapsed = time.monotonic() - started
         timed_out = exit_code == TIMEOUT_EXIT_CODE or (
@@ -442,18 +450,70 @@ def _translate(error: DockerError, container_id: str) -> LabRuntimeError:
     return LabRuntimeError(f"{container_id}: {error.message}")
 
 
-async def _collect_output(execution: Exec) -> tuple[bytes, bytes, bool]:
+async def _run(execution: Exec, stdin: bytes | None) -> tuple[bytes, bytes, bool]:
+    """Start the exec, write its input if any, and collect its output until it closes.
+
+    Input and output go over the same connection. Output is read while input is
+    written, so a command that writes a lot before reading all of its input cannot
+    block on a full pipe while this side blocks on writing.
+    """
+    async with execution.start(detach=False) as stream:
+        if stdin is None:
+            return await _read_output(stream)
+        reader = asyncio.create_task(_read_output(stream))
+        writer = asyncio.create_task(_write_input(stream, stdin))
+        try:
+            done, _ = await asyncio.wait({reader, writer}, return_when=asyncio.FIRST_COMPLETED)
+            if writer in done:
+                # Raises if the input could not be delivered. The command then never
+                # saw the end of its input; the caller treats the exec as failed.
+                writer.result()
+                return await reader
+            # The output closed first: the command ended before reading all of its
+            # input. Its exit code says how it ended.
+            return reader.result()
+        finally:
+            for task in (reader, writer):
+                task.cancel()
+            await asyncio.gather(reader, writer, return_exceptions=True)
+
+
+async def _read_output(stream: Stream) -> tuple[bytes, bytes, bool]:
     stdout = bytearray()
     stderr = bytearray()
     truncated = False
-    async with execution.start(detach=False) as stream:
-        while (message := await stream.read_out()) is not None:
-            target = stdout if message.stream == 1 else stderr
-            room = MAX_OUTPUT_BYTES - len(target)
-            if len(message.data) > room:
-                truncated = True
-            target += message.data[: max(room, 0)]
+    while (message := await stream.read_out()) is not None:
+        target = stdout if message.stream == 1 else stderr
+        room = MAX_OUTPUT_BYTES - len(target)
+        if len(message.data) > room:
+            truncated = True
+        target += message.data[: max(room, 0)]
     return bytes(stdout), bytes(stderr), truncated
+
+
+async def _write_input(stream: Stream, data: bytes) -> None:
+    try:
+        for start in range(0, len(data), STDIN_CHUNK_BYTES):
+            await stream.write_in(data[start : start + STDIN_CHUNK_BYTES])
+        _close_input(stream)
+    except (aiohttp.ClientError, OSError, RuntimeError) as error:
+        raise LabRuntimeError(f"could not write the exec's standard input: {error}") from error
+
+
+def _close_input(stream: Stream) -> None:
+    """Half-close the exec connection: the command reads end of file on its standard
+    input while its output keeps arriving.
+
+    aiodocker's Stream.close() closes both directions, so this writes the end of file
+    on the connection's transport, the one Stream.write_in writes to. Docker then
+    closes the command's standard input.
+    """
+    response = stream._resp
+    connection = response.connection if response is not None else None
+    transport = connection.transport if connection is not None else None
+    if transport is None or not transport.can_write_eof():
+        raise LabRuntimeError("the Docker connection cannot close standard input separately")
+    transport.write_eof()
 
 
 async def _wait_exit_code(execution: Exec) -> int:

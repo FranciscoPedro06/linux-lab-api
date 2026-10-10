@@ -96,6 +96,53 @@ async def test_exec_records_calls_and_uses_handler() -> None:
     assert runtime.exec_calls == [ExecCall(info.id, ("id", "-u"), "root", 5)]
 
 
+async def test_exec_records_stdin_and_parameters() -> None:
+    runtime = FakeRuntime()
+    info = await runtime.create(SPEC)
+    await runtime.start(info.id)
+
+    await runtime.exec(
+        info.id,
+        ["bash"],
+        user="student",
+        time_limit=5,
+        stdin=b"echo hi\n",
+        env={"LAB_PARAM_TOKEN": "ab12"},
+    )
+
+    assert runtime.exec_calls == [
+        ExecCall(info.id, ("bash",), "student", 5, b"echo hi\n", {"LAB_PARAM_TOKEN": "ab12"})
+    ]
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"PATH": "/tmp"},
+        {"HOME": "/root"},
+        {"LAB_PARAM_": "a"},
+        {"LAB_PARAM_token": "a"},
+        {"LAB_PARAM_" + "A" * 33: "a"},
+        {"LAB_PARAM_TOKEN": ""},
+        {"LAB_PARAM_TOKEN": "A"},
+        {"LAB_PARAM_TOKEN": "a b"},
+        {"LAB_PARAM_TOKEN": "a\n"},
+        {"LAB_PARAM_TOKEN": "a" * 65},
+    ],
+)
+async def test_exec_refuses_other_variables_without_quoting_values(env: dict[str, str]) -> None:
+    runtime = FakeRuntime()
+    info = await runtime.create(SPEC)
+    await runtime.start(info.id)
+
+    with pytest.raises(ValueError) as error:
+        await runtime.exec(info.id, ["true"], user="student", time_limit=5, env=env)
+    for value in env.values():
+        if value:
+            assert repr(value) not in str(error.value)
+    assert runtime.exec_calls == []
+
+
 @pytest.mark.parametrize(
     ("argv", "time_limit"),
     [([], 1.0), (["true"], 0.0), (["true"], -1.0)],
