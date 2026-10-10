@@ -14,14 +14,14 @@ In Linux Lab the student gets a problem ("the deploy script is readable by every
 
 What exists today:
 
-1. A signed-in student starts a lab: an isolated container created from the lab image, with no network, a read-only root filesystem and CPU, memory and process limits. Each lab belongs to one account, and an account has at most one active lab.
+1. A signed-in student starts a lab for a mission: an isolated container created from the lab image, with no network, a read-only root filesystem and CPU, memory and process limits. The lab is pinned to the mission's current version; the API generates the mission's parameters and runs its setup script inside the container before the lab is ready. Each lab belongs to one account, and an account has at most one active lab.
 2. The browser opens a terminal (xterm.js) connected over WebSocket to a `bash` shell inside that container, running as an unprivileged user.
 3. The student works with whatever commands they prefer; nothing typed is parsed or filtered.
 4. Accounts exist: sign-up with an invite code, login and logout, with a server-side session in an `HttpOnly` cookie. Only the owner's session can see a lab or open its terminal.
 5. Labs end when the student ends them, logs out, leaves them idle (15 minutes without a terminal, 30 without typing), after 2 hours, or when they run out of memory. A background reaper reconciles the database with Docker and removes anything left behind. The student is told why a lab ended.
-6. Modules and missions are kept in `content/` and synced to PostgreSQL by `linuxlab content sync`, which validates them and stores each change as a new immutable version. Signed-in users can browse the published catalog. Missions are not tied to labs yet.
+6. Modules and missions are kept in `content/` and synced to PostgreSQL by `linuxlab content sync`, which validates them and stores each change as a new immutable version, without running anything. Signed-in users can browse the published catalog and start a lab from a mission.
 
-Planned, not implemented yet: mission setup and parameters, validation of the final state, progress and resetting a lab.
+Planned, not implemented yet: validation of the final state, progress, and resetting a lab or switching it to another mission.
 
 Missions will declare conditions rather than run validation code:
 
@@ -113,11 +113,19 @@ Sign-up is disabled unless `SIGNUP_INVITE_CODE` is set in the environment that r
 
 The session cookie is `Secure`. Browsers that treat `http://localhost` as a secure context, such as Chrome, Edge and Firefox, accept it there; a browser that does not will not keep the session on the local environment.
 
-To use a terminal, build the lab image once, sign up with the invite code, and start a lab from the home page:
+To use a terminal, build the lab image once, publish missions (below), sign up with the invite code, open a mission from the home page and start its lab:
 
 ```sh
 docker build --tag linuxlab/lab-base:dev lab-image
 ```
+
+Labs are only created for published missions, and `content/` holds none until increment 11. For local development, sync the synthetic missions used by the tests, from the host:
+
+```sh
+uv run linuxlab content sync --content-dir tests/fixtures/content
+```
+
+With the API on the host, Windows' Docker named pipe cannot run mission setup ([docs/runtime.md](docs/runtime.md#environment)); use the Compose environment there.
 
 | Service | Address |
 |---|---|
@@ -148,7 +156,7 @@ uv run linuxlab content sync                                        # API on the
 docker compose -f infra/compose.yml exec api linuxlab content sync   # Compose
 ```
 
-The sync validates everything first and writes in one transaction, so invalid content changes nothing. It refuses an empty `content/` unless given `--allow-empty`. The repository holds no missions yet; the tests use synthetic content from `tests/fixtures/content/`.
+The sync validates everything first and writes in one transaction, so invalid content changes nothing. It refuses an empty `content/` unless given `--allow-empty`. The repository holds no missions yet; the tests use synthetic content from `tests/fixtures/content/`, which is never synced outside development.
 
 `ENVIRONMENT` defaults to `production`, which refuses to start unless labs run under gVisor (`LAB_OCI_RUNTIME=runsc`, registered with Docker). `.env.example` and Compose set `development`. `GET /api/health` reports the database and the lab runtime separately.
 
@@ -160,7 +168,7 @@ uv run ruff format --check
 uv run mypy
 uv run pytest                  # unit tests
 uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), content sync, catalog, schema, migrations; PostgreSQL at DATABASE_URL
-uv run pytest -m docker                         # lab runtime, isolation, terminal and lab lifecycle; Docker, the lab image and PostgreSQL
+uv run pytest -m docker                         # lab runtime, isolation, terminal, lab lifecycle and mission setup; Docker, the lab image and PostgreSQL (Linux: see docs/runtime.md)
 ```
 
 Lab runtime tests, gVisor setup and the list of isolation checks are described in [docs/runtime.md](docs/runtime.md).
@@ -178,7 +186,7 @@ Planned coverage as the project grows:
 
 ## Status
 
-Increments 01 to 06 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; and the mission catalog, with content validated and synced from `content/` into immutable versions. Mission setup and parameters come next (increment 07). Planned order:
+Increments 01 to 07 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; the mission catalog, with content validated and synced from `content/` into immutable versions; and labs created for a mission, pinned to its version, with generated parameters and the mission's setup run inside the lab. The validation engine comes next (increment 08). Planned order:
 
 | # | Increment |
 |---|---|

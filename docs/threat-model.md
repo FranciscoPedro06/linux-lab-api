@@ -83,7 +83,9 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 |---|---|
 | Using another user's lab by its id (IDOR) | Every lab route and the terminal resolve the lab from the session's user and the id together. A missing lab and another user's lab return the same `404` / `4404`; a lab's state is only revealed to its owner |
 | Guessing or reusing lab ids, container names or ids | Lab ids are random UUIDs, and knowing one grants nothing without the owner's session. Container names and ids are never returned and are not accepted as lab ids |
-| Choosing the owner, container, image, runtime, user or limits | `POST /api/labs` takes `{}` and refuses extra fields. Image, runtime, deployment label and limits come from server configuration; the terminal runs as uid 1000, chosen by the API. No route forwards anything to the Docker API |
+| Choosing the owner, container, image, runtime, user or limits | `POST /api/labs` takes only `mission_slug` and refuses extra fields. Image, runtime, deployment label and limits come from server configuration; the terminal runs as uid 1000, chosen by the API. No route forwards anything to the Docker API |
+| Choosing the mission version, parameters or setup | The API pins the mission's current version itself and generates the parameters; setup and its user come only from that stored version. A slug that is not a published mission creates nothing |
+| Starting labs for unpublished content | Drafts, archived missions and missions in unpublished modules answer `404 mission_not_found` before any row or container exists |
 | Unauthenticated or expired terminal | The handshake resolves the session cookie like any request and closes with `4401` |
 | Terminal kept open after its lab ended | Ending a lab closes its terminal (`4410`) before removing the container; reconnecting to an ended lab is refused with `4410` |
 | Two labs for one user through concurrent requests | Partial unique index `one_active_lab_per_user`; creation also serializes on an advisory lock for the global cap |
@@ -112,19 +114,23 @@ Content in `content/` is reviewed in the repository, but the sync still treats i
 | A partial sync after an error | Content is validated completely before the transaction starts, and the write is a single transaction |
 | Two syncs racing for the same version number | Transaction-scoped advisory lock taken before the current state is read |
 | An empty or wrong directory archiving the whole catalog | Empty content is refused unless `--allow-empty` is given |
-| Hidden mission data reaching students | Catalog responses use explicit response models with presentation fields only; setup, parameters, conditions, solutions, counterexamples and the explanation stay on the server |
+| Hidden mission data reaching students | Catalog and lab responses use explicit response models with presentation fields only; setup, parameters, conditions, solutions, counterexamples and the explanation stay on the server |
+| An unknown lab image | `environment.image` accepts only `base`, resolved to `LAB_IMAGE`; any other alias fails the sync |
+| A running lab silently changing mission | A lab's mission, version and parameters are fixed by a database trigger; versions are immutable, so a later sync changes nothing for existing labs |
 | Markup in briefings | The frontend renders Markdown with raw HTML disabled |
 
 ## Validation and setup
 
-- Mission content is treated as data. The API never executes mission content on the host.
-- The only mission code that runs is `setup.sh`, inside the container.
+- Mission content is treated as data. The API never executes mission content on the host, and the sync executes nothing.
+- The only mission code that runs is the setup script of the lab's pinned version, inside the lab's container, as the version's setup user (`student`, or `root` with the four platform capabilities and `no-new-privileges`), under the lab's limits and with no network. It is written to `bash`'s standard input and never stored in the container. It runs once, before the lab is ready, so the student's terminal cannot reach the lab while it runs.
+- Setup output is discarded. Logs carry the lab id, the exit code and whether setup timed out, never the script, its output or the parameters.
+- `labctl init` runs as root from `/opt/labctl`, which only root can open, on a read-only rootfs. It copies `/etc/skel` and never follows symbolic links.
 - Validators are part of the API code and do not run commands. Facts come from `labctl`, which ships with the image and only reads: `lstat`, bounded reads of regular files, `/proc`.
 - `labctl` receives JSON on stdin and runs with a fixed environment under `python3 -I -S`. Paths never go through a shell.
 - `labctl` output is capped at 256 KB and 10 seconds. Any anomaly results in `error`, never `passed`.
 - Root operations never execute files from locations the student can write to.
 - Answers to discovery missions are compared by the API and never reach the container.
-- Mission parameters are generated by the API with a restricted character set and reach setup only as environment variables.
+- Mission parameters are generated by the API with a restricted character set and reach setup only as environment variables. The runtime refuses any exec variable other than `LAB_PARAM_<NAME>` with a value in that set, so no other variable can be injected and nothing from the API's environment reaches the lab. A setup process left running keeps its environment, so missions start background processes with `env -i` ([missions.md](missions.md#setup)); mission tests (increment 11) check that no student process carries `LAB_PARAM_`.
 
 ## Accepted risks
 

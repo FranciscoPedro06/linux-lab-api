@@ -42,7 +42,7 @@ The API runs as a single process in the MVP. WebSocket connections, rate limitin
 
 ## Labs
 
-Implemented in increment 05 (`src/linuxlab/labs/`): `models.py` (lab sessions), `lifecycle.py` (creation, ending, reconciliation), `reaper.py`, `access.py` (ownership) and `router.py` (HTTP). A lab is an ephemeral container owned by one user. From increment 07 it will also be tied to a specific version of a mission; today it is a plain lab with no mission.
+Implemented in increment 05 (`src/linuxlab/labs/`): `models.py` (lab sessions), `lifecycle.py` (creation, ending, reconciliation), `reaper.py`, `access.py` (ownership) and `router.py` (HTTP). A lab is an ephemeral container owned by one user. Since increment 07 every lab is created for a published mission and pinned to one version of it ([Mission version and parameters](#mission-version-and-parameters)).
 
 ```
 provisioning --> ready --> terminating --> terminated
@@ -52,8 +52,8 @@ provisioning --> ready --> terminating --> terminated
 
 | State | Meaning |
 |---|---|
-| `provisioning` | The session exists; the container is being created and started |
-| `ready` | The container runs; the terminal may be used |
+| `provisioning` | The session exists; the container is being created, started and prepared (`labctl init`, then the mission's setup) |
+| `ready` | The container runs and setup completed; the terminal may be used |
 | `terminating` | The lab has ended (`end_reason` says why); its terminal and container are being removed |
 | `failed` | Provisioning did not complete; the container may still exist |
 | `terminated` | The container has been removed. Final |
@@ -66,8 +66,8 @@ Rules:
 
 - A user has at most one lab in `provisioning`, `ready` or `terminating`, enforced by the partial unique index `one_active_lab_per_user`. Concurrent creations by one user produce one lab; the others get the existing lab or `409`.
 - At most `LAB_CAPACITY` labs (default 10) are active across all users. Creations are serialized by a transaction-scoped advisory lock, so the cap cannot be raced. Each user may start at most 10 labs per 10 minutes. Both values are provisional; see [Values chosen in increment 05](#values-chosen-in-increment-05).
-- Labs are only created by an explicit user action.
-- Planned with missions: pinning `(mission_id, mission_version)` and the mission's parameters when the lab is created (increment 07), keeping progress when a lab is destroyed (increment 09), and ending the lab with `end_reason = mission_switch` when switching missions (increment 10).
+- Labs are only created by an explicit user action, for a published mission.
+- A user's active lab is for one mission. Asking for the same mission returns that lab; asking for another is refused until the lab ends. Switching missions, which ends the lab with `end_reason = mission_switch`, comes in increment 10, and keeping progress when a lab is destroyed in increment 09.
 
 ### Consistency between PostgreSQL and Docker
 
@@ -83,11 +83,29 @@ Containers are found by their deterministic name, `ll-lab-<lab id hex>`, and acc
 ### Creation
 
 1. Check the session and the per-user rate limit.
-2. Under the creation lock: return the user's active lab if there is one, check global capacity, insert `lab_sessions` with status `provisioning`.
-3. Outside any transaction: create and start the container (at most 2 minutes).
+2. In one transaction, under the creation lock:
+   1. if the user has an active lab, return it when it is for the same mission or is terminating, and refuse otherwise;
+   2. resolve the mission: published, in a published module; read its current version and that version's specification;
+   3. generate the parameters;
+   4. check global capacity;
+   5. insert `lab_sessions` with status `provisioning`, the mission, the version and the parameters, and commit.
+3. Outside any transaction, within 2 minutes: create and start the container, run `labctl init` as root, then the version's setup script ([missions.md](missions.md#setup)).
 4. Mark the lab `ready`, starting its idle timer.
 
-A failure marks the lab `failed`, removes the container and marks it `terminated` (`provisioning_failed`). If the lab was ended meanwhile, the container is removed and the lab is returned as it is.
+Nothing touches Docker before the row is committed, and a mission that is not published, or a version whose parameters cannot be generated, leaves no row and no container. A failure after the commit (Docker, `labctl init`, setup exiting non-zero or timing out) marks the lab `failed`, removes the container and marks it `terminated` (`provisioning_failed`); if the removal fails, the lab stays `failed` and the reaper finishes it. If the lab was ended meanwhile, the container is removed and the lab is returned as it is: the conditional update to `ready` fails, so a lab never becomes ready before, or without, its setup.
+
+Creation is synchronous: the request returns when the lab is ready or has failed. With setup it can take up to about 70 seconds (setup may run for 60).
+
+Setup runs once per lab, in the request that inserted the row. Nothing retries it: if the API stops during provisioning, the lab stays `provisioning` until the reaper fails it (`provisioning_timeout`) and removes the container.
+
+### Mission version and parameters
+
+A lab stores the mission version it was created for, `(mission_id, mission_version)`, with a composite foreign key to `mission_versions`, and the generated parameters in `params`. All three are set in the insert and never change (database trigger), and the version itself is immutable. Everything that needs the mission for a lab (setup, and validation from increment 08) reads that version, never the mission's current one:
+
+- a sync that publishes a new version does not change labs created before it;
+- a sync that archives the mission does not end its labs: the owner of an active lab keeps reading the pinned version (`GET /api/missions/{slug}`) until the lab ends, while nobody can start a new lab for it.
+
+The client sends only `mission_slug`. The version, parameters, setup, image (the `base` alias, which is `LAB_IMAGE`), runtime, Linux user and limits come from the catalog and the server's configuration.
 
 ### Ending
 
@@ -105,7 +123,7 @@ A failure marks the lab `failed`, removes the container and marks it `terminated
 | No terminal connected | 15 min | `no_terminal` |
 | Terminal connected, no user input | 30 min | `no_input` |
 | Maximum lifetime, from creation | 2 h | `max_lifetime` |
-| Stuck in `provisioning` | 2 min | `provisioning_timeout` |
+| Stuck in `provisioning` (creation, start, `labctl init` and setup) | 2 min | `provisioning_timeout` |
 | Left in `terminating` or `failed` | 1 min (chosen in increment 05, see below), then the reaper finishes it | (kept) |
 
 Activity is connecting, disconnecting and typing in the terminal. Running processes and terminal output do not count. Activity is recorded in memory by the terminal registry, with no I/O on the terminal's path, and stored in `last_activity_at` by the reaper at the start of each pass, so it is at most 30 seconds stale.
@@ -202,12 +220,12 @@ Versions are immutable: a trigger rejects `UPDATE` and `DELETE` on `mission_vers
 | Situation | Behavior |
 |---|---|
 | Completed on version 1, version 2 released | Stays completed; `completed_version = 1` (increment 09) |
-| Lab active on version 1 | Stays on version 1 until it ends (increment 07) |
-| Reset or new lab | Uses the current version |
+| Lab active on version 1 | Stays on version 1 until it ends, even if the mission is archived |
+| Reset (increment 10) or new lab | Uses the current version |
 
 Students cannot pick an older version. A change that alters what the mission asks for should use a new slug.
 
-The catalog (`GET /api/modules`, `GET /api/missions/{slug}`) shows a mission only when it is `published` and listed in a `published` module, and reads it at its current version. A module appears only with at least one such mission. Until labs are tied to missions (increment 07), the detail always uses the current version.
+The catalog (`GET /api/modules`, `GET /api/missions/{slug}`) shows a mission only when it is `published` and listed in a `published` module, and reads it at its current version. A module appears only with at least one such mission. The one exception is the detail of the mission of the user's active lab, read at the lab's pinned version, whatever the mission's current state.
 
 The format is described in [missions.md](missions.md).
 
@@ -258,7 +276,7 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 | `missions` | Stable mission identity (slug, unique), module, position in the module (unique per module, `NULL` once removed from `content/`), status, current version |
 | `mission_versions` | Immutable specification per version: content hash and the complete specification as `JSONB`; PK `(mission_id, version)` |
 | `user_missions` | Progress per user and mission; PK `(user_id, mission_id)` |
-| `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time. The pinned mission version and parameters are added with missions |
+| `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time, the pinned mission version and the generated parameters |
 | `validation_runs` | Every validation, with the full result and the version used |
 | `command_history` | Collected commands; unique on `(lab_session_id, seq)` |
 
@@ -284,7 +302,8 @@ CREATE UNIQUE INDEX one_active_lab_per_user
 Other rules:
 
 - `user_missions`: a missing row means the mission was never started. `completed_at` and `completed_version` are set together and never cleared.
-- `lab_sessions.params` holds answers for discovery missions and is never sent to the client.
+- `lab_sessions.params` is a JSON object of strings, the parameters generated for the lab, including answers for discovery missions. It is never sent to the client.
+- `lab_sessions` references `mission_versions` with a composite foreign key `(mission_id, mission_version)`, so the version exists and belongs to the mission. The mission, the version and `params` are all set or all `NULL` (labs created before increment 07), and the trigger refuses changing any of them.
 - `mission_versions` has a trigger that rejects `UPDATE` and `DELETE`.
 - `missions` has a foreign key `(id, current_version)` to `mission_versions`, so the current version always exists and belongs to the mission. It and the uniqueness of `(module_id, position)` are checked at commit, which lets a sync insert a mission with its first version and reorder a module in one transaction.
 - `modules` and `missions` have `CHECK` constraints on the status (`draft`, `published`, `archived`) and the slug format; a mission without a position must be `archived`.

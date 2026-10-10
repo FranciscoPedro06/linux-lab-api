@@ -123,13 +123,13 @@ Output is never truncated or dropped. Output frames are at most 64 KiB. The rate
 
 ## Access and authentication
 
-The terminal belongs to lab sessions ([architecture.md](architecture.md#labs)). A connection needs a valid session cookie and a ready lab owned by that session's user. Knowing a lab id, or a container name, grants nothing. There is no development mode: locally, sign up with the invite code, start a lab from the home page and open its terminal.
+The terminal belongs to lab sessions ([architecture.md](architecture.md#labs)). A connection needs a valid session cookie and a ready lab owned by that session's user. A lab is ready only after its mission's setup has finished, so the shell always starts in a prepared home, with the files of `/etc/skel` and whatever setup created. Knowing a lab id, or a container name, grants nothing. There is no development mode: locally, sign up with the invite code, start a lab from a mission's page and open its terminal.
 
 When a lab ends (delete, logout, a timeout, the container dying), its terminal is closed with 4410 and its cleanup finishes before the container is removed, so the order is always lab, terminal, exec cleanup, container. Ending a lab only ever closes that lab's connection.
 
 ## Development
 
-With the Compose environment running (see the README), build the lab image once, sign up at http://localhost:5173/signup with the `SIGNUP_INVITE_CODE` Compose was started with, and start a lab from the home page:
+With the Compose environment running (see the README), build the lab image once and publish missions; `content/` holds none until increment 11, so use the synthetic missions of the tests (see the README). Then sign up at http://localhost:5173/signup with the `SIGNUP_INVITE_CODE` Compose was started with, open a mission from the home page and start its lab:
 
 ```sh
 docker build --tag linuxlab/lab-base:dev lab-image
