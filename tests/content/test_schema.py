@@ -5,7 +5,14 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from linuxlab.content.schema import MAX_CONDITION_DEPTH, MAX_CONDITIONS, MissionFile, ModuleFile
+from linuxlab.content.regex import MAX_PATTERN_LENGTH
+from linuxlab.content.schema import (
+    MAX_CONDITION_DEPTH,
+    MAX_CONDITIONS,
+    MAX_CONTENT_PATHS,
+    MissionFile,
+    ModuleFile,
+)
 
 from .support import mission_data
 
@@ -155,6 +162,63 @@ def test_placeholders_name_declared_parameters() -> None:
     assert "unknown parameter" in errors(validation={**contains, "contains": "{{ secret }}"})
     assert "malformed" in errors(validation={**contains, "contains": "{{ token"})
     assert "unknown parameter" in errors(validation={**contains, "contains": "{{ token.upper() }}"})
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/home/student/../etc",
+        "/home/./student",
+        "/home//student",
+        "/home/student/",
+        "/",
+        "//x",
+        "/home\\student",
+        "/home/student\x00",
+        "home/student",
+    ],
+)
+def test_condition_paths_must_be_canonical(path: str) -> None:
+    errors(validation=check("c", path=path))
+
+
+def test_canonical_paths_are_accepted() -> None:
+    parse(validation=check("c", path="/x"))
+    parse(validation=check("c", path="/home/student/.config/app.conf"))
+    parse(validation=check("c", path="/home/student/{{ token }}.txt"))
+
+
+def test_regex_must_be_valid_re2() -> None:
+    content = {"id": "c", "type": "file_content", "path": "/x"}
+    parse(validation={**content, "regex": "^TOKEN=[0-9a-f]{8}$"})
+    parse(validation={**content, "regex": "^TOKEN={{ token }}$"})
+    assert "invalid RE2" in errors(validation={**content, "regex": "a(?=b)"})
+    assert "invalid RE2" in errors(validation={**content, "regex": r"(a)\1"})
+    errors(validation={**content, "regex": "a" * (MAX_PATTERN_LENGTH + 1)})
+    parse(validation={**content, "regex": "a" * MAX_PATTERN_LENGTH})
+    errors(validation={**content, "regex": " "})
+    process = {"id": "p", "type": "process_running"}
+    parse(validation={**process, "match": {"args_regex": r"sleep\s+\d+"}})
+    assert "invalid RE2" in errors(validation={**process, "match": {"args_regex": "(?<=x)y"}})
+    errors(validation={**process, "match": {"args_regex": "a" * (MAX_PATTERN_LENGTH + 1)}})
+
+
+def test_messages_cannot_hold_placeholders() -> None:
+    assert "placeholders" in errors(validation=check("c", fail_message="Token: {{ token }}"))
+    errors(validation=check("c", pass_message="{{ token }}"))
+    errors(validation={"all": [check("c")], "fail_message": "{{ token }}"})
+    errors(validation={"not": check("c"), "fail_message": "x }} y"})
+    parse(validation=check("c", fail_message="O arquivo não existe.", pass_message="Pronto."))
+
+
+def test_file_content_reads_at_most_eight_paths() -> None:
+    def content(index: int, path: str) -> dict[str, Any]:
+        return {"id": f"c{index}", "type": "file_content", "path": path, "contains": "x"}
+
+    eight = [content(i, f"/f{i}") for i in range(MAX_CONTENT_PATHS)]
+    parse(validation={"all": [*eight, content(99, "/f0")]})
+    message = errors(validation={"all": [*eight, content(99, "/f99")]})
+    assert f"more than {MAX_CONTENT_PATHS} different paths" in message
 
 
 @pytest.mark.parametrize(

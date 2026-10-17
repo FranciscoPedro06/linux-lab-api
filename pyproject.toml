@@ -13,6 +13,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "email-validator>=2.3.0",
     "fastapi>=0.141.1",
+    "google-re2>=1.1.20251105",
     "pydantic-settings>=2.15.0",
     "pyyaml>=6.0.3",
     "sqlalchemy[asyncio]>=2.1.1",
@@ -43,6 +44,8 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
 [tool.mypy]
 strict = true
 files = ["src", "tests", "migrations"]
+# google-re2 ships no type information; stubs/ holds a minimal stub.
+mypy_path = "stubs"
 plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
