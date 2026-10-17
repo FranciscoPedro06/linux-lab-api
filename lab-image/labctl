@@ -3,12 +3,45 @@
 can open. It never runs mission content.
 
 Commands:
-  init  Populate the student's home from /etc/skel: the same files, owned by the
-        student, with the modes they have in /etc/skel. Running it again gives the
-        same result. Nothing is followed through a symbolic link.
+  init   Populate the student's home from /etc/skel: the same files, owned by the
+         student, with the modes they have in /etc/skel. Running it again gives the
+         same result. Nothing is followed through a symbolic link.
+  probe  Report facts about the lab's state for validation. Reads a JSON request on
+         standard input and writes a JSON answer on standard output. Only reads:
+         nothing is written, executed or changed, and no symbolic link the student
+         may have created is followed, except by `stat` when the request asks for it.
+
+Probe protocol, version 1. Request (at most 64 KiB, at most 51 facts, no duplicates):
+
+  {"v": 1, "facts": [
+    {"op": "stat", "path": "/home/student/a", "follow": false},
+    {"op": "read", "path": "/home/student/a"},
+    {"op": "processes"}]}
+
+Paths are absolute and canonical (no ".", ".." or empty components), at most 4096
+bytes. Every directory on the way is opened without following symbolic links; a
+symbolic link there gives `symlink_in_path`. The answer lists one result per fact,
+in the order of the request, each repeating the fact's fields:
+
+  stat       status ok (type, mode, uid, gid, user, group), not_found,
+             symlink_in_path, loop (follow only) or error (errno)
+  read       status ok (content: base64 of at most 64 KiB), not_found,
+             symlink_in_path, wrong_type (not a regular file, including a symbolic
+             link), too_large or error (errno)
+  processes  status ok (processes: pid, uid, user, comm, args: base64 of the
+             command line, NUL-separated, cut at 4 KiB), too_many (more than 1024
+             processes) or error (errno). Zombies and this probe's own processes
+             are left out.
+
+An invalid request exits with status 1 and writes nothing on standard output.
 """
 
+import base64
+import errno
+import grp
+import json
 import os
+import pwd
 import stat
 import sys
 
@@ -17,10 +50,27 @@ HOME = "/home/student"
 STUDENT_UID = 1000
 STUDENT_GID = 1000
 
+PROBE_VERSION = 1
+MAX_REQUEST_BYTES = 64 * 1024
+MAX_FACTS = 51
+MAX_PATH_BYTES = 4096
+MAX_READ_BYTES = 64 * 1024
+MAX_ARGS_BYTES = 4096
+MAX_COMM_BYTES = 64
+MAX_PROCESSES = 1024
+
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK: opening a FIFO never waits for a writer. The type is checked before
+# and after opening, so nothing but a regular file is ever read.
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
 
 def fail(message):
     print(f"labctl: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+# init
 
 
 def copy_file(source, target, mode):
@@ -74,7 +124,274 @@ def init():
                 copy_file(source, os.path.join(target_directory, name), stat.S_IMODE(info.st_mode))
 
 
-COMMANDS = {"init": init}
+# probe: request
+
+
+def valid_path(path):
+    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+        return False
+    try:
+        if len(path.encode("utf-8")) > MAX_PATH_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return all(part not in ("", ".", "..") for part in path[1:].split("/"))
+
+
+def check_fact(fact):
+    if not isinstance(fact, dict):
+        fail("probe: a fact is not an object")
+    op = fact.get("op")
+    if op == "stat":
+        if set(fact) != {"op", "path", "follow"} or not isinstance(fact["follow"], bool):
+            fail("probe: invalid stat fact")
+    elif op == "read":
+        if set(fact) != {"op", "path"}:
+            fail("probe: invalid read fact")
+    elif op == "processes":
+        if set(fact) != {"op"}:
+            fail("probe: invalid processes fact")
+    else:
+        fail("probe: unknown operation")
+    if "path" in fact and not valid_path(fact["path"]):
+        fail("probe: invalid path")
+
+
+def read_request():
+    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if len(raw) > MAX_REQUEST_BYTES:
+        fail("probe: request too large")
+    try:
+        request = json.loads(raw)
+    except (ValueError, RecursionError):
+        fail("probe: request is not JSON")
+    if not isinstance(request, dict) or set(request) != {"v", "facts"}:
+        fail("probe: invalid request")
+    if type(request["v"]) is not int or request["v"] != PROBE_VERSION:
+        fail("probe: unsupported version")
+    facts = request["facts"]
+    if not isinstance(facts, list) or not 1 <= len(facts) <= MAX_FACTS:
+        fail("probe: invalid list of facts")
+    for fact in facts:
+        check_fact(fact)
+    keys = [json.dumps(fact, sort_keys=True) for fact in facts]
+    if len(set(keys)) != len(keys):
+        fail("probe: duplicate fact")
+    return facts
+
+
+# probe: facts
+
+
+class Status(Exception):
+    """Ends a fact early with a status other than ok."""
+
+    def __init__(self, status):
+        super().__init__(status)
+        self.status = status
+
+
+def file_type(mode):
+    for test, name in (
+        (stat.S_ISREG, "file"),
+        (stat.S_ISDIR, "directory"),
+        (stat.S_ISLNK, "symlink"),
+        (stat.S_ISFIFO, "fifo"),
+        (stat.S_ISSOCK, "socket"),
+        (stat.S_ISCHR, "char_device"),
+        (stat.S_ISBLK, "block_device"),
+    ):
+        if test(mode):
+            return name
+    return "other"
+
+
+_users = {}
+_groups = {}
+
+
+def user_name(uid):
+    if uid not in _users:
+        try:
+            _users[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _users[uid] = None
+    return _users[uid]
+
+
+def group_name(gid):
+    if gid not in _groups:
+        try:
+            _groups[gid] = grp.getgrgid(gid).gr_name
+        except KeyError:
+            _groups[gid] = None
+    return _groups[gid]
+
+
+def open_parent(path):
+    """A descriptor for the directory holding the path's last component, reached
+    from / one component at a time without following any symbolic link, and the
+    last component's name."""
+    parts = path[1:].split("/")
+    descriptor = os.open("/", DIRECTORY_FLAGS)
+    try:
+        for part in parts[:-1]:
+            try:
+                info = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                raise Status("not_found") from None
+            if stat.S_ISLNK(info.st_mode):
+                raise Status("symlink_in_path")
+            if not stat.S_ISDIR(info.st_mode):
+                raise Status("not_found")
+            try:
+                child = os.open(part, DIRECTORY_FLAGS, dir_fd=descriptor)
+            except (FileNotFoundError, NotADirectoryError):
+                raise Status("not_found") from None
+            except OSError as error:
+                # Replaced by a symbolic link since it was checked.
+                if error.errno == errno.ELOOP:
+                    raise Status("symlink_in_path") from None
+                raise
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, parts[-1]
+
+
+def describe(info):
+    return {
+        "status": "ok",
+        "type": file_type(info.st_mode),
+        "mode": stat.S_IMODE(info.st_mode),
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "user": user_name(info.st_uid),
+        "group": group_name(info.st_gid),
+    }
+
+
+def stat_fact(path, follow):
+    if follow:
+        try:
+            return describe(os.stat(path))
+        except (FileNotFoundError, NotADirectoryError):
+            raise Status("not_found") from None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise Status("loop") from None
+            raise
+    descriptor, name = open_parent(path)
+    try:
+        return describe(os.stat(name, dir_fd=descriptor, follow_symlinks=False))
+    except (FileNotFoundError, NotADirectoryError):
+        raise Status("not_found") from None
+    finally:
+        os.close(descriptor)
+
+
+def read_fact(path):
+    directory, name = open_parent(path)
+    try:
+        try:
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            raise Status("not_found") from None
+        if not stat.S_ISREG(info.st_mode):
+            raise Status("wrong_type")
+        try:
+            descriptor = os.open(name, FILE_FLAGS, dir_fd=directory)
+        except FileNotFoundError:
+            raise Status("not_found") from None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise Status("wrong_type") from None
+            raise
+    finally:
+        os.close(directory)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise Status("wrong_type")
+        data = bytearray()
+        while len(data) <= MAX_READ_BYTES:
+            chunk = os.read(descriptor, MAX_READ_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(descriptor)
+    if len(data) > MAX_READ_BYTES:
+        raise Status("too_large")
+    return {"status": "ok", "content": base64.b64encode(bytes(data)).decode("ascii")}
+
+
+def read_proc(path, limit):
+    with open(path, "rb", buffering=0) as reader:
+        return reader.read(limit)
+
+
+def process(pid):
+    status = read_proc(f"/proc/{pid}/status", 64 * 1024).decode("utf-8", "replace")
+    fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+    if fields.get("State", "").strip()[:1] in ("Z", "X"):
+        return None
+    # Effective uid, as ps shows it.
+    uid = int(fields["Uid"].split()[1])
+    comm = read_proc(f"/proc/{pid}/comm", MAX_COMM_BYTES).rstrip(b"\n")
+    args = read_proc(f"/proc/{pid}/cmdline", MAX_ARGS_BYTES)
+    return {
+        "pid": pid,
+        "uid": uid,
+        "user": user_name(uid),
+        "comm": comm.decode("utf-8", "replace"),
+        "args": base64.b64encode(args).decode("ascii"),
+    }
+
+
+def processes_fact():
+    own = {os.getpid(), os.getppid()}
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) in own:
+            continue
+        try:
+            entry = process(int(name))
+        except (OSError, KeyError, ValueError, IndexError):
+            # Exited while it was being read.
+            continue
+        if entry is not None:
+            found.append(entry)
+            if len(found) > MAX_PROCESSES:
+                raise Status("too_many")
+    found.sort(key=lambda entry: entry["pid"])
+    return {"status": "ok", "processes": found}
+
+
+def run_fact(fact):
+    try:
+        if fact["op"] == "stat":
+            result = stat_fact(fact["path"], fact["follow"])
+        elif fact["op"] == "read":
+            result = read_fact(fact["path"])
+        else:
+            result = processes_fact()
+    except Status as outcome:
+        result = {"status": outcome.status}
+    except OSError as error:
+        result = {"status": "error", "errno": errno.errorcode.get(error.errno, "EIO")}
+    return {**fact, **result}
+
+
+def probe():
+    facts = read_request()
+    answer = {"v": PROBE_VERSION, "facts": [run_fact(fact) for fact in facts]}
+    sys.stdout.write(json.dumps(answer, separators=(",", ":")))
+    sys.stdout.flush()
+
+
+COMMANDS = {"init": init, "probe": probe}
 
 
 def main():
