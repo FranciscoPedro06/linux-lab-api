@@ -89,7 +89,8 @@ async def running_api(runtime: LabRuntime, **settings: object) -> AsyncIterator[
     async with serve(app) as url:
         api = Api(url, app)
         await api.sql(
-            "TRUNCATE users, auth_sessions, lab_sessions, modules, missions, mission_versions"
+            "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, modules, missions,"
+            " mission_versions"
         )
         await api.sync(FIXTURE)
         yield api

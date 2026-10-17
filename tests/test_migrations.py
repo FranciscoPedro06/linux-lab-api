@@ -29,7 +29,15 @@ def tables() -> set[str]:
     return asyncio.run(read())
 
 
-TABLES = {"users", "auth_sessions", "lab_sessions", "modules", "missions", "mission_versions"}
+TABLES = {
+    "users",
+    "auth_sessions",
+    "lab_sessions",
+    "modules",
+    "missions",
+    "mission_versions",
+    "validation_runs",
+}
 
 
 def test_downgrade_and_upgrade_again() -> None:

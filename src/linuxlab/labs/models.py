@@ -34,6 +34,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -117,6 +118,14 @@ class LabSession(Base):
             postgresql_where=text(f"status IN ({ACTIVE_STATUSES_SQL})"),
         ),
         Index("ix_lab_sessions_user_id_created_at", "user_id", "created_at"),
+        # Target of validation_runs' foreign key, which ties each run to its lab's
+        # pinned version. The id alone is already unique.
+        UniqueConstraint(
+            "id",
+            "mission_id",
+            "mission_version",
+            name="uq_lab_sessions_id_mission_id_mission_version",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
