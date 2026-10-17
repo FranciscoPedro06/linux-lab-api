@@ -235,6 +235,10 @@ class DockerRuntime:
                 exit_code = await _wait_exit_code(execution)
         except TimeoutError:
             return ExecResult(exit_code=-1, stdout=b"", stderr=b"", timed_out=True)
+        except DockerError as error:
+            # The container was removed while the exec ran: Docker no longer knows
+            # the exec instance (404) when its exit code is read.
+            raise _translate(error, container_id) from error
         except (aiohttp.ClientError, OSError) as error:
             raise LabRuntimeError(f"{container_id}: exec failed: {error}") from error
 
