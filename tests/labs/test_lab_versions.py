@@ -104,6 +104,8 @@ def test_an_archived_mission_stays_visible_to_its_active_lab(
         "tags",
         "version",
         "requires_answer",
+        "progress",
+        "current_version",
         "module",
         "briefing",
         "objectives",
