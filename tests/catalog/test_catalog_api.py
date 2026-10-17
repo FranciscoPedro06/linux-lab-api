@@ -23,8 +23,10 @@ CARD_FIELDS = {
     "tags",
     "version",
     "requires_answer",
+    "progress",
 }
-DETAIL_FIELDS = CARD_FIELDS | {"module", "briefing", "objectives", "hints"}
+DETAIL_FIELDS = CARD_FIELDS | {"current_version", "module", "briefing", "objectives", "hints"}
+NOT_COMPLETED = {"status": "not_completed", "completed_version": None, "completed_at": None}
 # Never sent to the client, at any level of the response.
 HIDDEN = ("setup", "params", "validation", "solutions", "counterexamples", "explanation")
 
@@ -104,6 +106,7 @@ def test_list_shows_published_content_in_order(client: TestClient, token: str, r
                     "tags": ["permissions", "chmod"],
                     "version": 1,
                     "requires_answer": False,
+                    "progress": NOT_COMPLETED,
                 },
                 {
                     "slug": "sample-answer",
@@ -114,6 +117,7 @@ def test_list_shows_published_content_in_order(client: TestClient, token: str, r
                     "tags": [],
                     "version": 1,
                     "requires_answer": True,
+                    "progress": NOT_COMPLETED,
                 },
             ],
         }
