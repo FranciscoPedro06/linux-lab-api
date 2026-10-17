@@ -38,7 +38,7 @@ Defined in one function, `build_container_config`, and covered by a snapshot tes
 
 The lab image is built from `lab-image/`: Ubuntu 24.04 pinned by digest, `bash`, `python3`, `tini`, `procps`, `iproute2`, user `student` (uid 1000), no `sudo`, no setuid or setgid binaries, and `/opt/labctl` for platform utilities (directory and files `0700`, owned by root). The entrypoint is `tini -- sleep infinity`.
 
-`/home/student` is a tmpfs, so it starts empty. When a lab is created, `labctl init` (`lab-image/labctl`, installed as `/opt/labctl/labctl`) runs as root with `python3 -I -S` and copies `/etc/skel` into it, owned by the student, without following symbolic links; then the mission's setup runs ([missions.md](missions.md#setup)). Docker mounts tmpfs `noexec` by default, so the configuration sets `exec` on `/home/student` and `/tmp`, where students run their own scripts, and keeps `noexec` on `/run/lab`.
+`/home/student` is a tmpfs, so it starts empty. When a lab is created, `labctl init` (`lab-image/labctl`, installed as `/opt/labctl/labctl`) runs as root with `python3 -I -S` and copies `/etc/skel` into it, owned by the student, without following symbolic links; then the mission's setup runs ([missions.md](missions.md#setup)). Validation runs `labctl probe` the same way, as root with a fixed command line, to read the lab's state ([architecture.md](architecture.md#validation)). Docker mounts tmpfs `noexec` by default, so the configuration sets `exec` on `/home/student` and `/tmp`, where students run their own scripts, and keeps `noexec` on `/run/lab`.
 
 ## Differences between runc and runsc
 

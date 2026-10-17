@@ -2,7 +2,7 @@
 
 Backend for Linux Lab, a platform for learning Linux by solving problems in a real terminal, inside an isolated environment created for each student.
 
-This repository holds the API, the lab runtime, the WebSocket terminal, the lab image and the infrastructure. Mission content and validation will live here too. The web interface lives in [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web).
+This repository holds the API, the lab runtime, the WebSocket terminal, the lab image and the infrastructure. Validation lives here as well, and mission content will. The web interface lives in [linux-lab-web](https://github.com/FranciscoPedro06/linux-lab-web).
 
 ## Why
 
@@ -20,10 +20,11 @@ What exists today:
 4. Accounts exist: sign-up with an invite code, login and logout, with a server-side session in an `HttpOnly` cookie. Only the owner's session can see a lab or open its terminal.
 5. Labs end when the student ends them, logs out, leaves them idle (15 minutes without a terminal, 30 without typing), after 2 hours, or when they run out of memory. A background reaper reconciles the database with Docker and removes anything left behind. The student is told why a lab ended.
 6. Modules and missions are kept in `content/` and synced to PostgreSQL by `linuxlab content sync`, which validates them and stores each change as a new immutable version, without running anything. Signed-in users can browse the published catalog and start a lab from a mission.
+7. The student asks the API to validate the lab: it checks the lab's state against the conditions of the mission version the lab was created for, through a read-only platform utility inside the container, and returns a status per condition. Each validation is stored.
 
-Planned, not implemented yet: validation of the final state, progress, and resetting a lab or switching it to another mission.
+Planned, not implemented yet: progress, and resetting a lab or switching it to another mission.
 
-Missions will declare conditions rather than run validation code:
+Missions declare conditions rather than run validation code:
 
 ```yaml
 validation:
@@ -167,8 +168,8 @@ uv run ruff check
 uv run ruff format --check
 uv run mypy
 uv run pytest                  # unit tests
-uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), content sync, catalog, schema, migrations; PostgreSQL at DATABASE_URL
-uv run pytest -m docker                         # lab runtime, isolation, terminal, lab lifecycle and mission setup; Docker, the lab image and PostgreSQL (Linux: see docs/runtime.md)
+uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), content sync, catalog, schema, validation, migrations; PostgreSQL at DATABASE_URL
+uv run pytest -m docker                         # lab runtime, isolation, terminal, lab lifecycle, mission setup and validation; Docker, the lab image and PostgreSQL (Linux: see docs/runtime.md)
 ```
 
 Lab runtime tests, gVisor setup and the list of isolation checks are described in [docs/runtime.md](docs/runtime.md).
@@ -186,7 +187,7 @@ Planned coverage as the project grows:
 
 ## Status
 
-Increments 01 to 07 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; the mission catalog, with content validated and synced from `content/` into immutable versions; and labs created for a mission, pinned to its version, with generated parameters and the mission's setup run inside the lab. The validation engine comes next (increment 08). Planned order:
+Increments 01 to 08 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; the mission catalog, with content validated and synced from `content/` into immutable versions; labs created for a mission, pinned to its version, with generated parameters and the mission's setup run inside the lab; and the validation engine, which checks a lab's state against its pinned mission version with RE2 patterns and `labctl probe`, and stores each run in `validation_runs`. Progress comes next (increment 09). Planned order:
 
 | # | Increment |
 |---|---|

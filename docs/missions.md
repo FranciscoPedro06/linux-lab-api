@@ -173,7 +173,7 @@ Values are not coerced: a field that expects a string refuses a number, a boolea
 
 ## Validation tree
 
-The sync checks the structure of conditions, parameters, setup and mission tests and stores them in each version; it never runs them. Parameters and setup are used when a lab is created (increment 07, described below). Conditions and validators are run from increment 08 and mission tests from increment 11; their sections describe the planned behavior.
+The sync checks the structure of conditions, parameters, setup and mission tests and stores them in each version; it never runs them. Parameters and setup are used when a lab is created (increment 07), and conditions when the student validates the lab (increment 08, `POST /api/labs/{id}/validate`); both are described below. Mission tests run from increment 11; their section describes the planned behavior.
 
 The root of `validation` is a single node. A node is either:
 
@@ -224,6 +224,16 @@ Every leaf accepts `fail_message` and `pass_message`. Messages are shown to the 
 - `mode` must be a string of four octal digits (`"0700"`). In YAML, an unquoted `700` is read as a decimal integer and `0700` as octal 448; the parser rejects both.
 - `regex` and `args_regex` use RE2 syntax, up to 1024 characters. Constructs RE2 does not support (lookaround, backreferences, possessive quantifiers) are refused by the sync; there is no fallback to another engine.
 - `answer` is compared by the API. The answer is never sent to the container.
+
+How each condition is checked against the lab:
+
+- Paths are never resolved through a symbolic link the student may have created: a symbolic link on the way, or in place of the file, makes `file_exists`, `file_content`, `file_permissions`, `file_owner` and `file_group` fail (`wrong_type`). Only `file_exists` and `directory_exists` with `follow_symlinks: true` follow links, to check the target's type. `file_permissions`, `file_owner` and `file_group` accept any type other than a symbolic link, so they also apply to directories.
+- `path_absent` passes only when nothing, not even a dangling symbolic link, exists at the path.
+- `file_content` reads a regular file of at most 64 KiB, as UTF-8. A larger file, content that is not UTF-8, a FIFO or another non-regular file fails the condition. With `trim`, whitespace is removed from both ends of the content before comparing; the expected value and the pattern are used as written. `equals` compares the whole content, `contains` and `not_contains` look for a substring, and `regex` searches anywhere in the content (use `^` and `$` to anchor).
+- `process_running` counts processes whose `comm` (the kernel's name, at most 15 bytes) equals `comm`, or whose command line (arguments separated by spaces, cut at 4 KiB) matches `args_regex` anywhere, owned by `user` when given; `process_not_running` passes when there are none. Zombies are not counted.
+- `answer` applies `normalize` to both the submitted answer and the expected values: `trim` first, then `lowercase`, whatever their order in the list. `equals_param` compares with the lab's value of that parameter. Without a submitted answer the condition fails.
+- A condition fails with a reason (`not_found`, `wrong_type`, `too_large`, `not_utf8`, `mismatch`, `no_answer`) when the lab's state does not match. It is `error`, never `failed`, when it could not be checked: the probe timed out or failed, or the container stopped.
+- Without `pass_message` or `fail_message`, the student sees a generic message.
 
 ## Parameters
 
