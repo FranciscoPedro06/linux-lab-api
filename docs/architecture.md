@@ -32,9 +32,9 @@ The API runs as a single process in the MVP. WebSocket connections, rate limitin
 | Module | Responsibility |
 |---|---|
 | `auth` | Sign-up, login, logout, sessions |
-| `catalog` | Read access to published modules and missions; the user's progress is added in increment 09 |
+| `catalog` | Read access to published modules and missions, with the user's progress on each |
 | `content` | Parsing, schema validation and sync of missions from the repository |
-| `progress` | `user_missions` rules |
+| `progress` | `user_missions`: recording and reading the first completion of each mission |
 | `labs` | Lab lifecycle, container configuration, reaper |
 | `terminal` | WebSocket bridge to `docker exec` |
 | `validation` | Condition tree, validators, fact collection |
@@ -67,7 +67,7 @@ Rules:
 - A user has at most one lab in `provisioning`, `ready` or `terminating`, enforced by the partial unique index `one_active_lab_per_user`. Concurrent creations by one user produce one lab; the others get the existing lab or `409`.
 - At most `LAB_CAPACITY` labs (default 10) are active across all users. Creations are serialized by a transaction-scoped advisory lock, so the cap cannot be raced. Each user may start at most 10 labs per 10 minutes. Both values are provisional; see [Values chosen in increment 05](#values-chosen-in-increment-05).
 - Labs are only created by an explicit user action, for a published mission.
-- A user's active lab is for one mission. Asking for the same mission returns that lab; asking for another is refused until the lab ends. Switching missions, which ends the lab with `end_reason = mission_switch`, comes in increment 10, and keeping progress when a lab is destroyed in increment 09.
+- A user's active lab is for one mission. Asking for the same mission returns that lab; asking for another is refused until the lab ends. Switching missions, which ends the lab with `end_reason = mission_switch`, comes in increment 10. Progress is kept when a lab ends or is removed ([Progress](#progress)).
 
 ### Consistency between PostgreSQL and Docker
 
@@ -201,9 +201,39 @@ The response sent to the client carries the status and message of each condition
 
 ### Concurrency and consistency
 
-PostgreSQL and Docker share no transaction. Validation reads the lab and changes nothing: no row, parameter, version or file is modified, and setup does not run again. The run is inserted once the result is known, as a final row; there is no `running` state. A validation interrupted midway (a cancelled request, a crash) leaves no row, and a validation whose run cannot be stored answers `500`.
+PostgreSQL and Docker share no transaction. Validation reads the lab and changes nothing: no row, parameter, version or file is modified, and setup does not run again. The run is inserted once the result is known, as a final row; there is no `running` state, and no transaction is open during the probe. A passed run records the user's completion in the same transaction ([Progress](#progress)). A validation interrupted midway (a cancelled request, a crash) leaves no row, and a validation whose run or completion cannot be stored answers `500` and stores neither.
 
 At most one validation runs per lab at a time; a second request gets `409 validation_in_progress` instead of waiting. Validations of different labs run independently. The set of labs being validated lives in memory in the API process, like the terminal registry, and is released however the validation ends, including cancellation; running the API as several workers requires moving it. Each user may request 20 validations per 60 seconds, in memory as well. If the container is gone when a validation starts, the lab ends (`container_lost` or `oom`) and the request gets `409 lab_not_ready`; if it stops during the probe, the run ends as `error` (`container_gone`).
+
+## Progress
+
+Implemented in increment 09 (`src/linuxlab/progress/`). `user_missions` holds, per user and mission, the first completion: the version it was on and when. Progress belongs to the mission, not to a version, and outlives the labs and runs it came from: nothing in `user_missions` refers to them, and ending or reaping a lab leaves it.
+
+Recording a completion:
+
+1. `POST /api/labs/{id}/validate` checks that the user owns the lab, then validates it as described in [Validation](#validation). Nothing is written and no transaction is open while the lab is probed.
+2. In one transaction, the run is inserted in `validation_runs`; if it `passed`, `INSERT ... ON CONFLICT (user_id, mission_id) DO NOTHING RETURNING` records the completion with the lab's owner, its mission and its pinned version (never the mission's current version, which is not read), and the run's `finished_at` as `completed_at`. The progress is then read back in the same transaction, and the transaction commits.
+3. The response carries `progress` and `newly_completed`, which is true only when this insert added the row.
+
+`failed` and `error` runs never touch `user_missions`. A completion is kept when later runs fail, when the mission gets a new version, and when it is archived; a lab created before the mission was archived or changed still completes it, at its pinned version. Taking a new version as a new obligation would make editorial changes (a hint, a typo) undo progress; a change in what a mission asks for gets a new slug instead.
+
+Concurrency and failures:
+
+- Two transactions recording the same completion are settled by the primary key in PostgreSQL, not by the in-memory validation lock: the second insert waits for the first transaction, does nothing if it commits, and inserts if it rolls back. The read that follows sees the committed row, so the request that lost returns the stored completion with `newly_completed: false`.
+- The run and the completion commit together or not at all. A failed write, or a request cancelled before the commit, stores neither.
+- A response lost after the commit does not undo it; the next read of the catalog shows the completion, and validating again returns `newly_completed: false`.
+
+| Invariant | Enforced by |
+|---|---|
+| One completion per user and mission | Database: primary key `(user_id, mission_id)` |
+| The completed version exists and belongs to the mission | Database: foreign key `(mission_id, completed_version)` to `mission_versions` |
+| A completion never changes once recorded | Database: trigger rejecting `UPDATE` |
+| Deleting a user deletes their progress | Database: `ON DELETE CASCADE` on `user_id` |
+| Only a passed run of a lab the user owns records a completion, at the lab's pinned version and the run's end time | Service: `validation/service.py` and `progress/service.py`, within the run's transaction |
+| A completion is never removed by the application | Service: no code path deletes from `user_missions`; `DELETE` stays possible in the database so that deleting a user cascades |
+| Progress is only read for the user of the session | Service: catalog and validation routes take the user from the session; no route takes a user id |
+
+No backfill was done when the table was created: neither a lab nor a stored passed run is taken as a completion.
 
 ## Missions and versioning
 
@@ -228,7 +258,8 @@ Versions are immutable: a trigger rejects `UPDATE` and `DELETE` on `mission_vers
 
 | Situation | Behavior |
 |---|---|
-| Completed on version 1, version 2 released | Stays completed; `completed_version = 1` (increment 09) |
+| Completed on version 1, version 2 released | Stays completed; `completed_version = 1` |
+| Completed on version 1, then passed on version 2 | Stays as it was: `completed_version = 1`, `newly_completed: false` |
 | Lab active on version 1 | Stays on version 1 until it ends, even if the mission is archived |
 | Reset (increment 10) or new lab | Uses the current version |
 
@@ -275,7 +306,7 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 
 ## Data model
 
-`users`, `auth_sessions`, `lab_sessions` (migrations for increments 04 and 05), `modules`, `missions` and `mission_versions` (increment 06) and `validation_runs` (increment 08) exist; the other tables are the target design.
+`users`, `auth_sessions`, `lab_sessions` (migrations for increments 04 and 05), `modules`, `missions` and `mission_versions` (increment 06), `validation_runs` (increment 08) and `user_missions` (increment 09) exist; the other tables are the target design.
 
 | Table | Contents |
 |---|---|
@@ -284,7 +315,7 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 | `modules` | Modules synced from `content/`: slug (unique), title, description, status |
 | `missions` | Stable mission identity (slug, unique), module, position in the module (unique per module, `NULL` once removed from `content/`), status, current version |
 | `mission_versions` | Immutable specification per version: content hash and the complete specification as `JSONB`; PK `(mission_id, version)` |
-| `user_missions` | Progress per user and mission; PK `(user_id, mission_id)` |
+| `user_missions` | The first completion of a mission by a user: the version it was on and when; PK `(user_id, mission_id)` |
 | `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time, the pinned mission version and the generated parameters |
 | `validation_runs` | Every finished validation: the lab, its pinned version, the outcome (`passed`, `failed`, `error`), an error code for `error`, the tree of statuses and reasons, whether an answer was sent, start and end times |
 | `command_history` | Collected commands; unique on `(lab_session_id, seq)` |
@@ -310,7 +341,7 @@ CREATE UNIQUE INDEX one_active_lab_per_user
 
 Other rules:
 
-- `user_missions`: a missing row means the mission was never started. `completed_at` and `completed_version` are set together and never cleared.
+- `user_missions`: a missing row means no completion is recorded, not that the mission was never started (labs record that). `completed_version` and `completed_at` are `NOT NULL`, set by the insert and never changed: a trigger rejects `UPDATE`, and `DELETE` stays possible so that deleting a user cascades. A composite foreign key `(mission_id, completed_version)` references `mission_versions`, so the version exists and belongs to the mission. See [Progress](#progress) for what the database and the services each guarantee.
 - `lab_sessions.params` is a JSON object of strings, the parameters generated for the lab, including answers for discovery missions. It is never sent to the client.
 - `lab_sessions` references `mission_versions` with a composite foreign key `(mission_id, mission_version)`, so the version exists and belongs to the mission. The mission, the version and `params` are all set or all `NULL` (labs created before increment 07), and the trigger refuses changing any of them.
 - `mission_versions` has a trigger that rejects `UPDATE` and `DELETE`.

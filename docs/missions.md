@@ -24,7 +24,7 @@ content/
 
 - The directory name is the mission slug, and the module file name is the module slug.
 - The module file lists which missions belong to it and in what order. It is the only place where that is defined.
-- `briefing.md` is the problem statement. `explanation.md` is shown only after completion.
+- `briefing.md` is the problem statement. `explanation.md` is meant to be shown only after completion; until that is implemented (a candidate for increment 14) it never leaves the server.
 
 ## Content rules
 
@@ -292,4 +292,4 @@ Every mission is tested automatically:
 
 A mission needs at least two different solutions and one counterexample. This checks that validation accepts more than one path and rejects shortcuts.
 
-The scripts in `solutions` are also shown to the student after completion.
+The scripts in `solutions` are meant to be shown to the student after completion as well, together with the explanation (a candidate for increment 14); until then they never leave the server.
