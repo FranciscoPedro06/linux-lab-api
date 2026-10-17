@@ -173,16 +173,19 @@ Handshake, messages and close codes are in [api.md](api.md#terminal) and [termin
 
 ## Validation
 
-Validation runs in two phases:
+Implemented in increment 08 (`src/linuxlab/validation/`): `plan.py` (pinned tree and parameters to facts), `probe.py` (the `labctl probe` protocol), `evaluate.py` (pure evaluation), `service.py` (one validation, end to end), `models.py` (`validation_runs`) and `router.py` (`POST /api/labs/{id}/validate`).
 
-1. Each condition in the tree declares the facts it needs (`stat` of a path, file contents, process list).
-2. The API batches those requests into a single `labctl probe` call inside the container, through `docker exec` as root, with JSON on stdin and stdout.
-3. Each validator evaluates the facts it received. Evaluation is a pure function with no I/O.
-4. The tree combines the results.
+1. The lab is read again and must be `ready`, with a pinned version. That version's condition tree is read from `mission_versions` (never the mission's current version) and checked again with the rules the sync applied: structure, RE2 syntax, canonical paths and limits. A version that fails them ends the run as `error` (`invalid_spec`).
+2. Placeholders are replaced in memory with the lab's parameters, escaped in RE2 patterns. Each condition declares the fact it needs (`stat` of a path, the content of a file, the process list); identical facts are asked once.
+3. The API checks that the container runs, then collects every fact with a single `labctl probe` call inside the container, through `docker exec` as root, with JSON on stdin and stdout. A tree made only of `answer` conditions needs no probe.
+4. Each validator evaluates the facts it received. Evaluation is a pure function with no I/O.
+5. The tree combines the results, and the run is inserted, final, in `validation_runs`.
 
-Validators have no way to execute anything in the lab. They can only request facts from a closed catalog, so a buggy validator can at worst produce a wrong result.
+Validators have no way to execute anything in the lab. They can only request facts from a closed catalog (`stat`, `read`, `processes`), so a buggy validator can at worst produce a wrong result. The command line of the probe is fixed; paths travel only inside the JSON request, which is built from the pinned version and the lab's parameters. The client sends at most an answer.
 
-`labctl` is part of the lab image, which has a read-only rootfs, and only root can run it. The student runs as uid 1000 and cannot modify it.
+`labctl` is part of the lab image, which has a read-only rootfs, and only root can run it. The student runs as uid 1000 and cannot modify it. The probe only reads, and never follows a symbolic link the student may have created: every directory on the way is opened with `O_NOFOLLOW`, and a file is read only if it is a regular file, opened non-blocking (`O_NONBLOCK`, so a FIFO cannot hang it). `follow_symlinks: true` on `file_exists` and `directory_exists` follows links to report the target's type, never its content. The protocol is described in `lab-image/labctl`.
+
+The probe's answer is untrusted input. It is parsed by strict models and must answer exactly the facts asked, in order, within 1 MiB and 10 seconds. A timeout, a non-zero exit status, truncated or invalid output, or a wrong protocol version fails the whole probe: every condition that needed a fact is then `error`. A partial answer is never evaluated.
 
 Each node in the tree ends up `passed`, `failed` or `error`.
 
@@ -192,9 +195,15 @@ Each node in the tree ends up `passed`, `failed` or `error`.
 | `any` | `passed` if any child passed; otherwise `error` if any child errored; otherwise `failed` |
 | `not` | swaps `passed` and `failed`; `error` stays `error` |
 
-`error` means an infrastructure failure (timeout, stopped container) and does not count as an attempt. Every leaf is evaluated, with no short-circuiting, so the student gets complete feedback.
+A leaf fails, with a reason, when the lab's state does not match: `not_found` (missing path), `wrong_type` (a directory, FIFO or symbolic link where a regular file is expected, or a symbolic link on the way), `too_large` (a file over 64 KiB), `not_utf8`, `mismatch` (the comparison does not hold) and `no_answer`. These are states the student caused, not failures of the validator. `error` means the check itself could not run (timeout, stopped container, invalid probe output, a fact the probe could not read) and does not count as an attempt. Every leaf is evaluated, with no short-circuiting, so the student gets complete feedback.
 
-The response sent to the client carries the status and message of each condition. Expected and actual values are kept only in `validation_runs`, since they can give away the solution.
+The response sent to the client carries the status and message of each condition. Messages come from the mission (`pass_message`, `fail_message`), or are fixed defaults; they cannot contain parameters and never derive from the lab's state. Expected values, observed values, file contents, command lines, the answer and the parameters are neither returned nor stored: `validation_runs` keeps statuses and reasons only.
+
+### Concurrency and consistency
+
+PostgreSQL and Docker share no transaction. Validation reads the lab and changes nothing: no row, parameter, version or file is modified, and setup does not run again. The run is inserted once the result is known, as a final row; there is no `running` state. A validation interrupted midway (a cancelled request, a crash) leaves no row, and a validation whose run cannot be stored answers `500`.
+
+At most one validation runs per lab at a time; a second request gets `409 validation_in_progress` instead of waiting. Validations of different labs run independently. The set of labs being validated lives in memory in the API process, like the terminal registry, and is released however the validation ends, including cancellation; running the API as several workers requires moving it. Each user may request 20 validations per 60 seconds, in memory as well. If the container is gone when a validation starts, the lab ends (`container_lost` or `oom`) and the request gets `409 lab_not_ready`; if it stops during the probe, the run ends as `error` (`container_gone`).
 
 ## Missions and versioning
 
@@ -266,7 +275,7 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 
 ## Data model
 
-`users`, `auth_sessions`, `lab_sessions` (migrations for increments 04 and 05), `modules`, `missions` and `mission_versions` (increment 06) exist; the other tables are the target design.
+`users`, `auth_sessions`, `lab_sessions` (migrations for increments 04 and 05), `modules`, `missions` and `mission_versions` (increment 06) and `validation_runs` (increment 08) exist; the other tables are the target design.
 
 | Table | Contents |
 |---|---|
@@ -277,7 +286,7 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 | `mission_versions` | Immutable specification per version: content hash and the complete specification as `JSONB`; PK `(mission_id, version)` |
 | `user_missions` | Progress per user and mission; PK `(user_id, mission_id)` |
 | `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time, the pinned mission version and the generated parameters |
-| `validation_runs` | Every validation, with the full result and the version used |
+| `validation_runs` | Every finished validation: the lab, its pinned version, the outcome (`passed`, `failed`, `error`), an error code for `error`, the tree of statuses and reasons, whether an answer was sent, start and end times |
 | `command_history` | Collected commands; unique on `(lab_session_id, seq)` |
 
 ```
@@ -305,6 +314,7 @@ Other rules:
 - `lab_sessions.params` is a JSON object of strings, the parameters generated for the lab, including answers for discovery missions. It is never sent to the client.
 - `lab_sessions` references `mission_versions` with a composite foreign key `(mission_id, mission_version)`, so the version exists and belongs to the mission. The mission, the version and `params` are all set or all `NULL` (labs created before increment 07), and the trigger refuses changing any of them.
 - `mission_versions` has a trigger that rejects `UPDATE` and `DELETE`.
+- `validation_runs` references `lab_sessions` with a composite foreign key `(lab_session_id, mission_id, mission_version)` to `(id, mission_id, mission_version)`, so a run records exactly its lab's pinned version, and `mission_versions` with `(mission_id, mission_version)`. `CHECK` constraints tie `error_code` (a closed list) to `outcome = 'error'` and allow a missing `result` only for `invalid_spec`. A trigger rejects `UPDATE`; `DELETE` stays possible so that deleting a user cascades. No retention policy is defined yet.
 - `missions` has a foreign key `(id, current_version)` to `mission_versions`, so the current version always exists and belongs to the mission. It and the uniqueness of `(module_id, position)` are checked at commit, which lets a sync insert a mission with its first version and reorder a module in one transaction.
 - `modules` and `missions` have `CHECK` constraints on the status (`draft`, `published`, `archived`) and the slug format; a mission without a position must be `archived`.
 - States and reasons are `text` columns with `CHECK` constraints rather than `ENUM`, which keeps schema changes simple.

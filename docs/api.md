@@ -54,7 +54,7 @@ General errors, shared by every route:
 
 Every route requires a session except `signup`, `login`, `logout` and `health`.
 
-Implemented so far: `health`, the four `auth` routes, the two catalog routes, the lab routes except `reset` and `validate`, and the terminal. The others are the target contract.
+Implemented so far: `health`, the four `auth` routes, the two catalog routes, the lab routes except `reset`, and the terminal. `reset` is the target contract.
 
 ## Authentication
 
@@ -179,6 +179,55 @@ There is no way to replace the active lab with one for another mission yet: the 
 
 Body `{}`. Ends the lab with `end_reason = user`: closes its terminal (`4410`), removes the container and returns `200` with the lab, normally `terminated`. If the container could not be removed yet the lab is returned `terminating` and the reaper finishes it. Ending an ended lab returns it unchanged; concurrent requests all succeed.
 
+### `POST /api/labs/{id}/validate`
+
+Implemented in increment 08. Checks whether the lab's current state meets the conditions of the mission version the lab was created for ([architecture.md](architecture.md#validation)). How the student reached that state does not matter, and command history plays no part.
+
+```json
+{}
+```
+
+```json
+{ "answer": "lantern" }
+```
+
+The body holds at most `answer`: a string of up to 1 KiB in UTF-8, compared by the API with the mission's `answer` condition. It is never stored, logged or sent to the lab. Missions without an `answer` condition ignore it. Any other field is refused: the client cannot choose the mission version, conditions, paths, patterns, commands, the container or any limit.
+
+```json
+{
+  "run_id": 8812,
+  "outcome": "failed",
+  "mission": { "slug": "secure-deploy-script", "version": 2 },
+  "result": {
+    "kind": "all",
+    "status": "failed",
+    "message": null,
+    "children": [
+      { "kind": "check", "id": "exists", "status": "passed", "message": "O arquivo existe." },
+      { "kind": "check", "id": "mode", "status": "failed", "message": "As permissões ainda não estão corretas." }
+    ]
+  }
+}
+```
+
+- `outcome` is the status of the root: `passed` (the mission's conditions are met), `failed` (not yet) or `error` (the check itself could not run: the probe timed out or failed, the container stopped, or the pinned version cannot be read). `error` does not count as an attempt. Every outcome is stored in `validation_runs` and returned as `200`.
+- `mission` is the lab's pinned version, which a newer version or archiving the mission does not change.
+- Operator nodes have `kind` set to `all`, `any` or `not`, a `message` (their `fail_message` when they failed, otherwise `null`, or the error message) and `children`. Leaves have `kind` set to `check`, their `id`, `status` and `message`.
+- Messages come from the mission or are fixed defaults (`Condição atendida.`, `Condição ainda não atendida.`, `Envie uma resposta para verificar esta condição.`, `Não foi possível verificar esta condição.`). They never carry expected or observed values, file contents or parameters.
+- `result` is `null` only when the pinned version cannot be read.
+
+| Situation | Response |
+|---|---|
+| The lab is `ready` and its state was checked | `200` with the run |
+| Body with another field, `answer` not a string or longer than 1 KiB | `422 invalid_request` |
+| No such lab, or another user's | `404 lab_not_found` |
+| The lab is not `ready` (provisioning, ending, ended), was created before missions, or its container is gone (the lab is then ended) | `409 lab_not_ready` |
+| Another validation of this lab has not finished | `409 validation_in_progress`; nothing is stored for this request |
+| More than 20 validations by this user in 60 seconds | `429 rate_limited`, with `Retry-After` |
+| The run could not be stored | `500 internal_error` |
+
+Validation never changes the lab, its parameters or its version, never runs setup again, and does not count as terminal activity. Repeating it creates a new run each time; a passed run is not progress, which comes in increment 09. Clients should not validate automatically or retry in a loop: the request is made when the student asks.
+
 ## Catalog
 
 Implemented in increment 06. Both routes require a session and return only published content: a mission is visible when it is `published` and listed in a `published` module, read at its current version. Content comes from `content/` through `linuxlab content sync` ([architecture.md](architecture.md#missions-and-versioning)). Neither route includes progress yet (increment 09).
@@ -245,32 +294,9 @@ When the user has an active lab (`provisioning`, `ready` or `terminating`) for t
 
 From increment 09, `explanation` and `solutions` are included once the user has completed the mission. This is enforced by the server.
 
-### `POST /api/labs/{id}/validate`
+### `POST /api/labs/{id}/validate` after completion
 
-```json
-{
-  "run_id": 8812,
-  "outcome": "failed",
-  "mission": {
-    "slug": "secure-deploy-script",
-    "version": 2,
-    "status": "in_progress",
-    "newly_completed": false
-  },
-  "result": {
-    "kind": "all",
-    "status": "failed",
-    "children": [
-      { "kind": "check", "id": "exists", "status": "passed", "message": "O arquivo existe." },
-      { "kind": "check", "id": "mode", "status": "failed", "message": "As permissões ainda não estão corretas." }
-    ]
-  }
-}
-```
-
-- `outcome` is `passed`, `failed` or `error`. `error` means the check itself could not run and does not count as an attempt.
-- Operator nodes have `kind` set to `all`, `any` or `not` and carry `children`. Leaves have `kind` set to `check`.
-- When the mission is completed, the response also includes `explanation`, `solutions` and `commands` (commands recorded in this lab).
+From increment 09 the response also carries the user's progress on the mission (`mission.status`, `mission.newly_completed`) and, once the mission is completed, `explanation` and `solutions`; from increment 12, the commands recorded in the lab.
 
 ## Terminal
 
