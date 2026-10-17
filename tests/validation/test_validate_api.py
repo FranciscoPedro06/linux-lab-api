@@ -6,6 +6,7 @@ The probe is answered by the stand-in in fake_probe.py; Docker tests
 
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -36,7 +37,6 @@ from tests.labs.lab_support import (
     ready_lab,
     run_async,
     user,
-    wait_for_call,
 )
 
 from .fake_probe import Entry, LabState, install
@@ -67,6 +67,14 @@ def runs(client: TestClient) -> list[Any]:
 
 def solved_state(token: str) -> LabState:
     return LabState({SCRIPT: Entry(mode=0o600, content=f"#!/bin/sh\nTOKEN={token}\n".encode())})
+
+
+def wait_for_new_call(client: TestClient, operation: str, since: int, seconds: float = 5) -> None:
+    """Wait for the runtime to be called for `operation` after the first `since` calls."""
+    deadline = time.monotonic() + seconds
+    while not any(name == operation for name, _ in fake_runtime(client).calls[since:]):
+        assert time.monotonic() < deadline, f"runtime never called {operation}"
+        time.sleep(0.01)
 
 
 def probe_calls(client: TestClient) -> list[Any]:
@@ -401,18 +409,21 @@ def test_validation_uses_the_pinned_version_after_a_new_one_is_published(
 def test_a_stored_version_that_cannot_be_read_is_an_invalid_spec_error(
     setup: tuple[TestClient, str, dict[str, Any]],
 ) -> None:
-    client, token, lab = setup
+    client = setup[0]
+    token = user(client, "bia@example.com")
+    # A version written outside the sync: provisioning still works, but its
+    # condition tree does not fit the schema.
+    sql(
+        client,
+        "INSERT INTO mission_versions (mission_id, version, content_hash, spec)"
+        " SELECT mission_id, 2, content_hash, jsonb_set(spec, '{validation}',"
+        ' \'{"id": "x", "type": "run_command"}\') FROM mission_versions v'
+        " JOIN missions m ON m.id = v.mission_id WHERE m.slug = 'sample-file'",
+    )
+    sql(client, "UPDATE missions SET current_version = 2 WHERE slug = 'sample-file'")
+    lab = ready_lab(client, token)
+    assert lab["mission"]["version"] == 2
     install(fake_runtime(client), LabState())
-    # Versions are immutable; the trigger is lifted only to simulate a corrupt row.
-    sql(client, "ALTER TABLE mission_versions DISABLE TRIGGER mission_versions_immutable")
-    try:
-        sql(
-            client,
-            "UPDATE mission_versions SET spec = jsonb_set(spec, '{validation}',"
-            ' \'{"id": "x", "type": "run_command"}\')',
-        )
-    finally:
-        sql(client, "ALTER TABLE mission_versions ENABLE TRIGGER mission_versions_immutable")
 
     response = validate(client, token, lab["id"])
 
@@ -457,8 +468,10 @@ def test_a_concurrent_validation_of_the_same_lab_is_refused(
     client, token, lab = setup
     install(fake_runtime(client), LabState())
     release = hold(client, "exec")
+    since = len(fake_runtime(client).calls)
     first = in_background(lambda: validate(client, token, lab["id"]))
-    wait_for_call(client, "exec")
+    # The first validation is waiting on its probe, so it holds the lab.
+    wait_for_new_call(client, "exec", since)
 
     second = validate(client, token, lab["id"])
 
@@ -499,9 +512,12 @@ def test_a_cancelled_validation_stores_nothing_and_releases_the_lab(
     release = hold(client, "exec")
 
     async def cancel_midway() -> bool:
+        since = len(fake_runtime(client).calls)
         task = asyncio.create_task(validations.validate(uuid.UUID(lab["id"]), None))
-        while not any(name == "exec" for name, _ in fake_runtime(client).calls):
-            await asyncio.sleep(0.01)
+        # Cancelled while its probe is in progress.
+        async with asyncio.timeout(5):
+            while not any(name == "exec" for name, _ in fake_runtime(client).calls[since:]):
+                await asyncio.sleep(0.01)
         task.cancel()
         try:
             await task
@@ -521,7 +537,8 @@ def test_validations_are_rate_limited_per_user(
     client, token, lab = setup
     install(fake_runtime(client), LabState())
     for _ in range(VALIDATE_ATTEMPTS):
-        assert validate(client, token, lab["id"]).status_code == 200
+        response = validate(client, token, lab["id"])
+        assert response.status_code == 200, response.text
 
     response = validate(client, token, lab["id"])
 
