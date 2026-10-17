@@ -140,6 +140,10 @@ Every check runs commands inside a real lab and asserts what was allowed, not wh
 | Setup as student: uid 1000, no capabilities, `NoNewPrivs` = 1; as root: writes only to home, `/tmp` and `/run/lab`, rootfs stays read-only | passed | passed |
 | Setup script not present in any writable directory afterwards; a background process started with `env -i` carries no `LAB_PARAM_` | passed | passed |
 | Setup failure and timeout end the lab and remove its container; another lab is unaffected | passed | passed |
+| `labctl probe`: `stat`, `read` and `processes` report the lab's state; command lines cut at 4 KiB; the probe's own processes left out | passed | passed |
+| `labctl probe` never reads through a symbolic link (final or on the way, including to a root-only file and to `/proc/1`); FIFOs and devices are not opened for reading; files over 64 KiB are refused | passed | passed |
+| `labctl probe` refuses invalid requests (version, unknown operation, non-canonical path, duplicates, over 51 facts or 64 KiB) with nothing on standard output; shell metacharacters in paths are inert; the student cannot run it; nothing is written and no process is left | passed | passed |
+| Validation through the API: the synthetic missions' solutions pass and the counterexample fails, a link to a root-only copy of the parameter fails, two labs are validated in isolation, a lab whose container died is refused | passed | passed |
 
 ## Known limitations
 
