@@ -49,8 +49,8 @@ def make_client() -> Iterator[AppFactory]:
         clients.append(client)
         sql(
             client,
-            "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, modules, missions,"
-            " mission_versions",
+            "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, user_missions, modules,"
+            " missions, mission_versions",
         )
         return client
 
