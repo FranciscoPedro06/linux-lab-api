@@ -9,6 +9,7 @@ from linuxlab.config import get_settings
 from linuxlab.content import models as content_models  # noqa: F401
 from linuxlab.db import Base, create_engine
 from linuxlab.labs import models as lab_models  # noqa: F401
+from linuxlab.validation import models as validation_models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
