@@ -40,8 +40,8 @@ General errors, shared by every route:
 | POST | `/api/auth/login` | Create session. Body: `email`, `password` |
 | POST | `/api/auth/logout` | End the user's active lab, then the session |
 | GET | `/api/auth/me` | Current user |
-| GET | `/api/modules` | Published modules with their published missions (the user's progress from increment 09) |
-| GET | `/api/missions/{slug}` | Mission detail: at the version of the user's active lab for this mission if there is one, otherwise at its current version |
+| GET | `/api/modules` | Published modules with their published missions and the user's progress on each |
+| GET | `/api/missions/{slug}` | Mission detail with the user's progress: at the version of the user's active lab for this mission if there is one, otherwise at its current version |
 | GET | `/api/labs/current` | The user's active lab, or `null` |
 | GET | `/api/labs` | The user's recent labs |
 | GET | `/api/labs/{id}` | One of the user's labs, in any state |
@@ -197,7 +197,9 @@ The body holds at most `answer`: a string of up to 1 KiB in UTF-8, compared by t
 {
   "run_id": 8812,
   "outcome": "failed",
+  "newly_completed": false,
   "mission": { "slug": "secure-deploy-script", "version": 2 },
+  "progress": { "status": "not_completed", "completed_version": null, "completed_at": null },
   "result": {
     "kind": "all",
     "status": "failed",
@@ -212,6 +214,7 @@ The body holds at most `answer`: a string of up to 1 KiB in UTF-8, compared by t
 
 - `outcome` is the status of the root: `passed` (the mission's conditions are met), `failed` (not yet) or `error` (the check itself could not run: the probe timed out or failed, the container stopped, or the pinned version cannot be read). `error` does not count as an attempt. Every outcome is stored in `validation_runs` and returned as `200`.
 - `mission` is the lab's pinned version, which a newer version or archiving the mission does not change.
+- `progress` is the user's progress on the mission once the run is stored ([Progress](#progress)), and `newly_completed` is `true` only for the validation that recorded the user's first completion of the mission. Only a `passed` run can record it, at the lab's pinned version, with the run's end time as `completed_at`; later passes, on this lab or another, on this version or another, return `false` and leave the completion as it is. `failed` and `error` never record or remove a completion.
 - Operator nodes have `kind` set to `all`, `any` or `not`, a `message` (their `fail_message` when they failed, otherwise `null`, or the error message) and `children`. Leaves have `kind` set to `check`, their `id`, `status` and `message`.
 - Messages come from the mission or are fixed defaults (`Condição atendida.`, `Condição ainda não atendida.`, `Envie uma resposta para verificar esta condição.`, `Não foi possível verificar esta condição.`). They never carry expected or observed values, file contents or parameters.
 - `result` is `null` only when the pinned version cannot be read.
@@ -224,13 +227,15 @@ The body holds at most `answer`: a string of up to 1 KiB in UTF-8, compared by t
 | The lab is not `ready` (provisioning, ending, ended), was created before missions, or its container is gone (the lab is then ended) | `409 lab_not_ready` |
 | Another validation of this lab has not finished | `409 validation_in_progress`; nothing is stored for this request |
 | More than 20 validations by this user in 60 seconds | `429 rate_limited`, with `Retry-After` |
-| The run could not be stored | `500 internal_error` |
+| The run or the completion could not be stored | `500 internal_error`; neither is stored |
 
-Validation never changes the lab, its parameters or its version, never runs setup again, and does not count as terminal activity. Repeating it creates a new run each time; a passed run is not progress, which comes in increment 09. Clients should not validate automatically or retry in a loop: the request is made when the student asks.
+Validation never changes the lab, its parameters or its version, never runs setup again, and does not count as terminal activity. Repeating it creates a new run each time, and the first passed run records the completion. Clients should not validate automatically or retry in a loop: the request is made when the student asks.
+
+The run and the completion are committed in one transaction. A response lost after that commit (a dropped connection) does not undo it: a client that did not get the response should read the progress again from the catalog rather than assume nothing was stored. Validating again then returns `newly_completed: false`.
 
 ## Catalog
 
-Implemented in increment 06. Both routes require a session and return only published content: a mission is visible when it is `published` and listed in a `published` module, read at its current version. Content comes from `content/` through `linuxlab content sync` ([architecture.md](architecture.md#missions-and-versioning)). Neither route includes progress yet (increment 09).
+Implemented in increment 06, with the user's progress since increment 09. Both routes require a session and return only published content: a mission is visible when it is `published` and listed in a `published` module, read at its current version. Content comes from `content/` through `linuxlab content sync` ([architecture.md](architecture.md#missions-and-versioning)). Each mission carries the progress of the user making the request, and never anyone else's.
 
 Mission card, as listed in a module:
 
@@ -243,11 +248,13 @@ Mission card, as listed in a module:
   "estimated_minutes": 5,
   "tags": ["permissions", "chmod"],
   "version": 2,
-  "requires_answer": false
+  "requires_answer": false,
+  "progress": { "status": "completed", "completed_version": 1, "completed_at": "2026-10-17T14:03:12Z" }
 }
 ```
 
 - `version`: the mission's current version.
+- `progress`: the user's progress on the mission ([Progress](#progress)). Here it was completed on version 1, before version 2 was published, and it stays completed.
 - `requires_answer`: validation expects the `answer` field, because the mission's conditions include an `answer` condition. Derived from the stored specification; nothing is evaluated.
 
 Setup, parameters, conditions, solutions, counterexamples and the explanation are never returned.
@@ -275,6 +282,7 @@ The mission card plus:
 
 ```json
 {
+  "current_version": 2,
   "module": { "slug": "fundamentals", "title": "Fundamentos" },
   "briefing": "# Proteja o script de deploy\n\n...",
   "objectives": ["`~/deploy.sh` continua existindo, com o conteúdo original."],
@@ -288,15 +296,29 @@ A mission that does not exist, is `draft` or `archived`, or is listed in a modul
 
 When the user has an active lab (`provisioning`, `ready` or `terminating`) for this mission, the detail is read at the lab's pinned version, so it matches the lab even after a newer version is published. This holds even if the mission was archived meanwhile: its owner can still read it while that lab is active. `version` is then the lab's version. Nobody else sees an archived mission, and the owner no longer does once the lab ends.
 
+`current_version` is always the mission's current version in the catalog, so a client compares `progress.completed_version` with it, not with `version`, which can be an older lab's version.
+
+## Progress
+
+Implemented in increment 09. The same object appears in each mission card, in the mission detail and in the validation response, always for the user making the request:
+
+```json
+{ "status": "completed", "completed_version": 1, "completed_at": "2026-10-17T14:03:12Z" }
+```
+
+```json
+{ "status": "not_completed", "completed_version": null, "completed_at": null }
+```
+
+- `status` is `completed` when a completion is recorded for the user and the mission, and `not_completed` otherwise. `not_completed` does not mean the mission was never started; labs record that.
+- `completed_version` is the version the mission was first completed on, and `completed_at` when. Both are fixed by the first completion and never change.
+- A newer version of the mission does not undo a completion and does not ask for a new one: `status` stays `completed` whatever `completed_version` is compared with the current version. A change that alters what a mission asks for gets a new slug ([architecture.md](architecture.md#missions-and-versioning)).
+
+There is no route to read or change another user's progress, nor a route that takes a user id: progress is read from the session and recorded only by the validation of a lab the user owns.
+
 ## Missions (planned)
 
-### `GET /api/missions/{slug}` after completion
-
-From increment 09, `explanation` and `solutions` are included once the user has completed the mission. This is enforced by the server.
-
-### `POST /api/labs/{id}/validate` after completion
-
-From increment 09 the response also carries the user's progress on the mission (`mission.status`, `mission.newly_completed`) and, once the mission is completed, `explanation` and `solutions`; from increment 12, the commands recorded in the lab.
+Releasing `explanation` and `solutions` to a user who completed the mission, in `GET /api/missions/{slug}` and in the validation response, is a candidate for increment 14, after the closed beta deployment (13). Until then the server never returns them. From increment 12 the validation response also carries the commands recorded in the lab.
 
 ## Terminal
 
