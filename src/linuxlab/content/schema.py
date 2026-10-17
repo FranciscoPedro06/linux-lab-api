@@ -8,7 +8,7 @@ that uses them. The one thing compiled is each RE2 pattern, to check its syntax
 """
 
 import re
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -340,6 +340,46 @@ def _strings(value: Any) -> Iterator[str]:
             yield from _strings(item)
 
 
+def check_condition_tree(validation: BaseModel, params: Collection[str]) -> None:
+    """Rules that span a whole condition tree, given the declared parameter names.
+
+    Checked by the sync, and again when validation reads a stored version.
+    """
+    leaves = list(checks(validation))
+    if len(leaves) > MAX_CONDITIONS:
+        raise ValueError(f"validation: more than {MAX_CONDITIONS} conditions")
+    if depth(validation) > MAX_CONDITION_DEPTH:
+        raise ValueError(f"validation: nested deeper than {MAX_CONDITION_DEPTH} levels")
+    content_paths = {leaf.path for leaf in leaves if isinstance(leaf, FileContent)}
+    if len(content_paths) > MAX_CONTENT_PATHS:
+        raise ValueError(
+            f"validation: file_content reads more than {MAX_CONTENT_PATHS} different paths"
+        )
+    ids = [leaf.id for leaf in leaves]
+    repeated = sorted({leaf_id for leaf_id in ids if ids.count(leaf_id) > 1})
+    if repeated:
+        raise ValueError(f"validation: condition id used more than once: {repeated[0]}")
+    for leaf in leaves:
+        if isinstance(leaf, Answer) and leaf.equals_param not in (None, *params):
+            raise ValueError(
+                f"validation: condition {leaf.id}: unknown parameter {leaf.equals_param}"
+            )
+    for text in _strings(validation.model_dump(by_alias=True)):
+        _check_placeholders(text, params)
+
+
+def _check_placeholders(text: str, params: Collection[str]) -> None:
+    """`{{ name }}` is a plain lookup of a declared parameter; nothing else is allowed."""
+    if "{{" not in text and "}}" not in text:
+        return
+    rest = PLACEHOLDER.sub("", text)
+    if "{{" in rest or "}}" in rest:
+        raise ValueError("validation: malformed {{ }} placeholder")
+    for name in PLACEHOLDER.findall(text):
+        if name not in params:
+            raise ValueError(f"validation: unknown parameter in placeholder: {name}")
+
+
 # Parameters
 
 
@@ -434,38 +474,7 @@ class MissionFile(_Strict):
         return self
 
     def _check_conditions(self) -> None:
-        leaves = list(checks(self.validation))
-        if len(leaves) > MAX_CONDITIONS:
-            raise ValueError(f"validation: more than {MAX_CONDITIONS} conditions")
-        if depth(self.validation) > MAX_CONDITION_DEPTH:
-            raise ValueError(f"validation: nested deeper than {MAX_CONDITION_DEPTH} levels")
-        content_paths = {leaf.path for leaf in leaves if isinstance(leaf, FileContent)}
-        if len(content_paths) > MAX_CONTENT_PATHS:
-            raise ValueError(
-                f"validation: file_content reads more than {MAX_CONTENT_PATHS} different paths"
-            )
-        ids = [leaf.id for leaf in leaves]
-        repeated = sorted({leaf_id for leaf_id in ids if ids.count(leaf_id) > 1})
-        if repeated:
-            raise ValueError(f"validation: condition id used more than once: {repeated[0]}")
-        for leaf in leaves:
-            if isinstance(leaf, Answer) and leaf.equals_param not in (None, *self.params):
-                raise ValueError(
-                    f"validation: condition {leaf.id}: unknown parameter {leaf.equals_param}"
-                )
-        for text in _strings(self.validation.model_dump(by_alias=True)):
-            self._check_placeholders(text)
-
-    def _check_placeholders(self, text: str) -> None:
-        """`{{ name }}` is a plain lookup of a declared parameter; nothing else is allowed."""
-        if "{{" not in text and "}}" not in text:
-            return
-        rest = PLACEHOLDER.sub("", text)
-        if "{{" in rest or "}}" in rest:
-            raise ValueError("validation: malformed {{ }} placeholder")
-        for name in PLACEHOLDER.findall(text):
-            if name not in self.params:
-                raise ValueError(f"validation: unknown parameter in placeholder: {name}")
+        check_condition_tree(self.validation, self.params)
 
     def has_answer(self) -> bool:
         return any(isinstance(leaf, Answer) for leaf in checks(self.validation))
