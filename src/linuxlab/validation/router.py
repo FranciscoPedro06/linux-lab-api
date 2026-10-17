@@ -3,7 +3,8 @@
 The client sends at most an answer. The mission version, the conditions, paths,
 patterns, the probe and every limit come from the lab's pinned version and the
 server. The response carries a status and a message per condition: messages come
-from the mission or are fixed defaults, never from the lab's state.
+from the mission or are fixed defaults, never from the lab's state. It also carries
+the lab owner's progress on the mission and whether this run completed it.
 """
 
 import math
@@ -16,6 +17,7 @@ from linuxlab.api import ApiError, api_router
 from linuxlab.auth.ratelimit import RateLimiter
 from linuxlab.auth.router import CurrentUser, Database
 from linuxlab.labs.access import owned_lab
+from linuxlab.progress.service import Progress
 from linuxlab.validation.evaluate import Node
 from linuxlab.validation.models import Outcome
 from linuxlab.validation.service import LabNotReadyError, ValidationInProgressError, Validations
@@ -66,7 +68,12 @@ class ValidationMission(BaseModel):
 class ValidationResponse(BaseModel):
     run_id: int
     outcome: Outcome
+    # Whether this validation recorded the user's first completion of the mission.
+    newly_completed: bool
+    # The lab's pinned mission version, which the run was checked against.
     mission: ValidationMission
+    # The user's progress on the mission, across versions, after this run.
+    progress: Progress
     result: CheckResult | OperatorResult | None
 
 
@@ -119,6 +126,8 @@ async def validate_lab(
     return ValidationResponse(
         run_id=run.id,
         outcome=run.outcome,
+        newly_completed=run.newly_completed,
         mission=ValidationMission(slug=run.mission_slug, version=run.mission_version),
+        progress=run.progress,
         result=public_result(run.result) if run.result else None,
     )
