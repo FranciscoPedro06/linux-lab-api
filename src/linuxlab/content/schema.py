@@ -1,8 +1,9 @@
 """Schema of module and mission files. See docs/missions.md.
 
-The models check structure only. Nothing in a mission is executed or compiled here:
-setup scripts, conditions and parameters are validated as data and stored for the
-increments that use them. Models are strict: values are never coerced (an unquoted
+The models check structure only. Nothing in a mission is executed here: setup
+scripts, conditions and parameters are validated as data and stored for the code
+that uses them. The one thing compiled is each RE2 pattern, to check its syntax
+(linuxlab.content.regex). Models are strict: values are never coerced (an unquoted
 `mode: 700` is an integer and is refused), and unknown fields are rejected.
 """
 
@@ -21,10 +22,15 @@ from pydantic import (
     model_validator,
 )
 
+from linuxlab.content.regex import MAX_PATTERN_LENGTH, PLACEHOLDER, PatternError, check_syntax
+
 SCHEMA_VERSION = 1
 
 MAX_CONDITIONS = 50
 MAX_CONDITION_DEPTH = 5
+# Each file_content path is read whole (up to 64 KiB) by labctl probe; this bounds
+# what one validation reads. Paths are counted as written, placeholders included.
+MAX_CONTENT_PATHS = 8
 
 Status = Literal["draft", "published", "archived"]
 
@@ -41,8 +47,6 @@ ParamValue = Annotated[str, Field(pattern=rf"^{PARAM_VALUE.pattern}$")]
 ImageAlias = Literal["base"]
 AccountName = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_-]{0,31}$")]
 Mode = Annotated[str, Field(pattern=r"^[0-7]{4}$")]
-
-PLACEHOLDER = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
 
 
 def _not_blank(value: str) -> str:
@@ -70,8 +74,29 @@ def _schema_version(value: Any) -> Any:
 
 
 def _container_path(value: str) -> str:
-    if not value.startswith("/") or "\x00" in value:
+    """An absolute path in canonical form. labctl probe resolves it one component at a
+    time and never normalizes it, so `.`, `..`, empty components (`//`, a trailing
+    slash) and backslashes are refused rather than interpreted."""
+    if not value.startswith("/") or "\x00" in value or "\\" in value:
         raise ValueError("must be an absolute path inside the lab")
+    if any(part in ("", ".", "..") for part in value[1:].split("/")):
+        raise ValueError("must not contain empty, '.' or '..' components")
+    return value
+
+
+def _no_placeholder(value: str) -> str:
+    # Messages are shown to the student as written: a parameter in one would give its
+    # value away.
+    if "{{" in value or "}}" in value:
+        raise ValueError("messages cannot contain {{ }} placeholders")
+    return value
+
+
+def _re2_syntax(value: str) -> str:
+    try:
+        check_syntax(value)
+    except PatternError as error:
+        raise ValueError(str(error)) from None
     return value
 
 
@@ -79,6 +104,13 @@ SchemaVersion = Annotated[Literal[1], BeforeValidator(_schema_version)]
 Text = Annotated[str, AfterValidator(_not_blank)]
 FilePath = Annotated[str, Field(max_length=255), AfterValidator(_relative_path)]
 ContainerPath = Annotated[str, Field(max_length=4096), AfterValidator(_container_path)]
+Message = Annotated[str, AfterValidator(_not_blank), AfterValidator(_no_placeholder)]
+Pattern = Annotated[
+    str,
+    Field(max_length=MAX_PATTERN_LENGTH),
+    AfterValidator(_not_blank),
+    AfterValidator(_re2_syntax),
+]
 
 
 class _Strict(BaseModel):
@@ -115,8 +147,8 @@ class ModuleFile(_Strict):
 
 class _Condition(_Strict):
     id: Slug
-    fail_message: Text | None = None
-    pass_message: Text | None = None
+    fail_message: Message | None = None
+    pass_message: Message | None = None
 
 
 class FileExists(_Condition):
@@ -142,8 +174,8 @@ class FileContent(_Condition):
     equals: str | None = None
     contains: Text | None = None
     not_contains: Text | None = None
-    # RE2 syntax. Compiled by the validation engine, not here.
-    regex: Text | None = None
+    # RE2 syntax, compiled here only to check it (linuxlab.content.regex).
+    regex: Pattern | None = None
     trim: bool = True
 
     @model_validator(mode="after")
@@ -172,7 +204,7 @@ class FileGroup(_Condition):
 
 class ProcessMatch(_Strict):
     comm: Text | None = None
-    args_regex: Text | None = None
+    args_regex: Pattern | None = None
 
     @model_validator(mode="after")
     def _one_match(self) -> Self:
@@ -225,19 +257,19 @@ Check = Annotated[
 
 class AllOf(_Strict):
     all: list["Condition"] = Field(min_length=1)
-    fail_message: Text | None = None
+    fail_message: Message | None = None
 
 
 class AnyOf(_Strict):
     any: list["Condition"] = Field(min_length=1)
-    fail_message: Text | None = None
+    fail_message: Message | None = None
 
 
 class NotOf(_Strict):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True, populate_by_name=True)
 
     not_: "Condition" = Field(alias="not")
-    fail_message: Text
+    fail_message: Message
 
 
 OPERATORS = ("all", "any", "not")
@@ -407,6 +439,11 @@ class MissionFile(_Strict):
             raise ValueError(f"validation: more than {MAX_CONDITIONS} conditions")
         if depth(self.validation) > MAX_CONDITION_DEPTH:
             raise ValueError(f"validation: nested deeper than {MAX_CONDITION_DEPTH} levels")
+        content_paths = {leaf.path for leaf in leaves if isinstance(leaf, FileContent)}
+        if len(content_paths) > MAX_CONTENT_PATHS:
+            raise ValueError(
+                f"validation: file_content reads more than {MAX_CONTENT_PATHS} different paths"
+            )
         ids = [leaf.id for leaf in leaves]
         repeated = sorted({leaf_id for leaf_id in ids if ids.count(leaf_id) > 1})
         if repeated:
