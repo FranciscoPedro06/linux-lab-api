@@ -5,12 +5,15 @@
    resolve it with the lab's parameters, in memory.
 3. Check that the container runs, then collect every fact with one `labctl probe`
    (none when every condition is an answer).
-4. Evaluate the tree and insert the run, final, in validation_runs.
+4. Evaluate the tree and, in one transaction, insert the run, final, in
+   validation_runs and, if it passed, the user's first completion of the mission in
+   user_missions, with the lab's owner, mission and pinned version.
 
 Validation reads only: it never runs setup again and changes nothing in the lab, its
 parameters or its version. PostgreSQL and Docker share no transaction; nothing is
 written before the result is known, so a validation interrupted midway (a cancelled
-request, a crash) leaves no row rather than a partial one.
+request, a crash) leaves no row rather than a partial one. The run and the
+completion are committed together or not at all.
 
 At most one validation runs per lab at a time, tracked in memory in this API
 process. Like the terminal registry, this assumes a single process and has to move
@@ -31,6 +34,7 @@ from linuxlab.content.stored import InvalidSpecError, validation_spec
 from linuxlab.labs.lifecycle import LabGoneError, Labs, utcnow
 from linuxlab.labs.models import LabStatus
 from linuxlab.labs.runtime import LabRuntime, LabRuntimeError
+from linuxlab.progress.service import Progress, progress_of, record_completion
 from linuxlab.validation.evaluate import Node, evaluate, to_record
 from linuxlab.validation.models import ErrorCode, Outcome, ValidationRun
 from linuxlab.validation.plan import Plan, plan
@@ -55,6 +59,10 @@ class Run:
     mission_version: int
     # None only when the pinned version could not be read (invalid_spec).
     result: Node | None
+    # The user's progress on the mission once the run is stored, and whether this run
+    # recorded the first completion.
+    progress: Progress
+    newly_completed: bool
 
 
 class Validations:
@@ -158,13 +166,21 @@ class Validations:
                 finished_at=utcnow(),
             )
             db.add(run)
+            await db.flush()
+            # Only a pass completes the mission, at the lab's pinned version; failed
+            # and error leave progress as it is.
+            newly_completed = outcome == Outcome.PASSED and await record_completion(
+                db, lab.user_id, mission_id, version, run.finished_at
+            )
+            progress = await progress_of(db, lab.user_id, mission_id)
             await db.commit()
         logger.info(
-            "lab validated: lab=%s run=%s outcome=%s error=%s",
+            "lab validated: lab=%s run=%s outcome=%s error=%s newly_completed=%s",
             lab_id,
             run.id,
             outcome,
             error_code,
+            newly_completed,
         )
         return Run(
             id=run.id,
@@ -172,4 +188,6 @@ class Validations:
             mission_slug=slug,
             mission_version=version,
             result=result,
+            progress=progress,
+            newly_completed=newly_completed,
         )
