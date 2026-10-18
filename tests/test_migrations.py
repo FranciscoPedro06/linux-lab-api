@@ -18,6 +18,8 @@ pytestmark = pytest.mark.integration
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 # The last revision of increment 08, before user_missions.
 BEFORE_PROGRESS = "c4e1a7b39d52"
+# The last revision of increment 09, before previous_lab_id.
+BEFORE_REPLACEMENT = "7d3f2a91c6e8"
 
 
 def tables() -> set[str]:
@@ -116,6 +118,73 @@ def test_progress_starts_empty_on_a_migrated_database() -> None:
         assert "user_missions" not in tables()
         command.upgrade(config, "head")
         assert execute("SELECT count(*) FROM user_missions") == [(0,)]
+    finally:
+        command.downgrade(config, "base")
+        command.upgrade(config, "head")
+
+
+def test_downgrading_replacement_keeps_labs_and_their_reasons_valid() -> None:
+    """Going back to increment 09 drops the link between labs and records replaced labs
+    as ended by their user, the reason closest to theirs that the schema knows."""
+    config = Config(str(ALEMBIC_INI))
+    command.upgrade(config, "head")
+    user_id, first, second, third = (uuid.uuid4() for _ in range(4))
+    execute(
+        "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, user_missions, modules,"
+        " missions, mission_versions",
+        "INSERT INTO users (id, email, password_hash, display_name)"
+        " VALUES (:user, 'ana@example.com', '$argon2id$synthetic', 'Ana')",
+        "INSERT INTO lab_sessions (id, user_id, status, end_reason, created_at,"
+        " last_activity_at, expires_at, ended_at)"
+        " VALUES (:first, :user, 'terminated', 'reset', now(), now(),"
+        " now() + interval '2 hours', now())",
+        "INSERT INTO lab_sessions (id, user_id, status, end_reason, created_at,"
+        " last_activity_at, expires_at, ended_at, previous_lab_id)"
+        " VALUES (:second, :user, 'terminated', 'mission_switch', now(), now(),"
+        " now() + interval '2 hours', now(), :first)",
+        "INSERT INTO lab_sessions (id, user_id, status, created_at, last_activity_at,"
+        " expires_at, previous_lab_id)"
+        " VALUES (:third, :user, 'ready', now(), now(), now() + interval '2 hours', :second)",
+        user=user_id,
+        first=first,
+        second=second,
+        third=third,
+    )
+
+    try:
+        command.downgrade(config, BEFORE_REPLACEMENT)
+
+        assert set(execute("SELECT id, end_reason FROM lab_sessions")) == {
+            (first, "user"),
+            (second, "user"),
+            (third, None),
+        }
+        columns = execute(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_name = 'lab_sessions' AND column_name = 'previous_lab_id'"
+        )
+        assert columns == []
+        # The guard of increment 09 is back, still attached, and still enforced.
+        assert execute("SELECT count(*) FROM pg_trigger WHERE tgname = 'lab_sessions_guard'") == [
+            (1,)
+        ]
+        assert execute("SELECT count(*) FROM pg_proc WHERE proname = 'lab_sessions_guard'") == [
+            (1,)
+        ]
+        with pytest.raises(Exception, match="end reason cannot change"):
+            execute("UPDATE lab_sessions SET end_reason = 'oom' WHERE id = :id", id=first)
+        with pytest.raises(Exception, match="ck_lab_sessions_end_reason"):
+            execute(
+                "INSERT INTO lab_sessions (id, user_id, status, end_reason, created_at,"
+                " last_activity_at, expires_at, ended_at)"
+                " VALUES (:id, :user, 'terminated', 'reset', now(), now(),"
+                " now() + interval '2 hours', now())",
+                id=uuid.uuid4(),
+                user=user_id,
+            )
+
+        command.upgrade(config, "head")
+        assert execute("SELECT count(*) FROM lab_sessions WHERE previous_lab_id IS NULL") == [(3,)]
     finally:
         command.downgrade(config, "base")
         command.upgrade(config, "head")
