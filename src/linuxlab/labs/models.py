@@ -19,6 +19,10 @@ A lab is created for one version of a mission, with the parameters generated for
 Both are fixed at creation: the trigger also refuses changing the mission, the
 version or the parameters, and the version itself is immutable. Labs created before
 missions existed have none of the three.
+
+A lab created to replace another (reset or mission switch, see lifecycle.py) names it
+in previous_lab_id: a lab of the same user, which has at most one successor. The link
+is set at creation and never changes either.
 """
 
 import enum
@@ -75,6 +79,12 @@ class EndReason(enum.StrEnum):
     CONTAINER_LOST = "container_lost"  # the container stopped or disappeared otherwise
     PROVISIONING_FAILED = "provisioning_failed"
     PROVISIONING_TIMEOUT = "provisioning_timeout"
+    RESET = "reset"  # replaced by a new lab for the same mission
+    MISSION_SWITCH = "mission_switch"  # replaced by a new lab for another mission
+
+
+# The reasons of a lab ended to be replaced.
+REPLACEMENT_REASONS = frozenset({EndReason.RESET, EndReason.MISSION_SWITCH})
 
 
 def _sql_list(values: frozenset[LabStatus] | type[enum.StrEnum]) -> str:
@@ -120,6 +130,22 @@ class LabSession(Base):
         Index("ix_lab_sessions_user_id_created_at", "user_id", "created_at"),
         # Target of validation_runs' foreign key, which ties each run to its lab's
         # pinned version. The id alone is already unique.
+        # The previous lab, if any, is one of the same user's labs, other than this one,
+        # and is replaced at most once.
+        ForeignKeyConstraint(
+            ["previous_lab_id", "user_id"], ["lab_sessions.id", "lab_sessions.user_id"]
+        ),
+        CheckConstraint(
+            "previous_lab_id IS NULL OR previous_lab_id <> id", name="not_its_own_previous"
+        ),
+        Index(
+            "one_successor_per_lab",
+            "previous_lab_id",
+            unique=True,
+            postgresql_where=text("previous_lab_id IS NOT NULL"),
+        ),
+        # Target of the foreign key above. The id alone is already unique.
+        UniqueConstraint("id", "user_id", name="uq_lab_sessions_id_user_id"),
         UniqueConstraint(
             "id",
             "mission_id",
@@ -146,6 +172,8 @@ class LabSession(Base):
     # Parameter name -> generated value, all strings. Secret: never sent to the client
     # or written to a log.
     params: Mapped[dict[str, str] | None] = mapped_column(JSONB)
+    # The lab this one replaced, for a reset or a mission switch; None otherwise.
+    previous_lab_id: Mapped[uuid.UUID | None] = mapped_column()
 
     @property
     def lab_key(self) -> str:

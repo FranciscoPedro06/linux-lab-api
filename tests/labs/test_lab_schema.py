@@ -284,3 +284,108 @@ def test_a_mission_with_labs_cannot_lose_its_versions(client: TestClient) -> Non
 
     with pytest.raises(DBAPIError):
         sql(client, "DELETE FROM mission_versions WHERE mission_id = :id", id=mission_id)
+
+
+# Replacement: previous_lab_id
+
+
+def add_successor(
+    client: TestClient, user_id: uuid.UUID, previous: uuid.UUID, lab_id: uuid.UUID | None = None
+) -> uuid.UUID:
+    lab_id = lab_id or uuid.uuid4()
+    sql(
+        client,
+        "INSERT INTO lab_sessions"
+        " (id, user_id, status, created_at, last_activity_at, expires_at, previous_lab_id)"
+        " VALUES (:id, :user_id, 'provisioning', now(), now(), now() + interval '2 hours',"
+        " :previous)",
+        id=lab_id,
+        user_id=user_id,
+        previous=previous,
+    )
+    return lab_id
+
+
+@pytest.mark.parametrize("reason", ["reset", "mission_switch"])
+def test_a_replaced_lab_records_why(client: TestClient, reason: str) -> None:
+    lab_id = add_lab(client, add_user(client), "terminated", reason, ended=True)
+
+    assert sql(client, "SELECT end_reason FROM lab_sessions WHERE id = :id", id=lab_id) == [
+        (reason,)
+    ]
+
+
+def test_a_successor_names_a_lab_of_the_same_user(client: TestClient) -> None:
+    ana = add_user(client, "ana@example.com")
+    bia = add_user(client, "bia@example.com")
+    previous = add_lab_in(client, ana, LabStatus.TERMINATED)
+    anas_other = add_lab_in(client, ana, LabStatus.TERMINATED)
+
+    lab_id = add_successor(client, ana, previous)
+    assert sql(client, "SELECT previous_lab_id FROM lab_sessions WHERE id = :id", id=lab_id) == [
+        (previous,)
+    ]
+
+    with pytest.raises(IntegrityError, match="fk_lab_sessions_previous_lab_id_lab_sessions"):
+        add_successor(client, bia, anas_other)
+    with pytest.raises(IntegrityError, match="fk_lab_sessions_previous_lab_id_lab_sessions"):
+        add_successor(client, bia, uuid.uuid4())
+
+
+def test_a_lab_is_not_its_own_previous_lab(client: TestClient) -> None:
+    user_id = add_user(client)
+    lab_id = uuid.uuid4()
+
+    with pytest.raises(IntegrityError, match="ck_lab_sessions_not_its_own_previous"):
+        add_successor(client, user_id, lab_id, lab_id=lab_id)
+
+
+def test_a_lab_has_at_most_one_successor(client: TestClient) -> None:
+    user_id = add_user(client)
+    previous = add_lab_in(client, user_id, LabStatus.TERMINATED)
+    first = add_successor(client, user_id, previous)
+    set_status(client, first, "failed")
+    set_status(client, first, "terminated")
+
+    # Even with the first successor ended, and the user free to start another lab.
+    with pytest.raises(IntegrityError, match="one_successor_per_lab"):
+        add_successor(client, user_id, previous)
+    add_lab(client, user_id)
+
+
+@pytest.mark.parametrize("change", ["previous_lab_id = NULL", "previous_lab_id = :other"])
+def test_previous_lab_never_changes(client: TestClient, change: str) -> None:
+    user_id = add_user(client)
+    previous = add_lab_in(client, user_id, LabStatus.TERMINATED)
+    other = add_lab_in(client, user_id, LabStatus.TERMINATED)
+    lab_id = add_successor(client, user_id, previous)
+
+    with pytest.raises(DBAPIError, match="previous lab cannot change"):
+        sql(client, f"UPDATE lab_sessions SET {change} WHERE id = :id", id=lab_id, other=other)
+
+
+def test_a_lab_created_normally_cannot_gain_a_previous_lab(client: TestClient) -> None:
+    user_id = add_user(client)
+    previous = add_lab_in(client, user_id, LabStatus.TERMINATED)
+    lab_id = add_lab(client, user_id)
+
+    with pytest.raises(DBAPIError, match="previous lab cannot change"):
+        sql(
+            client,
+            "UPDATE lab_sessions SET previous_lab_id = :previous WHERE id = :id",
+            id=lab_id,
+            previous=previous,
+        )
+
+
+def test_deleting_a_user_deletes_their_chain_of_labs(client: TestClient) -> None:
+    user_id = add_user(client)
+    first = add_lab_in(client, user_id, LabStatus.TERMINATED)
+    second = add_successor(client, user_id, first)
+    set_status(client, second, "failed")
+    set_status(client, second, "terminated")
+    add_successor(client, user_id, second)
+
+    sql(client, "DELETE FROM users WHERE id = :id", id=user_id)
+
+    assert sql(client, "SELECT count(*) FROM lab_sessions") == [(0,)]
