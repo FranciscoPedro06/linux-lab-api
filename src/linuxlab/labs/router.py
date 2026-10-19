@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from linuxlab.api import ApiError, api_router
 from linuxlab.auth.ratelimit import RateLimiter
-from linuxlab.auth.router import CurrentUser, Database
+from linuxlab.auth.router import CurrentSession, CurrentUser, Database, not_authenticated
 from linuxlab.content.models import Mission, MissionVersion
 from linuxlab.content.schema import SLUG
 from linuxlab.labs.access import owned_lab
@@ -30,6 +30,7 @@ from linuxlab.labs.lifecycle import (
     MissionSpecError,
     NotCurrentError,
     PreviousLabNotRemovedError,
+    SessionEndedError,
 )
 from linuxlab.labs.models import EndReason, LabSession, LabStatus
 
@@ -201,14 +202,23 @@ async def get_lab(lab_id: str, user: CurrentUser, db: Database) -> PublicLab:
 
 @router.post("", status_code=201)
 async def create_lab(
-    body: CreateLabRequest, request: Request, response: Response, user: CurrentUser, db: Database
+    body: CreateLabRequest,
+    request: Request,
+    response: Response,
+    auth: CurrentSession,
+    db: Database,
 ) -> PublicLab:
+    user = auth.user
     _admit_creation(request, user.id)
     if not SLUG.fullmatch(body.mission_slug):
         raise _mission_not_found()
 
     try:
-        creation = await _labs(request).create(user.id, body.mission_slug)
+        creation = await _labs(request).create(
+            user.id, body.mission_slug, session_id=auth.session.id
+        )
+    except SessionEndedError:
+        raise not_authenticated() from None
     except MissionNotFoundError:
         raise _mission_not_found() from None
     except DifferentMissionError:
@@ -245,7 +255,7 @@ async def replace_lab(
     body: ReplaceLabRequest,
     request: Request,
     response: Response,
-    user: CurrentUser,
+    auth: CurrentSession,
     db: Database,
 ) -> PublicLab:
     """Reset the lab (same mission) or switch it to another mission. See
@@ -255,10 +265,10 @@ async def replace_lab(
     already created its lab returns that lab without counting against the rate limit.
     Only a replacement that is about to end a lab and create another is counted.
     """
-    lab = await owned_lab(db, user.id, lab_id)
+    lab = await owned_lab(db, auth.user.id, lab_id)
     if lab is None:
         raise _not_found()
-    owned_id, user_id = lab.id, user.id
+    owned_id, user_id, session_id = lab.id, auth.user.id, auth.session.id
     # No transaction stays open while the lab is replaced.
     await db.rollback()
     if not SLUG.fullmatch(body.mission_slug):
@@ -266,8 +276,14 @@ async def replace_lab(
 
     try:
         creation = await _labs(request).replace(
-            owned_id, body.mission_slug, admit=lambda: _admit_creation(request, user_id)
+            owned_id,
+            body.mission_slug,
+            session_id=session_id,
+            admit=lambda: _admit_creation(request, user_id),
         )
+    except SessionEndedError:
+        # Logged out meanwhile; the lab may have been ended already.
+        raise not_authenticated() from None
     except NotCurrentError:
         raise _not_current() from None
     except MissionNotFoundError:

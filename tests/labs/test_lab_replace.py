@@ -111,9 +111,9 @@ def patch_before_successor(
     service = labs(client)
     original = service._create_successor
 
-    async def first_the_action(source: LabSession, target: Target) -> Any:
+    async def first_the_action(source: LabSession, target: Target, session_id: int) -> Any:
         await action(service)
-        return await original(source, target)
+        return await original(source, target, session_id)
 
     monkeypatch.setattr(service, "_create_successor", first_the_action)
 
@@ -416,7 +416,7 @@ def test_capacity_taken_after_the_check_leaves_no_lab(
     bia_id = user_id(client, "bia@example.com")
 
     async def bia_starts_a_lab(service: Labs) -> None:
-        await service.create(bia_id, OTHER)
+        await service.create(bia_id, OTHER, session_id=None)
 
     patch_before_successor(client, monkeypatch, bia_starts_a_lab)
     response = replace_lab(client, ana, lab["id"])
@@ -679,7 +679,7 @@ def test_a_lab_started_meanwhile_is_not_replaced(
     ana_id = user_id(client, "ana@example.com")
 
     async def another_tab_starts_a_lab(service: Labs) -> None:
-        await service.create(ana_id, OTHER)
+        await service.create(ana_id, OTHER, session_id=None)
 
     patch_before_successor(client, monkeypatch, another_tab_starts_a_lab)
     response = replace_lab(client, ana, first["id"])

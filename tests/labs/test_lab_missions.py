@@ -616,7 +616,7 @@ def test_interrupted_provisioning_is_failed_by_the_reaper_without_setup_again(
     user_id = sql(client, "SELECT id FROM users")[0][0]
 
     async def cancel_during_setup() -> None:
-        task = asyncio.create_task(labs(client).create(user_id, MISSION))
+        task = asyncio.create_task(labs(client).create(user_id, MISSION, session_id=None))
         await runtime.setup_started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

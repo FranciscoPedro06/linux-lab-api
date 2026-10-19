@@ -34,6 +34,12 @@ previous_lab_id. A lab has at most one successor (unique index), so repeating a
 replacement, or racing another one, converges on the same successor. There is no
 state of its own: a replacement interrupted after the lab ended is resumed by asking
 for it again. See docs/architecture.md#replacing-a-lab.
+
+A lab asked for through a session is inserted only while that session exists: the
+inserting transaction locks the session's row, which logout deletes, so each insert
+is ordered before or after the logout. Logout ends the user's lab again once the
+session is gone, which catches every lab inserted before. See
+docs/architecture.md#logout-and-lab-creation.
 """
 
 import asyncio
@@ -49,6 +55,7 @@ from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from linuxlab.auth.models import AuthSession
 from linuxlab.content.models import Mission, MissionVersion, Module
 from linuxlab.content.params import ParamError, generate_params
 from linuxlab.content.stored import (
@@ -140,6 +147,11 @@ class NotCurrentError(Exception):
     other kind."""
 
 
+class SessionEndedError(Exception):
+    """The session that asked for the lab was ended (logout) before the lab was
+    inserted. Nothing was created."""
+
+
 class PreviousLabNotRemovedError(Exception):
     """The lab being replaced has ended but its container could not be removed yet.
     It stays terminating for the reaper; asking again resumes the replacement."""
@@ -207,7 +219,9 @@ class Labs:
 
     # Creation
 
-    async def create(self, user_id: uuid.UUID, mission_slug: str) -> Creation:
+    async def create(
+        self, user_id: uuid.UUID, mission_slug: str, *, session_id: int | None
+    ) -> Creation:
         """Create a lab for the user and the mission, or return the user's active lab.
 
         An active lab for the same mission is returned as it is; one for another
@@ -216,6 +230,9 @@ class Labs:
         if its current version cannot be provisioned, LabCapacityError when the global
         cap is reached and LabStartError if the container could not be started or
         prepared.
+
+        `session_id` is the auth session the lab is asked for through, None only
+        outside a request. SessionEndedError if it is gone when the lab is inserted.
         """
         async with self._sessionmaker() as db:
             await db.execute(select(func.pg_advisory_xact_lock(CREATION_LOCK)))
@@ -226,7 +243,7 @@ class Labs:
             # the lab: a sync that publishes a new version afterwards does not change it.
             target = await self._target(db, mission_slug)
             try:
-                lab = await self._insert(db, user_id, target)
+                lab = await self._insert(db, user_id, target, session_id)
             except IntegrityError as error:
                 await db.rollback()
                 if getattr(error.orig, "sqlstate", None) != UNIQUE_VIOLATION:
@@ -280,13 +297,25 @@ class Labs:
         db: AsyncSession,
         user_id: uuid.UUID,
         target: Target,
+        session_id: int | None,
         previous_lab_id: uuid.UUID | None = None,
     ) -> LabSession:
         """Insert the lab in provisioning and commit. The caller holds the creation lock.
 
-        Raises LabCapacityError when the global cap is reached, and IntegrityError when
-        the user already has an active lab or the previous lab a successor.
+        Raises SessionEndedError when the session is gone, LabCapacityError when the
+        global cap is reached, and IntegrityError when the user already has an active
+        lab or the previous lab a successor.
         """
+        if session_id is not None:
+            # Held until the commit. Logout's DELETE of the row waits for it, and an
+            # insert that comes after the DELETE finds no row.
+            session = await db.scalar(
+                select(AuthSession.id)
+                .where(AuthSession.id == session_id)
+                .with_for_update(key_share=True)
+            )
+            if session is None:
+                raise SessionEndedError
         active = await db.scalar(
             select(func.count())
             .select_from(LabSession)
@@ -351,7 +380,12 @@ class Labs:
     # Replacement
 
     async def replace(
-        self, lab_id: uuid.UUID, mission_slug: str, *, admit: Callable[[], None]
+        self,
+        lab_id: uuid.UUID,
+        mission_slug: str,
+        *,
+        session_id: int | None,
+        admit: Callable[[], None],
     ) -> Creation:
         """Replace the lab with a new one for the mission: a reset when it is the lab's
         mission, a mission switch otherwise. The caller has checked ownership.
@@ -370,8 +404,9 @@ class Labs:
            kept) and remove its container. Raise PreviousLabNotRemovedError if the
            removal is not confirmed.
         6. Create the successor at the selected version and provision it as create()
-           does. From here on LabCapacityError (taken meanwhile) and LabStartError
-           leave the user without an active lab.
+           does. From here on LabCapacityError (taken meanwhile), SessionEndedError
+           (logged out meanwhile) and LabStartError leave the user without an active
+           lab.
         """
         async with self._sessionmaker() as db:
             source = await db.get(LabSession, lab_id)
@@ -417,9 +452,11 @@ class Labs:
         if ended.end_reason == EndReason.LOGOUT:
             # Logged out while the lab was being replaced.
             raise NotCurrentError(lab_id)
-        return await self._create_successor(ended, target)
+        return await self._create_successor(ended, target, session_id)
 
-    async def _create_successor(self, source: LabSession, target: Target) -> Creation:
+    async def _create_successor(
+        self, source: LabSession, target: Target, session_id: int | None
+    ) -> Creation:
         async with self._sessionmaker() as db:
             await db.execute(select(func.pg_advisory_xact_lock(CREATION_LOCK)))
             successor = await db.scalar(_successor(source.id))
@@ -428,7 +465,9 @@ class Labs:
             if await db.scalar(_active_lab(source.user_id)) is not None:
                 raise NotCurrentError(source.id)
             try:
-                lab = await self._insert(db, source.user_id, target, previous_lab_id=source.id)
+                lab = await self._insert(
+                    db, source.user_id, target, session_id, previous_lab_id=source.id
+                )
             except IntegrityError as error:
                 await db.rollback()
                 if getattr(error.orig, "sqlstate", None) != UNIQUE_VIOLATION:

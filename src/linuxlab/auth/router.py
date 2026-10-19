@@ -81,7 +81,7 @@ async def database(request: Request) -> AsyncIterator[AsyncSession]:
 Database = Annotated[AsyncSession, Depends(database)]
 
 
-def _not_authenticated() -> ApiError:
+def not_authenticated() -> ApiError:
     return ApiError(
         401,
         "not_authenticated",
@@ -90,14 +90,22 @@ def _not_authenticated() -> ApiError:
     )
 
 
-async def current_user(request: Request, db: Database) -> User:
-    """The user of the request's session. Raises 401 without a valid session."""
+async def current_session(request: Request, db: Database) -> sessions.ActiveSession:
+    """The request's session and its user. Raises 401 without a valid session."""
     token = request.cookies.get(SESSION_COOKIE)
     if not token or len(token) > MAX_TOKEN_LENGTH:
-        raise _not_authenticated()
+        raise not_authenticated()
     active = await sessions.resolve(db, token, sessions.utcnow())
     if active is None:
-        raise _not_authenticated()
+        raise not_authenticated()
+    return active
+
+
+CurrentSession = Annotated[sessions.ActiveSession, Depends(current_session)]
+
+
+async def current_user(active: CurrentSession) -> User:
+    """The user of the request's session. Raises 401 without a valid session."""
     return active.user
 
 
@@ -201,12 +209,17 @@ async def login(
 
 @router.post("/logout", status_code=204)
 async def logout(request: Request, db: Database) -> Response:
-    """Ends the user's active lab, then the request's session, if any.
+    """Ends the user's active lab, then the request's session, if any, then the
+    user's active lab again.
 
     The lab goes first. If ending it fails, the session is kept and the client can
     retry, so the session is never gone while its lab still counts as ready. If only
     removing the container fails, the lab stays terminating, the reaper finishes it,
     and logout completes.
+
+    A lab inserted for this session while the first pass ran is ended by the second:
+    inserting a lab locks the session's row, so the revocation waits for an insert in
+    progress and every later insert finds no session (see Labs.create).
     """
     token = request.cookies.get(SESSION_COOKIE)
     if token and len(token) <= MAX_TOKEN_LENGTH:
@@ -217,7 +230,10 @@ async def logout(request: Request, db: Database) -> Response:
             await db.rollback()
             labs: Labs = request.app.state.labs
             await labs.end_active(user_id, EndReason.LOGOUT)
-        await sessions.revoke(db, token)
+            await sessions.revoke(db, token)
+            await labs.end_active(user_id, EndReason.LOGOUT)
+        else:
+            await sessions.revoke(db, token)
     response = Response(status_code=204)
     clear_session_cookie(response)
     return response
