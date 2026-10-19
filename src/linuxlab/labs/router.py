@@ -28,6 +28,8 @@ from linuxlab.labs.lifecycle import (
     LabStartError,
     MissionNotFoundError,
     MissionSpecError,
+    NotCurrentError,
+    PreviousLabNotRemovedError,
 )
 from linuxlab.labs.models import EndReason, LabSession, LabStatus
 
@@ -76,6 +78,14 @@ class PublicLab(BaseModel):
 class CreateLabRequest(BaseModel):
     # The client names the mission only. Everything else (version, parameters, setup,
     # image, runtime, user, limits) comes from the catalog and the server's settings.
+    model_config = ConfigDict(extra="forbid")
+
+    mission_slug: str
+
+
+class ReplaceLabRequest(BaseModel):
+    # The mission of the new lab: the lab's own for a reset, another for a switch. As
+    # for creation, nothing else comes from the client.
     model_config = ConfigDict(extra="forbid")
 
     mission_slug: str
@@ -131,6 +141,39 @@ def _mission_not_found() -> ApiError:
     return ApiError(404, "mission_not_found", "Missão não encontrada.")
 
 
+def _admit_creation(request: Request, user_id: uuid.UUID) -> None:
+    """Count a lab creation against the user's limit; raise 429 past it."""
+    limiter: RateLimiter = request.app.state.lab_rate_limit
+    retry_after = limiter.hit(str(user_id))
+    if retry_after is not None:
+        raise ApiError(
+            429,
+            "rate_limited",
+            "Muitos laboratórios iniciados em pouco tempo. Aguarde alguns minutos.",
+            headers={"retry-after": str(max(1, math.ceil(retry_after)))},
+        )
+
+
+def _capacity_reached() -> ApiError:
+    return ApiError(
+        503,
+        "lab_capacity_reached",
+        "Todos os laboratórios estão em uso. Tente novamente em alguns minutos.",
+    )
+
+
+def _not_current() -> ApiError:
+    return ApiError(
+        409,
+        "lab_not_current",
+        "Este laboratório já foi substituído ou não é mais o seu laboratório atual.",
+    )
+
+
+def _lab_provisioning() -> ApiError:
+    return ApiError(409, "lab_provisioning", "O laboratório já está sendo iniciado.")
+
+
 @router.get("/current")
 async def current_lab(request: Request, user: CurrentUser, db: Database) -> PublicLab | None:
     lab = await _labs(request).active(user.id)
@@ -160,15 +203,7 @@ async def get_lab(lab_id: str, user: CurrentUser, db: Database) -> PublicLab:
 async def create_lab(
     body: CreateLabRequest, request: Request, response: Response, user: CurrentUser, db: Database
 ) -> PublicLab:
-    limiter: RateLimiter = request.app.state.lab_rate_limit
-    retry_after = limiter.hit(str(user.id))
-    if retry_after is not None:
-        raise ApiError(
-            429,
-            "rate_limited",
-            "Muitos laboratórios iniciados em pouco tempo. Aguarde alguns minutos.",
-            headers={"retry-after": str(max(1, math.ceil(retry_after)))},
-        )
+    _admit_creation(request, user.id)
     if not SLUG.fullmatch(body.mission_slug):
         raise _mission_not_found()
 
@@ -185,11 +220,7 @@ async def create_lab(
     except MissionSpecError:
         raise ApiError(500, "internal_error", "Erro interno. Tente novamente.") from None
     except LabCapacityError:
-        raise ApiError(
-            503,
-            "lab_capacity_reached",
-            "Todos os laboratórios estão em uso. Tente novamente em alguns minutos.",
-        ) from None
+        raise _capacity_reached() from None
     except LabStartError:
         raise ApiError(
             503, "lab_start_failed", "Não foi possível iniciar o laboratório. Tente novamente."
@@ -202,10 +233,74 @@ async def create_lab(
         response.status_code = 200
         return await public_lab(db, lab)
     if lab.status == LabStatus.PROVISIONING:
-        raise ApiError(409, "lab_provisioning", "O laboratório já está sendo iniciado.")
+        raise _lab_provisioning()
     raise ApiError(
         409, "lab_terminating", "O laboratório anterior ainda está sendo encerrado. Aguarde."
     )
+
+
+@router.post("/{lab_id}/replace", status_code=201)
+async def replace_lab(
+    lab_id: str,
+    body: ReplaceLabRequest,
+    request: Request,
+    response: Response,
+    user: CurrentUser,
+    db: Database,
+) -> PublicLab:
+    """Reset the lab (same mission) or switch it to another mission. See
+    docs/api.md#post-apilabsidreplace.
+
+    Ownership comes first, then the successor: asking again for a replacement that
+    already created its lab returns that lab without counting against the rate limit.
+    Only a replacement that is about to end a lab and create another is counted.
+    """
+    lab = await owned_lab(db, user.id, lab_id)
+    if lab is None:
+        raise _not_found()
+    owned_id, user_id = lab.id, user.id
+    # No transaction stays open while the lab is replaced.
+    await db.rollback()
+    if not SLUG.fullmatch(body.mission_slug):
+        raise _mission_not_found()
+
+    try:
+        creation = await _labs(request).replace(
+            owned_id, body.mission_slug, admit=lambda: _admit_creation(request, user_id)
+        )
+    except NotCurrentError:
+        raise _not_current() from None
+    except MissionNotFoundError:
+        raise _mission_not_found() from None
+    except MissionSpecError:
+        raise ApiError(500, "internal_error", "Erro interno. Tente novamente.") from None
+    except LabCapacityError:
+        raise _capacity_reached() from None
+    except PreviousLabNotRemovedError:
+        raise ApiError(
+            503,
+            "previous_lab_not_removed",
+            "O laboratório anterior foi encerrado, mas ainda está sendo removido."
+            " Tente novamente em instantes.",
+        ) from None
+    except LabStartError:
+        raise ApiError(
+            503,
+            "lab_start_failed",
+            "Não foi possível iniciar o novo laboratório. O anterior já foi encerrado.",
+        ) from None
+
+    replacement = creation.lab
+    if creation.created:
+        logger.info("lab replaced: lab=%s successor=%s", owned_id, replacement.id)
+        return await public_lab(db, replacement)
+    # The replacement had already been made.
+    if replacement.status == LabStatus.READY:
+        response.status_code = 200
+        return await public_lab(db, replacement)
+    if replacement.status == LabStatus.PROVISIONING:
+        raise _lab_provisioning()
+    raise _not_current()
 
 
 @router.delete("/{lab_id}")
