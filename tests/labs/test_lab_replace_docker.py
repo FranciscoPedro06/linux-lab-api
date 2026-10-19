@@ -20,7 +20,7 @@ from linuxlab.labs.lifecycle import (
     PreviousLabNotRemovedError,
     utcnow,
 )
-from linuxlab.labs.models import LabSession
+from linuxlab.labs.models import EndReason, LabSession
 from linuxlab.labs.runtime import ExecUser, LabRuntimeError
 from linuxlab.labs.runtime.docker import DockerRuntime
 from linuxlab.labs.runtime.spec import container_name
@@ -45,8 +45,14 @@ async def api(docker_client: aiodocker.Docker) -> AsyncIterator[Api]:
         lab_deployment=f"tests-{uuid.uuid4().hex[:12]}",
     ) as api:
         yield api
-        await api.sql("UPDATE lab_sessions SET last_activity_at = now() - interval '1 day'")
+        # Every lab still running is ended explicitly: a terminal used during the test
+        # counts as recent activity, which the reaper would store before any timeout.
+        for (lab_id,) in await api.sql(
+            "SELECT id FROM lab_sessions WHERE status IN ('provisioning', 'ready')"
+        ):
+            await api.labs.end(lab_id, EndReason.USER)
         await api.labs.reconcile(startup=True)
+        assert await deployment_containers(api) == set()
 
 
 @pytest.fixture
