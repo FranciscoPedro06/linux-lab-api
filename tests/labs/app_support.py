@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from linuxlab.auth import sessions
-from linuxlab.auth.models import User
+from linuxlab.auth.models import AuthSession, User
 from linuxlab.content.loader import load_content
 from linuxlab.content.sync import sync_content
 from linuxlab.labs.lifecycle import Labs
@@ -32,6 +32,7 @@ MISSION = "sample-file"
 class Account:
     id: uuid.UUID
     token: str
+    session_id: int
 
 
 @dataclass
@@ -56,10 +57,14 @@ class Api:
             await db.flush()
             token = sessions.add_session(db, user.id, sessions.utcnow())
             await db.commit()
-        return Account(user.id, token)
+            session_id = await db.scalar(
+                select(AuthSession.id).where(AuthSession.user_id == user.id)
+            )
+        assert session_id is not None
+        return Account(user.id, token, session_id)
 
     async def lab(self, account: Account, mission: str = MISSION) -> LabSession:
-        creation = await self.labs.create(account.id, mission)
+        creation = await self.labs.create(account.id, mission, session_id=account.session_id)
         assert creation.lab.status == "ready", creation.lab.status
         return creation.lab
 

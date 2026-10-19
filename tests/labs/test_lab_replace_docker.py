@@ -11,13 +11,17 @@ from datetime import timedelta
 from pathlib import Path
 
 import aiodocker
+import httpx2
 import pytest
 from aiodocker.exceptions import DockerError
 
+from linuxlab.auth.cookies import SESSION_COOKIE
 from linuxlab.labs.lifecycle import (
     PROVISIONING_TIMEOUT,
+    Creation,
     LabStartError,
     PreviousLabNotRemovedError,
+    SessionEndedError,
     utcnow,
 )
 from linuxlab.labs.models import EndReason, LabSession
@@ -28,7 +32,7 @@ from tests.content.support import copy_fixture, edit_yaml, mission_file
 
 from .app_support import MISSION, Account, Api, running_api
 from .support import LAB_IMAGE, OCI_RUNTIME
-from .terminal_client import close_code, read_until, start, terminal
+from .terminal_client import ORIGIN, close_code, read_until, start, terminal
 
 pytestmark = [pytest.mark.docker, pytest.mark.integration]
 
@@ -64,8 +68,16 @@ def admit() -> None:
     pass
 
 
-async def replace(api: Api, lab: LabSession, mission: str = MISSION) -> LabSession:
-    creation = await api.labs.replace(lab.id, mission, admit=admit)
+async def replace_as(
+    api: Api, account: Account, lab: LabSession, mission: str = MISSION
+) -> Creation:
+    return await api.labs.replace(lab.id, mission, session_id=account.session_id, admit=admit)
+
+
+async def replace(
+    api: Api, account: Account, lab: LabSession, mission: str = MISSION
+) -> LabSession:
+    creation = await replace_as(api, account, lab, mission)
     assert creation.created
     return creation.lab
 
@@ -128,7 +140,7 @@ async def test_reset_removes_the_container_and_starts_a_clean_one(
     before = await container_info(docker_client, first)
     assert before is not None
 
-    second = await replace(api, first)
+    second = await replace(api, ana, first)
 
     assert await api.status(first) == ("terminated", "reset")
     assert await container_info(docker_client, first) is None
@@ -156,7 +168,7 @@ async def test_switch_starts_the_other_missions_lab(
     ana = await api.account("ana@example.com")
     first = await api.lab(ana)
 
-    second = await replace(api, first, OTHER)
+    second = await replace(api, ana, first, OTHER)
 
     assert await api.status(first) == ("terminated", "mission_switch")
     assert await container_info(docker_client, first) is None
@@ -172,7 +184,7 @@ async def test_the_old_terminal_is_closed_and_refused_and_the_new_one_is_separat
 
     async with terminal(api.url, str(first.id), ana.token) as websocket:
         await start(websocket)
-        second = await replace(api, first)
+        second = await replace(api, ana, first)
         assert await close_code(websocket) == 4410
 
     async with terminal(api.url, str(first.id), ana.token) as websocket:
@@ -203,7 +215,7 @@ async def test_failed_removal_is_recovered(api: Api, docker_client: aiodocker.Do
     runtime.remove = broken_remove  # type: ignore[method-assign]
     try:
         with pytest.raises(PreviousLabNotRemovedError):
-            await api.labs.replace(first.id, MISSION, admit=admit)
+            await replace_as(api, ana, first)
     finally:
         runtime.remove = real_remove  # type: ignore[method-assign]
 
@@ -215,7 +227,7 @@ async def test_failed_removal_is_recovered(api: Api, docker_client: aiodocker.Do
     assert await api.status(first) == ("terminated", "reset")
     assert await container_info(docker_client, first) is None
 
-    second = await replace(api, first)
+    second = await replace(api, ana, first)
     assert await deployment_containers(api) == {second.lab_key}
 
 
@@ -229,7 +241,7 @@ async def test_setup_timeout_of_the_successor(
     await api.sync(root)
 
     with pytest.raises(LabStartError):
-        await api.labs.replace(first.id, OTHER, admit=admit)
+        await replace_as(api, ana, first, OTHER)
 
     assert await api.status(first) == ("terminated", "mission_switch")
     rows = await api.sql(
@@ -250,7 +262,7 @@ async def test_api_stopping_during_the_successors_setup_leaves_no_orphan(
     await api.sync(root)
 
     # A shutdown cancels the request while the successor's setup runs.
-    replacing = asyncio.create_task(api.labs.replace(first.id, MISSION, admit=admit))
+    replacing = asyncio.create_task(replace_as(api, ana, first))
     async with asyncio.timeout(30):
         while True:
             rows = await api.sql(
@@ -275,4 +287,80 @@ async def test_api_stopping_during_the_successors_setup_leaves_no_orphan(
 
     assert await api.status(successor) == ("terminated", "provisioning_timeout")
     assert await api.status(first) == ("terminated", "reset")
+    assert await deployment_containers(api) == set()
+
+
+async def http_logout(api: Api, account: Account) -> int:
+    base_url = api.url.replace("ws://", "http://")
+    async with httpx2.AsyncClient(base_url=base_url) as http:
+        response = await http.post(
+            "/api/auth/logout",
+            json={},
+            headers={"origin": ORIGIN, "cookie": f"{SESSION_COOKIE}={account.token}"},
+        )
+    return response.status_code
+
+
+async def session_rows(api: Api, account: Account) -> int:
+    rows = await api.sql("SELECT count(*) FROM auth_sessions WHERE id = :id", id=account.session_id)
+    count: int = rows[0][0]
+    return count
+
+
+async def test_logout_before_the_successor_is_inserted_leaves_no_lab(
+    api: Api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ana = await api.account("ana@example.com")
+    first = await api.lab(ana)
+    original = api.labs._create_successor
+
+    async def logout_first(*args: object) -> Creation:
+        assert await http_logout(api, ana) == 204
+        return await original(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(api.labs, "_create_successor", logout_first)
+    with pytest.raises(SessionEndedError):
+        await replace_as(api, ana, first)
+
+    assert await session_rows(api, ana) == 0
+    assert await api.status(first) == ("terminated", "reset")
+    assert (
+        await api.sql("SELECT id FROM lab_sessions WHERE previous_lab_id = :id", id=first.id) == []
+    )
+    assert await deployment_containers(api) == set()
+
+
+async def test_logout_during_the_successors_setup_ends_it(api: Api, root: Path) -> None:
+    ana = await api.account("ana@example.com")
+    first = await api.lab(ana)
+    (root / "missions" / MISSION / "setup.sh").write_text("sleep 30\n", encoding="utf-8")
+    await api.sync(root)
+
+    replacing = asyncio.create_task(replace_as(api, ana, first))
+    async with asyncio.timeout(30):
+        while True:
+            rows = await api.sql(
+                "SELECT id FROM lab_sessions WHERE previous_lab_id = :id", id=first.id
+            )
+            if rows and await deployment_containers(api):
+                break
+            await asyncio.sleep(0.1)
+    successor = await api.labs.get(rows[0][0])
+    assert successor is not None
+    async with asyncio.timeout(30):
+        while not await setup_running(api, successor):
+            await asyncio.sleep(0.1)
+
+    assert await http_logout(api, ana) == 204
+
+    # Answered: the successor has been ended and its container removed.
+    assert await session_rows(api, ana) == 0
+    assert await api.status(successor) == ("terminated", "logout")
+    assert await deployment_containers(api) == set()
+    # The replacement answers with the successor as it read it once setup was cut
+    # short: ended, possibly while logout was still removing it.
+    creation = await replacing
+    assert creation.lab.id == successor.id
+    assert creation.lab.end_reason == "logout"
+    assert await api.status(successor) == ("terminated", "logout")
     assert await deployment_containers(api) == set()

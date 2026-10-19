@@ -90,7 +90,7 @@ async def failed_lab(api: Api, docker_client: aiodocker.Docker, email: str) -> L
     """Start a lab that must fail; return its row once the attempt is over."""
     account = await api.account(email)
     with pytest.raises(LabStartError):
-        await api.labs.create(account.id, MISSION)
+        await api.labs.create(account.id, MISSION, session_id=account.session_id)
     rows = await api.sql("SELECT id FROM lab_sessions WHERE user_id = :id", id=account.id)
     lab = await api.labs.get(rows[0][0])
     assert lab is not None
