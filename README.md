@@ -23,7 +23,9 @@ What exists today:
 7. The student asks the API to validate the lab: it checks the lab's state against the conditions of the mission version the lab was created for, through a read-only platform utility inside the container, and returns a status per condition. Each validation is stored.
 8. The first validation that passes records the student's completion of the mission, which the catalog then shows. It belongs to the mission, not to a version: a newer version of the mission does not undo it, and it outlives the lab.
 
-Planned, not implemented yet: resetting a lab or switching it to another mission, and showing the explanation and solutions after completion.
+9. The student can reset a lab, getting a clean one for the same mission, or switch to another mission. Either way the lab is replaced by a new one: its files and processes are discarded, and progress is kept.
+
+Planned, not implemented yet: showing the explanation and solutions after completion.
 
 Missions declare conditions rather than run validation code:
 
@@ -188,7 +190,7 @@ Planned coverage as the project grows:
 
 ## Status
 
-Increments 01 to 09 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; the mission catalog, with content validated and synced from `content/` into immutable versions; labs created for a mission, pinned to its version, with generated parameters and the mission's setup run inside the lab; and the validation engine, which checks a lab's state against its pinned mission version with RE2 patterns and `labctl probe`, and stores each run in `validation_runs`; and progress, which records in `user_missions` the first completion of each mission, in the transaction of the run that passed, and shows it in the catalog. Reset and mission switching come next (increment 10). Planned order:
+Increments 01 to 10 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; the mission catalog, with content validated and synced from `content/` into immutable versions; labs created for a mission, pinned to its version, with generated parameters and the mission's setup run inside the lab; and the validation engine, which checks a lab's state against its pinned mission version with RE2 patterns and `labctl probe`, and stores each run in `validation_runs`; and progress, which records in `user_missions` the first completion of each mission, in the transaction of the run that passed, and shows it in the catalog; and reset and mission switching, which replace a lab with a new lab linked to it. The mission test harness and the first missions come next (increment 11). Planned order:
 
 | # | Increment |
 |---|---|
