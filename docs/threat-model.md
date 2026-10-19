@@ -95,6 +95,7 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 | Repeated replacements multiplying labs | At most one successor per lab (`one_successor_per_lab`); a replacement that ends a lab and creates another counts against the creation rate limit |
 | Concurrent delete, logout and reaper on one lab | All three take the same idempotent path; the first end reason is kept |
 | Logout leaving a usable lab | Logout ends the lab before deleting the session, and keeps the session if ending the lab fails |
+| A lab created or replaced for a session after its logout | Inserting a lab locks the session's row and requires it to exist; logout deletes the row, then ends the user's lab again. Covered by concurrency tests of logout against creation and replacement |
 | Orphan containers (API crash, failed removal) | The reaper removes this deployment's lab containers with no unfinished lab and retries unfinished removals |
 | Reaper removing containers that are not its own | Containers are selected by the `linuxlab.managed` and `linuxlab.deployment` labels and accepted only with the matching lab id and name. Containers without them, or of another deployment, are left alone |
 | One user's lab affecting another's | The reaper, delete and logout act on one lab id at a time; ending a lab closes only that lab's terminal. Covered by tests for delete, logout and the reaper |

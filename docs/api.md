@@ -96,7 +96,7 @@ Returns `200` with the user and sets a new session cookie. An unknown email and 
 
 ### `POST /api/auth/logout`
 
-Body `{}`. Ends the user's active lab (`end_reason = logout`, container removed), then deletes the session named by the cookie, clears the cookie and returns `204`. Without a valid session no lab is touched. If ending the lab fails, the response is `500` and the session is kept, so the client can retry; if only the container removal fails, the lab is left `terminating` for the reaper and the response is `204`. Other sessions of the same user remain valid.
+Body `{}`. Ends the user's active lab (`end_reason = logout`, container removed), then deletes the session named by the cookie, clears the cookie and returns `204`. Once it has answered, no lab asked for through that session is active: a lab inserted for it while the logout ran is ended too, and creating or replacing a lab with it afterwards answers `401 not_authenticated` ([architecture.md](architecture.md#logout-and-lab-creation)). Without a valid session no lab is touched. If ending the lab fails, the response is `500` and the session is kept, so the client can retry; if only the container removal fails, the lab is left `terminating` for the reaper and the response is `204`. Other sessions of the same user remain valid.
 
 ### `GET /api/auth/me`
 
@@ -169,7 +169,7 @@ Creates a lab for the mission's current version: the API pins that version, gene
 | The mission's version cannot be used (its parameters could not be generated) | `500 internal_error`; nothing is created |
 | The container could not be started, or `labctl init` or setup failed or timed out | `503 lab_start_failed`; the lab ends as `provisioning_failed` |
 
-If the lab is ended while it is being created (logout, delete), the response is `201` with the lab in its ended state.
+If the lab is ended while it is being created (logout, delete), the response is `201` with the lab in its ended state. If the request's session is deleted by a logout before the lab is inserted, the response is `401 not_authenticated` and nothing is created.
 
 The rate limit and the default capacity are provisional values chosen in increment 05 ([architecture.md](architecture.md#values-chosen-in-increment-05)).
 
@@ -209,6 +209,7 @@ A lab is replaced at most once. The new lab records which lab it replaced (not r
 | The lab ended but its container could not be removed yet | `503 previous_lab_not_removed` | `terminating`; the reaper finishes it |
 | Another user took the last place after the check | `503 lab_capacity_reached` | Ended and removed; no new lab |
 | The new lab's container could not be started or prepared | `503 lab_start_failed` | Ended and removed; the new lab ends as `provisioning_failed` |
+| The request's session was deleted by a logout before the new lab was inserted | `401 not_authenticated` | Ended and removed (by the replacement or the logout); no new lab |
 
 The last two rows are the accepted cost of ending the old lab before creating the new one ([architecture.md](architecture.md#replacing-a-lab)): the user is left without an active lab, and the old lab cannot be restored.
 
@@ -222,7 +223,7 @@ A client that did not get an answer reads `GET /api/labs/current` and `GET /api/
 
 The order of the checks is: session, ownership, the existing replacement, conflicts, the rate limit, then the mission and capacity. Repeating a replacement already made, or resuming one interrupted after the lab ended, is therefore not counted against the rate limit and never refused by it; any other replacement counts as a lab creation.
 
-Concurrent replacements of one lab create one new lab; the other requests get it (`200`), `409 lab_provisioning` or, for another mission, `409 lab_not_current`. A replacement that meets `DELETE` or the reaper on the old lab keeps the first end reason recorded and still creates the new lab; one that meets a logout does not, when the logout ended the lab first. A lab created with `POST /api/labs` while the old one was being removed takes the user's one active place, and the replacement answers `409 lab_not_current`.
+Concurrent replacements of one lab create one new lab; the other requests get it (`200`), `409 lab_provisioning` or, for another mission, `409 lab_not_current`. A replacement that meets `DELETE` or the reaper on the old lab keeps the first end reason recorded and still creates the new lab; one that meets a logout does not, when the logout ended the lab first. A logout of the request's own session leaves no new lab active, whatever the order: the new lab is ended by the logout if it was inserted first, and otherwise never inserted (`401 not_authenticated`). Asking again from a new session resumes the replacement. A lab created with `POST /api/labs` while the old one was being removed takes the user's one active place, and the replacement answers `409 lab_not_current`.
 
 ### `DELETE /api/labs/{id}`
 

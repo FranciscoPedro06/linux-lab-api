@@ -116,6 +116,20 @@ The client sends only `mission_slug`. The version, parameters, setup, image (the
 3. The container is removed. A removal already in progress (by another actor) is waited for.
 4. `terminating` → `terminated`.
 
+### Logout and lab creation
+
+A lab asked for through a session (`POST /api/labs`, or the successor of `POST /api/labs/{id}/replace`) is inserted only while that session exists. The transaction that inserts the lab, under the creation lock, locks the session's `auth_sessions` row (`FOR KEY SHARE`) and refuses with `401 not_authenticated` if the row is gone. Logout:
+
+1. ends the user's active lab;
+2. deletes the session. The `DELETE` waits for an insert that holds the row's lock, and every insert after it finds no row;
+3. ends the user's active lab again, which catches a lab inserted between steps 1 and 2.
+
+So once logout has answered, no lab asked for through that session is left active: one inserted before the session was deleted has been ended by step 3 (`end_reason = logout`), and one asked for afterwards is refused. A lab ended while it was being prepared never becomes `ready`, and its creation removes the container it made ([Ending](#ending)). The order comes from PostgreSQL row locks, not from process memory, and no transaction is held while Docker works: the lock lasts only for the insert's transaction.
+
+A replacement that is refused this way has already ended the old lab and created no successor. The same replacement asked again from a new session resumes it, as after any interruption between steps 5 and 6 of [Replacing a lab](#replacing-a-lab).
+
+Other sessions of the user are not deleted. A lab they create after the logout's step 2 is theirs and stays active.
+
 ### Replacing a lab
 
 Implemented in increment 10 (`Labs.replace` in `lifecycle.py`, `POST /api/labs/{id}/replace`). A reset (same mission) and a mission switch are one operation: the lab is ended and a new lab is created, a new row with its own id, container and freshly generated parameters. Creation (`POST /api/labs`) never ends a lab, and a replacement always does. The old lab is never reused, so nothing it held (files, processes, temporary state, parameters) reaches the new one, and since it ends in a final state its terminal can never be opened again.
@@ -158,6 +172,7 @@ Concurrency relies on PostgreSQL, not on process memory:
 
 - Two replacements of one lab both end it (the first reason is kept) and both wait for the removal. The creation lock and `one_successor_per_lab` let one of them insert the successor; the other finds it and answers `200`, `409 lab_provisioning` or, for another mission, `409 lab_not_current`. When a reset and a switch race, the one that ended the lab first proceeds and the other answers `409 lab_not_current` without waiting.
 - `DELETE`, logout and the reaper end the old lab through the same path, and whoever records the reason first keeps it. The replacement then still creates the successor, except when a logout ended the old lab.
+- A logout of the session that asked for the replacement, at any point, leaves no successor active ([Logout and lab creation](#logout-and-lab-creation)): a successor inserted before the session was deleted is ended by the logout, and one not inserted yet is refused with `401 not_authenticated`.
 - A lab created with `POST /api/labs` between steps 5 and 6 takes the user's one active place, and the replacement answers `409 lab_not_current`.
 - The old lab's terminal is closed with `4410` in step 5, and reconnecting to it is refused with `4410`. The successor's container has its own name and labels, and every removal of the old lab targets only the old lab's name and labels, so it cannot reach the new container.
 - A validation of the old lab already running when it is replaced is stored against the old lab if its probe completed, or ends as `error`. It never involves the successor.
@@ -165,7 +180,6 @@ Concurrency relies on PostgreSQL, not on process memory:
 Accepted risks:
 
 - **Capacity taken after the check.** Another user can take the last place between the end of the old lab and the insert of the new one. The student is then left without a lab (`503 lab_capacity_reached`); asking again resumes the replacement once a place is free. The old lab is not restored: its container is gone.
-- **Logout during the removal.** A logout that arrives while the old lab is being removed finds it already ending with `reset` or `mission_switch`; the replacement then creates the successor after the session was deleted. Nobody can open it, and the reaper ends it after 15 minutes without a terminal (`no_terminal`). A `POST /api/labs` racing a logout behaves the same way.
 - **Duration.** A replacement can take up to about 100 seconds: up to 15 s for the terminal, 10 s for a removal already in progress, then up to 70 s of provisioning. The reverse proxy of increment 13 has to allow it.
 - **One process.** Closing the old lab's terminal relies on the in-process terminal registry, as every way of ending a lab does. With several API processes, a terminal opened on another process would close only when the container is removed.
 
@@ -342,7 +356,7 @@ Implemented in increment 04, in `src/linuxlab/auth/`. Server-side sessions with 
 - 32-byte random token (`secrets.token_urlsafe`); the database stores only its SHA-256, and the token reaches the client only in the cookie;
 - `__Host-sid` cookie with `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/` and no `Domain`, and a `Max-Age` of 30 days;
 - a session is valid while it has been used in the last 7 days (idle expiry) and is less than 30 days old (absolute expiry, fixed at creation and never extended). `last_seen_at` is updated at most once every 5 minutes, so authenticated requests do not each write to the database. An expired session is deleted when it is next presented;
-- logout first ends the user's active lab (`end_reason = logout`), then deletes the current session and clears the cookie. If ending the lab fails, the session is kept so the client can retry; if only removing the container fails, the lab stays `terminating` for the reaper and logout completes. Other sessions of the same user stay valid, but the lab belonged to the user and has ended;
+- logout first ends the user's active lab (`end_reason = logout`), then deletes the current session and clears the cookie, then ends the user's active lab again, for a lab inserted meanwhile ([Logout and lab creation](#logout-and-lab-creation)). If ending the lab fails, the session is kept so the client can retry; if only removing the container fails, the lab stays `terminating` for the reaper and logout completes. Other sessions of the same user stay valid, but the lab belonged to the user and has ended;
 - Argon2id password hashing (`argon2-cffi` defaults: RFC 9106 low-memory parameters) in worker threads, with at most two hashes running at once, so it neither blocks the event loop nor takes unbounded CPU and memory;
 - a login for an unknown email verifies the password against a dummy hash, so its timing and response match a wrong password;
 - passwords of 12 to 128 characters with no composition rules; emails stripped and lowercased, ASCII only, unique case-insensitively through a unique index on `lower(email)`; display names stripped, 1 to 80 characters, without control characters, stored as plain text;
