@@ -83,13 +83,16 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 |---|---|
 | Using another user's lab by its id (IDOR) | Every lab route (validation included) and the terminal resolve the lab from the session's user and the id together. A missing lab and another user's lab return the same `404` / `4404`; a lab's state is only revealed to its owner |
 | Guessing or reusing lab ids, container names or ids | Lab ids are random UUIDs, and knowing one grants nothing without the owner's session. Container names and ids are never returned and are not accepted as lab ids |
-| Choosing the owner, container, image, runtime, user or limits | `POST /api/labs` takes only `mission_slug` and refuses extra fields. Image, runtime, deployment label and limits come from server configuration; the terminal runs as uid 1000, chosen by the API. No route forwards anything to the Docker API |
+| Choosing the owner, container, image, runtime, user or limits | `POST /api/labs` and `POST /api/labs/{id}/replace` take only `mission_slug` and refuse extra fields. Image, runtime, deployment label and limits come from server configuration; the terminal runs as uid 1000, chosen by the API. No route forwards anything to the Docker API |
 | Choosing the mission version, parameters or setup | The API pins the mission's current version itself and generates the parameters; setup and its user come only from that stored version. A slug that is not a published mission creates nothing |
 | Starting labs for unpublished content | Drafts, archived missions and missions in unpublished modules answer `404 mission_not_found` before any row or container exists |
 | Unauthenticated or expired terminal | The handshake resolves the session cookie like any request and closes with `4401` |
 | Terminal kept open after its lab ended | Ending a lab closes its terminal (`4410`) before removing the container; reconnecting to an ended lab is refused with `4410` |
 | Two labs for one user through concurrent requests | Partial unique index `one_active_lab_per_user`; creation also serializes on an advisory lock for the global cap |
 | Reviving an ended lab | Conditional status updates and a database trigger that only allows the lifecycle's transitions |
+| Replacing another user's lab, or linking to one | The replace route resolves the lab from the session's user and the id together (`404` otherwise); a composite foreign key requires `previous_lab_id` to be a lab of the same user |
+| Reusing a replaced lab's container, files or parameters | A reset or switch always creates a new row, container and parameters; the old lab ends in a final state and its terminal is closed and refused (`4410`) |
+| Repeated replacements multiplying labs | At most one successor per lab (`one_successor_per_lab`); a replacement that ends a lab and creates another counts against the creation rate limit |
 | Concurrent delete, logout and reaper on one lab | All three take the same idempotent path; the first end reason is kept |
 | Logout leaving a usable lab | Logout ends the lab before deleting the session, and keeps the session if ending the lab fails |
 | Orphan containers (API crash, failed removal) | The reaper removes this deployment's lab containers with no unfinished lab and retries unfinished removals |

@@ -45,8 +45,8 @@ General errors, shared by every route:
 | GET | `/api/labs/current` | The user's active lab, or `null` |
 | GET | `/api/labs` | The user's recent labs |
 | GET | `/api/labs/{id}` | One of the user's labs, in any state |
-| POST | `/api/labs` | Create a lab for a mission. Body: `mission_slug` (`replace` from increment 10) |
-| POST | `/api/labs/{id}/reset` | Recreate the lab for the same mission and return the new one |
+| POST | `/api/labs` | Create a lab for a mission. Body: `mission_slug` |
+| POST | `/api/labs/{id}/replace` | Replace the lab with a new one, for the same mission (reset) or another (mission switch). Body: `mission_slug` |
 | POST | `/api/labs/{id}/validate` | Validate the current state. Optional body: `answer` |
 | DELETE | `/api/labs/{id}` | End the lab |
 | GET | `/api/health` | Database and lab runtime status |
@@ -54,7 +54,7 @@ General errors, shared by every route:
 
 Every route requires a session except `signup`, `login`, `logout` and `health`.
 
-Implemented so far: `health`, the four `auth` routes, the two catalog routes, the lab routes except `reset`, and the terminal. `reset` is the target contract.
+All of these routes are implemented.
 
 ## Authentication
 
@@ -129,7 +129,7 @@ Lab object:
 ```
 
 - `status`: `provisioning`, `ready`, `terminating`, `terminated` or `failed` ([architecture.md](architecture.md#labs)).
-- `end_reason`: `null` while the lab runs; otherwise `user`, `logout`, `no_terminal`, `no_input`, `max_lifetime`, `oom`, `container_lost`, `provisioning_failed` or `provisioning_timeout`.
+- `end_reason`: `null` while the lab runs; otherwise `user`, `logout`, `no_terminal`, `no_input`, `max_lifetime`, `oom`, `container_lost`, `provisioning_failed`, `provisioning_timeout`, `reset` (replaced by a new lab for the same mission) or `mission_switch` (replaced by a lab for another mission).
 - `expires_at`: the maximum lifetime, 2 hours after creation.
 - `mission`: the mission version the lab was created for, with the title of that version; it does not change when the mission gets a new version or is archived. `null` only for labs created before increment 07.
 
@@ -173,7 +173,56 @@ If the lab is ended while it is being created (logout, delete), the response is 
 
 The rate limit and the default capacity are provisional values chosen in increment 05 ([architecture.md](architecture.md#values-chosen-in-increment-05)).
 
-There is no way to replace the active lab with one for another mission yet: the body gains `replace` in increment 10 (mission switching). Until then the user ends the current lab first.
+`POST /api/labs` never ends a lab. To start a lab for another mission while one is active, or a clean one for the same mission, the client replaces the lab ([`POST /api/labs/{id}/replace`](#post-apilabsidreplace)).
+
+### `POST /api/labs/{id}/replace`
+
+Implemented in increment 10.
+
+```json
+{ "mission_slug": "secure-deploy-script" }
+```
+
+Replaces the lab with a new one: a new lab session with its own id, container and parameters.
+
+- A **reset** when `mission_slug` is the lab's own mission: a clean lab for the same mission.
+- A **mission switch** when it is another mission.
+
+`POST /api/labs` creates a lab and never ends one; this route ends the lab named in the URL and creates its successor. The lab is ended with `end_reason` `reset` or `mission_switch` (unless it had already ended, whose reason is kept) and its container removed; then the new lab is created as `POST /api/labs` creates one, at the mission's current version, which is selected before the old lab is touched. The old lab's files, processes and parameters are discarded and nothing is carried over. It never becomes `ready` again, and its terminal is closed with `4410`. Progress and the old lab's validation runs are kept: a reset neither undoes a completion nor records one.
+
+The body holds only `mission_slug`; extra fields are refused. Like creation, the request is synchronous and returns once the new lab is ready or has failed, which can take up to about 100 seconds (closing the terminal, removing the container, then setup). Clients should not repeat it meanwhile.
+
+A lab is replaced at most once. The new lab records which lab it replaced (not returned to the client), and asking again for the same replacement answers with that lab instead of creating another.
+
+| Situation | Response | The lab in the URL |
+|---|---|---|
+| Replaced | `201` with the new lab in `ready` | Ended and removed |
+| Asked again after the replacement, for the same mission, with the new lab ready | `200` with the new lab | Already ended |
+| Asked again while the new lab is being prepared | `409 lab_provisioning` | Already ended |
+| Already replaced for another mission, or its replacement has ended (failed, deleted, timed out); the user has another active lab; or the lab was ended by a logout | `409 lab_not_current` | Unchanged |
+| No such lab, or another user's | `404 lab_not_found` | Unchanged |
+| Body other than `{"mission_slug": "<string>"}` | `422 invalid_request` | Unchanged |
+| No such mission, or it is a draft, archived or in a module that is not published | `404 mission_not_found` | Unchanged |
+| The mission's current version cannot be used | `500 internal_error` | Unchanged |
+| More than 10 lab creations by this user in 10 minutes | `429 rate_limited`, with `Retry-After` | Unchanged |
+| `LAB_CAPACITY` labs active, not counting this one | `503 lab_capacity_reached` | Unchanged |
+| The lab ended but its container could not be removed yet | `503 previous_lab_not_removed` | `terminating`; the reaper finishes it |
+| Another user took the last place after the check | `503 lab_capacity_reached` | Ended and removed; no new lab |
+| The new lab's container could not be started or prepared | `503 lab_start_failed` | Ended and removed; the new lab ends as `provisioning_failed` |
+
+The last two rows are the accepted cost of ending the old lab before creating the new one ([architecture.md](architecture.md#replacing-a-lab)): the user is left without an active lab, and the old lab cannot be restored.
+
+Repeating the request, for example after a lost response or a timeout, never creates a second lab for the same old lab:
+
+- After `201`, the same request answers `200` with the new lab, `409 lab_provisioning` while it is prepared, or `409 lab_not_current` once it has ended.
+- After `503 previous_lab_not_removed`, after `503 lab_capacity_reached` with the old lab already ended, or after a `500` while the new lab was being created, it resumes the replacement where it stopped. It must be of the same kind: an interrupted reset is not resumed as a mission switch, nor the reverse (`409 lab_not_current`).
+- After `503 lab_start_failed`, the replacement has happened and its result failed, so the same request answers `409 lab_not_current` from then on. The way forward is `POST /api/labs`, once `GET /api/labs/current` shows no active lab.
+
+A client that did not get an answer reads `GET /api/labs/current` and `GET /api/labs/{id}` before sending anything that ends a lab.
+
+The order of the checks is: session, ownership, the existing replacement, conflicts, the rate limit, then the mission and capacity. Repeating a replacement already made, or resuming one interrupted after the lab ended, is therefore not counted against the rate limit and never refused by it; any other replacement counts as a lab creation.
+
+Concurrent replacements of one lab create one new lab; the other requests get it (`200`), `409 lab_provisioning` or, for another mission, `409 lab_not_current`. A replacement that meets `DELETE` or the reaper on the old lab keeps the first end reason recorded and still creates the new lab; one that meets a logout does not, when the logout ended the lab first. A lab created with `POST /api/labs` while the old one was being removed takes the user's one active place, and the replacement answers `409 lab_not_current`.
 
 ### `DELETE /api/labs/{id}`
 

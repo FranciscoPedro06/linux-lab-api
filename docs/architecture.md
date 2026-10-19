@@ -60,14 +60,14 @@ provisioning --> ready --> terminating --> terminated
 
 `provisioning -> terminating` covers a lab ended (logout, delete) before it was ready. The database refuses every other transition, and any change to the owner or to a recorded end reason, with a trigger; the first reason recorded is the one kept.
 
-End reasons: `user` (`DELETE`), `logout`, `no_terminal`, `no_input`, `max_lifetime`, `oom`, `container_lost`, `provisioning_failed`, `provisioning_timeout`.
+End reasons: `user` (`DELETE`), `logout`, `no_terminal`, `no_input`, `max_lifetime`, `oom`, `container_lost`, `provisioning_failed`, `provisioning_timeout`, `reset` and `mission_switch` ([Replacing a lab](#replacing-a-lab)).
 
 Rules:
 
 - A user has at most one lab in `provisioning`, `ready` or `terminating`, enforced by the partial unique index `one_active_lab_per_user`. Concurrent creations by one user produce one lab; the others get the existing lab or `409`.
 - At most `LAB_CAPACITY` labs (default 10) are active across all users. Creations are serialized by a transaction-scoped advisory lock, so the cap cannot be raced. Each user may start at most 10 labs per 10 minutes. Both values are provisional; see [Values chosen in increment 05](#values-chosen-in-increment-05).
 - Labs are only created by an explicit user action, for a published mission.
-- A user's active lab is for one mission. Asking for the same mission returns that lab; asking for another is refused until the lab ends. Switching missions, which ends the lab with `end_reason = mission_switch`, comes in increment 10. Progress is kept when a lab ends or is removed ([Progress](#progress)).
+- A user's active lab is for one mission. Asking `POST /api/labs` for the same mission returns that lab; asking for another is refused until the lab ends. Resetting the lab, or switching it to another mission, replaces it with a new lab ([Replacing a lab](#replacing-a-lab)). Progress is kept when a lab ends or is removed ([Progress](#progress)).
 
 ### Consistency between PostgreSQL and Docker
 
@@ -109,12 +109,65 @@ The client sends only `mission_slug`. The version, parameters, setup, image (the
 
 ### Ending
 
-`DELETE /api/labs/{id}`, logout and the reaper all end a lab the same way:
+`DELETE /api/labs/{id}`, logout, the reaper and a replacement all end a lab the same way:
 
 1. `ready` or `provisioning` → `terminating`, with the end reason and time.
 2. The lab's terminal connection is closed with `4410`, and ending waits (up to 15 seconds) for the terminal's cleanup exec to finish.
 3. The container is removed. A removal already in progress (by another actor) is waited for.
 4. `terminating` → `terminated`.
+
+### Replacing a lab
+
+Implemented in increment 10 (`Labs.replace` in `lifecycle.py`, `POST /api/labs/{id}/replace`). A reset (same mission) and a mission switch are one operation: the lab is ended and a new lab is created, a new row with its own id, container and freshly generated parameters. Creation (`POST /api/labs`) never ends a lab, and a replacement always does. The old lab is never reused, so nothing it held (files, processes, temporary state, parameters) reaches the new one, and since it ends in a final state its terminal can never be opened again.
+
+The new row names the lab it replaced in `previous_lab_id`, which the client never sees:
+
+| Invariant | Enforced by |
+|---|---|
+| The previous lab belongs to the same user | Database: composite foreign key `(previous_lab_id, user_id)` to `(id, user_id)` |
+| A lab is replaced at most once | Database: partial unique index `one_successor_per_lab` |
+| A lab is not its own previous lab | Database: check constraint |
+| The link never changes, and a lab created normally never gains one | Database: the lifecycle trigger |
+| The old and the new lab are never active together | Database: `one_active_lab_per_user`; the new lab is inserted only once the old one is `terminated` |
+
+There is no new lifecycle state. A replacement is a saga over the existing lifecycle, and the rows of the two labs say how far it got:
+
+1. Ownership (`404`), then the existing successor: if there is one it is the answer (below), and nothing else happens.
+2. Conflicts refuse with `409 lab_not_current`: another active lab, an old lab ended by a logout, or an old lab already ended by a replacement of the other kind.
+3. The creation rate limit, unless a replacement already ended this lab: resuming creates no more labs than the first attempt counted.
+4. Pre-check, with the old lab untouched: the mission must be published; its current version is selected, its specification read and its parameters generated; capacity is checked counting every active lab except this one.
+5. The old lab is ended with `reset` or `mission_switch` (a reason recorded earlier is kept), as in [Ending](#ending), and its container removed. Unless it is then `terminated`, the request answers `503 previous_lab_not_removed` and the reaper keeps retrying the removal.
+6. Under the creation lock, the successor is inserted with the selected version and parameters, then provisioned as in [Creation](#creation).
+
+No transaction is open while Docker works. Each step is conditional or idempotent, so a crash, a lost response or a concurrent request at any point leaves a state that asking again resumes or answers:
+
+| Interrupted | State left | The same request, asked again |
+|---|---|---|
+| Before step 5 | Nothing changed | Starts over |
+| In step 5, container not removed (Docker error, crash) | Old lab `terminating`; the reaper finishes it | Resumes at step 4 |
+| Between steps 5 and 6 (crash, database error, capacity taken) | Old lab `terminated`, no successor | Resumes at step 4 |
+| In step 6, during provisioning (crash) | Successor `provisioning`; the reaper fails it after 2 minutes | `409 lab_provisioning`, then `409 lab_not_current` |
+| In step 6, provisioning failed | Successor `terminated` (`provisioning_failed`) | `409 lab_not_current` |
+| Done | Successor `ready` | `200` with the successor |
+
+A successor that failed is never replaced by another one for the same old lab: that replacement happened, and its result failed. The student starts a new lab with `POST /api/labs`, which the client offers once it has read the current state.
+
+The version created is the one selected in step 4, even if a sync publishes another version, or archives the mission, before step 6. Versions are immutable, so what was checked is what is provisioned, as for a lab that was already active.
+
+Concurrency relies on PostgreSQL, not on process memory:
+
+- Two replacements of one lab both end it (the first reason is kept) and both wait for the removal. The creation lock and `one_successor_per_lab` let one of them insert the successor; the other finds it and answers `200`, `409 lab_provisioning` or, for another mission, `409 lab_not_current`. When a reset and a switch race, the one that ended the lab first proceeds and the other answers `409 lab_not_current` without waiting.
+- `DELETE`, logout and the reaper end the old lab through the same path, and whoever records the reason first keeps it. The replacement then still creates the successor, except when a logout ended the old lab.
+- A lab created with `POST /api/labs` between steps 5 and 6 takes the user's one active place, and the replacement answers `409 lab_not_current`.
+- The old lab's terminal is closed with `4410` in step 5, and reconnecting to it is refused with `4410`. The successor's container has its own name and labels, and every removal of the old lab targets only the old lab's name and labels, so it cannot reach the new container.
+- A validation of the old lab already running when it is replaced is stored against the old lab if its probe completed, or ends as `error`. It never involves the successor.
+
+Accepted risks:
+
+- **Capacity taken after the check.** Another user can take the last place between the end of the old lab and the insert of the new one. The student is then left without a lab (`503 lab_capacity_reached`); asking again resumes the replacement once a place is free. The old lab is not restored: its container is gone.
+- **Logout during the removal.** A logout that arrives while the old lab is being removed finds it already ending with `reset` or `mission_switch`; the replacement then creates the successor after the session was deleted. Nobody can open it, and the reaper ends it after 15 minutes without a terminal (`no_terminal`). A `POST /api/labs` racing a logout behaves the same way.
+- **Duration.** A replacement can take up to about 100 seconds: up to 15 s for the terminal, 10 s for a removal already in progress, then up to 70 s of provisioning. The reverse proxy of increment 13 has to allow it.
+- **One process.** Closing the old lab's terminal relies on the in-process terminal registry, as every way of ending a lab does. With several API processes, a terminal opened on another process would close only when the container is removed.
 
 ### Timeouts
 
@@ -261,7 +314,7 @@ Versions are immutable: a trigger rejects `UPDATE` and `DELETE` on `mission_vers
 | Completed on version 1, version 2 released | Stays completed; `completed_version = 1` |
 | Completed on version 1, then passed on version 2 | Stays as it was: `completed_version = 1`, `newly_completed: false` |
 | Lab active on version 1 | Stays on version 1 until it ends, even if the mission is archived |
-| Reset (increment 10) or new lab | Uses the current version |
+| Reset, mission switch or new lab | Uses the current version; a replacement selects it before ending the previous lab |
 
 Students cannot pick an older version. A change that alters what the mission asks for should use a new slug.
 
