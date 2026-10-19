@@ -27,12 +27,19 @@ after that reads the pinned version. The container is then prepared (`labctl ini
 then the version's setup script) before the lab becomes ready. Only the request that
 inserted the row runs setup, once: a provisioning interrupted by a crash is failed by
 the reaper, never resumed.
+
+Replacing a lab (a reset, for the same mission, or a mission switch) never reuses it:
+the lab is ended and removed, then a new lab is created that names it in
+previous_lab_id. A lab has at most one successor (unique index), so repeating a
+replacement, or racing another one, converges on the same successor. There is no
+state of its own: a replacement interrupted after the lab ended is resumed by asking
+for it again. See docs/architecture.md#replacing-a-lab.
 """
 
 import asyncio
 import logging
 import uuid
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -44,9 +51,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from linuxlab.content.models import Mission, MissionVersion, Module
 from linuxlab.content.params import ParamError, generate_params
-from linuxlab.content.stored import InvalidSpecError, SetupScript, provisioning_spec
+from linuxlab.content.stored import (
+    InvalidSpecError,
+    ProvisioningSpec,
+    SetupScript,
+    provisioning_spec,
+)
 from linuxlab.labs.models import (
     ACTIVE_STATUSES,
+    REPLACEMENT_REASONS,
     RUNNING_STATUSES,
     EndReason,
     LabSession,
@@ -121,6 +134,17 @@ class MissionSpecError(Exception):
     is invalid or its parameters could not be generated. Nothing was created."""
 
 
+class NotCurrentError(Exception):
+    """The lab cannot be replaced: it already has a successor for another mission, the
+    user has another active lab, or it was ended by a logout or by a replacement of the
+    other kind."""
+
+
+class PreviousLabNotRemovedError(Exception):
+    """The lab being replaced has ended but its container could not be removed yet.
+    It stays terminating for the reaper; asking again resumes the replacement."""
+
+
 class PreparationError(Exception):
     """labctl init or setup did not complete. Carries no output and no parameter."""
 
@@ -133,6 +157,19 @@ class LabGoneError(Exception):
 class Creation:
     lab: LabSession
     created: bool
+
+
+@dataclass(frozen=True)
+class Target:
+    """A published mission version selected for a new lab, with what provisioning
+    reads. The parameters are secret."""
+
+    mission_id: int
+    slug: str
+    version: int
+    provisioning: ProvisioningSpec
+    image: str
+    params: dict[str, str]
 
 
 def utcnow() -> datetime:
@@ -180,7 +217,6 @@ class Labs:
         cap is reached and LabStartError if the container could not be started or
         prepared.
         """
-        now = utcnow()
         async with self._sessionmaker() as db:
             await db.execute(select(func.pg_advisory_xact_lock(CREATION_LOCK)))
             existing = await db.scalar(_active_lab(user_id))
@@ -188,61 +224,9 @@ class Labs:
                 return await self._existing(db, existing, mission_slug)
             # The version is read, and pinned below, in the transaction that inserts
             # the lab: a sync that publishes a new version afterwards does not change it.
-            pinned = (
-                await db.execute(
-                    select(Mission.id, MissionVersion.version, MissionVersion.spec)
-                    .join(Module, Module.id == Mission.module_id)
-                    .join(
-                        MissionVersion,
-                        (MissionVersion.mission_id == Mission.id)
-                        & (MissionVersion.version == Mission.current_version),
-                    )
-                    .where(
-                        (Mission.slug == mission_slug)
-                        & (Mission.status == PUBLISHED)
-                        & (Module.status == PUBLISHED)
-                        & Mission.position.is_not(None)
-                    )
-                )
-            ).one_or_none()
-            if pinned is None:
-                raise MissionNotFoundError(mission_slug)
-            mission_id, version, spec = pinned
+            target = await self._target(db, mission_slug)
             try:
-                provisioning = provisioning_spec(spec)
-                image = self._images[provisioning.environment.image]
-                params = generate_params(provisioning.params)
-            except (InvalidSpecError, ParamError, KeyError) as error:
-                # These messages name fields and parameters, never values.
-                logger.error(
-                    "lab not created, mission version unusable: mission=%s version=%s error=%s",
-                    mission_slug,
-                    version,
-                    error,
-                )
-                raise MissionSpecError(mission_slug) from None
-            active = await db.scalar(
-                select(func.count())
-                .select_from(LabSession)
-                .where(LabSession.status.in_(ACTIVE_STATUSES))
-            )
-            if (active or 0) >= self._capacity:
-                raise LabCapacityError
-            lab = LabSession(
-                id=uuid.uuid4(),
-                user_id=user_id,
-                status=LabStatus.PROVISIONING,
-                created_at=now,
-                last_activity_at=now,
-                expires_at=now + MAX_LIFETIME,
-                mission_id=mission_id,
-                mission_version=version,
-                params=params,
-            )
-            db.add(lab)
-            try:
-                # The partial unique index is what guarantees one active lab per user.
-                await db.commit()
+                lab = await self._insert(db, user_id, target)
             except IntegrityError as error:
                 await db.rollback()
                 if getattr(error.orig, "sqlstate", None) != UNIQUE_VIOLATION:
@@ -251,21 +235,104 @@ class Labs:
                 if existing is None:
                     raise
                 return await self._existing(db, existing, mission_slug)
-        logger.info(
-            "lab provisioning: lab=%s user=%s mission=%s version=%s",
-            lab.id,
-            user_id,
-            mission_slug,
-            version,
-        )
+        return await self._provision(lab, target)
 
+    async def _target(self, db: AsyncSession, mission_slug: str) -> Target:
+        """The mission's current version, if the mission is published, with its
+        parameters generated. Raises MissionNotFoundError or MissionSpecError."""
+        pinned = (
+            await db.execute(
+                select(Mission.id, MissionVersion.version, MissionVersion.spec)
+                .join(Module, Module.id == Mission.module_id)
+                .join(
+                    MissionVersion,
+                    (MissionVersion.mission_id == Mission.id)
+                    & (MissionVersion.version == Mission.current_version),
+                )
+                .where(
+                    (Mission.slug == mission_slug)
+                    & (Mission.status == PUBLISHED)
+                    & (Module.status == PUBLISHED)
+                    & Mission.position.is_not(None)
+                )
+            )
+        ).one_or_none()
+        if pinned is None:
+            raise MissionNotFoundError(mission_slug)
+        mission_id, version, spec = pinned
+        try:
+            provisioning = provisioning_spec(spec)
+            image = self._images[provisioning.environment.image]
+            params = generate_params(provisioning.params)
+        except (InvalidSpecError, ParamError, KeyError) as error:
+            # These messages name fields and parameters, never values.
+            logger.error(
+                "lab not created, mission version unusable: mission=%s version=%s error=%s",
+                mission_slug,
+                version,
+                error,
+            )
+            raise MissionSpecError(mission_slug) from None
+        return Target(mission_id, mission_slug, version, provisioning, image, params)
+
+    async def _insert(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        target: Target,
+        previous_lab_id: uuid.UUID | None = None,
+    ) -> LabSession:
+        """Insert the lab in provisioning and commit. The caller holds the creation lock.
+
+        Raises LabCapacityError when the global cap is reached, and IntegrityError when
+        the user already has an active lab or the previous lab a successor.
+        """
+        active = await db.scalar(
+            select(func.count())
+            .select_from(LabSession)
+            .where(LabSession.status.in_(ACTIVE_STATUSES))
+        )
+        if (active or 0) >= self._capacity:
+            raise LabCapacityError
+        now = utcnow()
+        lab = LabSession(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            status=LabStatus.PROVISIONING,
+            created_at=now,
+            last_activity_at=now,
+            expires_at=now + MAX_LIFETIME,
+            mission_id=target.mission_id,
+            mission_version=target.version,
+            params=target.params,
+            previous_lab_id=previous_lab_id,
+        )
+        db.add(lab)
+        # The partial unique indexes are what guarantee one active lab per user and one
+        # successor per lab.
+        await db.commit()
+        return lab
+
+    async def _provision(self, lab: LabSession, target: Target) -> Creation:
+        """Create, start and prepare the container of a lab just inserted, then mark it
+        ready."""
+        logger.info(
+            "lab provisioning: lab=%s user=%s mission=%s version=%s previous=%s",
+            lab.id,
+            lab.user_id,
+            target.slug,
+            target.version,
+            lab.previous_lab_id,
+        )
         try:
             async with asyncio.timeout(PROVISIONING_TIMEOUT.total_seconds()):
                 info = await self._runtime.create(
-                    LabContainerSpec(lab_id=lab.lab_key, image=image, deployment=self._deployment)
+                    LabContainerSpec(
+                        lab_id=lab.lab_key, image=target.image, deployment=self._deployment
+                    )
                 )
                 await self._runtime.start(info.id)
-                await self._prepare(lab.id, info.id, provisioning.setup, params)
+                await self._prepare(lab.id, info.id, target.provisioning.setup, target.params)
         except (LabRuntimeError, PreparationError, TimeoutError) as error:
             if await self._fail(lab.id, EndReason.PROVISIONING_FAILED):
                 logger.error("lab provisioning failed: lab=%s error=%s", lab.id, error)
@@ -281,18 +348,119 @@ class Labs:
             return Creation(ready, created=True)
         return Creation(await self._ended_while_provisioning(lab.id), created=True)
 
+    # Replacement
+
+    async def replace(
+        self, lab_id: uuid.UUID, mission_slug: str, *, admit: Callable[[], None]
+    ) -> Creation:
+        """Replace the lab with a new one for the mission: a reset when it is the lab's
+        mission, a mission switch otherwise. The caller has checked ownership.
+
+        1. If the lab already has a successor, return it when it is for this mission
+           (created=False, in whatever state it is) and raise NotCurrentError
+           otherwise. Nothing is created: a lab is replaced at most once.
+        2. Raise NotCurrentError if the user has another active lab, if the lab was
+           ended by a logout, or if a replacement of the other kind ended it.
+        3. Call `admit`, which raises to refuse, unless a replacement already ended the
+           lab: resuming it creates no more labs than the first attempt counted.
+        4. Select the mission's current version and generate its parameters (raises
+           MissionNotFoundError or MissionSpecError), and check that capacity is left
+           (LabCapacityError). The lab is untouched so far.
+        5. End the lab with `reset` or `mission_switch` (a reason recorded before is
+           kept) and remove its container. Raise PreviousLabNotRemovedError if the
+           removal is not confirmed.
+        6. Create the successor at the selected version and provision it as create()
+           does. From here on LabCapacityError (taken meanwhile) and LabStartError
+           leave the user without an active lab.
+        """
+        async with self._sessionmaker() as db:
+            source = await db.get(LabSession, lab_id)
+            assert source is not None
+            successor = await db.scalar(_successor(lab_id))
+            if successor is not None:
+                return await self._converge(db, successor, mission_slug)
+            active = await db.scalar(_active_lab(source.user_id))
+            if active is not None and active.id != source.id:
+                raise NotCurrentError(lab_id)
+            source_slug = await self._slug(db, source.mission_id)
+        reason = EndReason.RESET if source_slug == mission_slug else EndReason.MISSION_SWITCH
+        if source.end_reason == EndReason.LOGOUT:
+            raise NotCurrentError(lab_id)
+        if source.end_reason in REPLACEMENT_REASONS:
+            if source.end_reason != reason:
+                raise NotCurrentError(lab_id)
+        else:
+            admit()
+
+        async with self._sessionmaker() as db:
+            target = await self._target(db, mission_slug)
+            # The lab being replaced frees its own place.
+            active_count = await db.scalar(
+                select(func.count())
+                .select_from(LabSession)
+                .where(LabSession.status.in_(ACTIVE_STATUSES), LabSession.id != lab_id)
+            )
+        if (active_count or 0) >= self._capacity:
+            raise LabCapacityError
+        logger.info(
+            "lab replacement: lab=%s reason=%s mission=%s version=%s",
+            lab_id,
+            reason,
+            target.slug,
+            target.version,
+        )
+
+        ended = await self.end(lab_id, reason)
+        assert ended is not None
+        if ended.status != LabStatus.TERMINATED:
+            raise PreviousLabNotRemovedError(lab_id)
+        if ended.end_reason == EndReason.LOGOUT:
+            # Logged out while the lab was being replaced.
+            raise NotCurrentError(lab_id)
+        return await self._create_successor(ended, target)
+
+    async def _create_successor(self, source: LabSession, target: Target) -> Creation:
+        async with self._sessionmaker() as db:
+            await db.execute(select(func.pg_advisory_xact_lock(CREATION_LOCK)))
+            successor = await db.scalar(_successor(source.id))
+            if successor is not None:
+                return await self._converge(db, successor, target.slug)
+            if await db.scalar(_active_lab(source.user_id)) is not None:
+                raise NotCurrentError(source.id)
+            try:
+                lab = await self._insert(db, source.user_id, target, previous_lab_id=source.id)
+            except IntegrityError as error:
+                await db.rollback()
+                if getattr(error.orig, "sqlstate", None) != UNIQUE_VIOLATION:
+                    raise
+                successor = await db.scalar(_successor(source.id))
+                if successor is None:
+                    raise NotCurrentError(source.id) from None
+                return await self._converge(db, successor, target.slug)
+        return await self._provision(lab, target)
+
+    async def _converge(
+        self, db: AsyncSession, successor: LabSession, mission_slug: str
+    ) -> Creation:
+        """The lab's successor, if it is for the mission asked for."""
+        if await self._slug(db, successor.mission_id) != mission_slug:
+            raise NotCurrentError(successor.previous_lab_id)
+        return Creation(successor, created=False)
+
+    async def _slug(self, db: AsyncSession, mission_id: int | None) -> str | None:
+        if mission_id is None:
+            return None
+        return await db.scalar(select(Mission.slug).where(Mission.id == mission_id))
+
     async def _existing(
         self, db: AsyncSession, existing: LabSession, mission_slug: str
     ) -> Creation:
         """The user's active lab, unless it is for another mission and not ending."""
-        if existing.status != LabStatus.TERMINATING:
-            slug = None
-            if existing.mission_id is not None:
-                slug = await db.scalar(
-                    select(Mission.slug).where(Mission.id == existing.mission_id)
-                )
-            if slug != mission_slug:
-                raise DifferentMissionError(existing)
+        if (
+            existing.status != LabStatus.TERMINATING
+            and await self._slug(db, existing.mission_id) != mission_slug
+        ):
+            raise DifferentMissionError(existing)
         return Creation(existing, created=False)
 
     async def _prepare(
@@ -553,6 +721,10 @@ class Labs:
             )
             await db.commit()
             return lab
+
+
+def _successor(lab_id: uuid.UUID) -> Select[LabSession]:
+    return select(LabSession).where(LabSession.previous_lab_id == lab_id)
 
 
 def _active_lab(user_id: uuid.UUID) -> Select[LabSession]:
