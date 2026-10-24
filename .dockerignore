@@ -11,3 +11,5 @@ docs
 infra
 lab-image
 tests
+# Private mission content must never enter the image build context.
+linux-lab-content

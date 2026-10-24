@@ -38,3 +38,6 @@ backups/
 *.swp
 .DS_Store
 Thumbs.db
+
+# The private mission content is cloned next to this repository, never inside it.
+/linux-lab-content/

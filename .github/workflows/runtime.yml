@@ -1,7 +1,8 @@
 name: Runtime
 
 # Runs the Docker integration, isolation and lab lifecycle tests, and the mission
-# harness, under gVisor (runsc), the production runtime. Kept separate from CI because
+# harness on synthetic missions, under gVisor (runsc), the production runtime. The
+# real missions are private and are tested in the content repository. Kept separate from CI because
 # it installs a container runtime on the runner.
 
 on:
@@ -10,7 +11,6 @@ on:
   pull_request:
     paths:
       - "src/linuxlab/**"
-      - "content/**"
       - "migrations/**"
       - "tests/**"
       - "lab-image/**"
@@ -84,7 +84,7 @@ jobs:
         run: uv run pytest -m "docker or runsc" -v -rA
 
   mission-labs:
-    name: Mission labs (runsc)
+    name: Mission harness, synthetic missions (runsc)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -140,6 +140,3 @@ jobs:
 
       - name: Harness in real labs (synthetic missions)
         run: uv run pytest -m "mission_labs and not content" -v -rA
-      - name: Missions of the content under test
-        if: ${{ !cancelled() }}
-        run: uv run pytest -m "mission_labs and content" -v -rA
