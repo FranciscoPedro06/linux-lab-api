@@ -21,10 +21,9 @@ setup:
   timeout_seconds: 5
 
 validation:
-  not:
-    id: out-missing
-    type: path_absent
-    path: /home/student/out
+  id: out-directory
+  type: directory_exists
+  path: /home/student/out
   fail_message: "O diretório ~/out ainda não existe."
 
 solutions:
