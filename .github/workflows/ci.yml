@@ -90,11 +90,11 @@ jobs:
       - name: Lab runtime, lifecycle, reaper and terminal tests
         run: uv run pytest -m docker -v -rA
 
-  # Mission harness (docs/missions.md#mission-tests). Each job runs the harness's own
-  # tests first, then the content under test (content/), so a failure of the content
-  # shows as its own step.
+  # Mission harness (docs/missions.md#mission-tests) on synthetic missions only. The
+  # real missions are private and are tested in the content repository, never here:
+  # code from a pull request must not run next to their solutions.
   missions:
-    name: Mission harness (PostgreSQL)
+    name: Mission harness, synthetic missions (PostgreSQL)
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -119,14 +119,11 @@ jobs:
           version: "0.12.19"
       - run: uv sync --locked
       - run: uv run alembic upgrade head
-      - name: Harness on a FakeRuntime
+      - name: Harness on a FakeRuntime (synthetic missions)
         run: uv run pytest -m missions -v -rA
-      - name: Content under test (static checks, initial missions)
-        if: ${{ !cancelled() }}
-        run: uv run pytest -m "content and not mission_labs" -v -rA
 
   mission-labs:
-    name: Mission labs (Docker, runc)
+    name: Mission harness, synthetic missions (Docker, runc)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -157,9 +154,6 @@ jobs:
       - run: uv run alembic upgrade head
       - name: Harness in real labs (synthetic missions)
         run: uv run pytest -m "mission_labs and not content" -v -rA
-      - name: Missions of the content under test
-        if: ${{ !cancelled() }}
-        run: uv run pytest -m "mission_labs and content" -v -rA
 
   docker:
     name: Docker image
@@ -167,4 +161,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: docker build --target prod --tag linuxlab-api:ci .
+      - name: Check that the image holds no mission content and no tests
+        run: |
+          set -euo pipefail
+          files=$(docker run --rm --entrypoint find linuxlab-api:ci /app/content -type f)
+          test "$files" = "/app/content/.gitkeep"
+          docker run --rm --entrypoint sh linuxlab-api:ci -c 'test ! -e /app/tests'
       - run: docker build --tag linuxlab/lab-base:ci lab-image
