@@ -43,6 +43,7 @@ docs/architecture.md#logout-and-lab-creation.
 """
 
 import asyncio
+import enum
 import logging
 import uuid
 from collections.abc import Callable, Collection, Mapping
@@ -157,8 +158,25 @@ class PreviousLabNotRemovedError(Exception):
     It stays terminating for the reaper; asking again resumes the replacement."""
 
 
+class PreparationStage(enum.StrEnum):
+    INIT = "init"  # labctl init, part of the platform
+    SETUP = "setup"  # the mission version's setup script
+
+
 class PreparationError(Exception):
-    """labctl init or setup did not complete. Carries no output and no parameter."""
+    """labctl init or setup did not complete. Carries no output and no parameter.
+
+    `stage` and `timed_out` say which command failed and how, so that callers (the
+    mission tests) can tell a platform failure from a mission's own without reading
+    the message.
+    """
+
+    def __init__(self, stage: PreparationStage, exit_code: int, timed_out: bool) -> None:
+        command = "labctl init" if stage == PreparationStage.INIT else "setup"
+        super().__init__(f"{command}: exit {exit_code}, timed out {timed_out}")
+        self.stage = stage
+        self.exit_code = exit_code
+        self.timed_out = timed_out
 
 
 class LabGoneError(Exception):
@@ -518,9 +536,7 @@ class Labs:
             container_id, LABCTL_INIT, user="root", time_limit=LABCTL_INIT_SECONDS
         )
         if init.exit_code != 0 or init.timed_out:
-            raise PreparationError(
-                f"labctl init: exit {init.exit_code}, timed out {init.timed_out}"
-            )
+            raise PreparationError(PreparationStage.INIT, init.exit_code, init.timed_out)
         result = await self._runtime.exec(
             container_id,
             SETUP_COMMAND,
@@ -536,7 +552,7 @@ class Labs:
             result.timed_out,
         )
         if result.exit_code != 0 or result.timed_out:
-            raise PreparationError(f"setup: exit {result.exit_code}, timed out {result.timed_out}")
+            raise PreparationError(PreparationStage.SETUP, result.exit_code, result.timed_out)
 
     async def _ended_while_provisioning(self, lab_id: uuid.UUID) -> LabSession:
         # Ended by logout, delete or the reaper. Whoever ended it may have removed the
