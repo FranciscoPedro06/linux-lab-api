@@ -1,0 +1,1 @@
+printf 'ok' > ~/feito

@@ -1,0 +1,36 @@
+schema: 1
+slug: failing-setup
+title: Setup que falha
+summary: "O setup termina com erro."
+difficulty: 1
+estimated_minutes: 5
+status: published
+
+briefing: briefing.md
+explanation: briefing.md
+objectives:
+  - "Existe `~/feito` com `ok`."
+
+environment:
+  image: base
+  profile: default
+
+setup:
+  script: setup.sh
+  timeout_seconds: 10
+
+validation:
+  id: done
+  type: file_content
+  path: /home/student/feito
+  contains: ok
+
+solutions:
+  - label: echo
+    script: tests/solution-echo.sh
+  - label: printf
+    script: tests/solution-printf.sh
+
+counterexamples:
+  - label: touch
+    script: tests/counter-touch.sh

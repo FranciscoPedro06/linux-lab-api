@@ -1,0 +1,11 @@
+schema: 1
+slug: harness
+title: Harness
+description: Missões sintéticas que mostram o que os testes de missão detectam.
+status: draft
+missions:
+  - harness-draft
+  - leaky-setup
+  - weak-validation
+  - solved-at-start
+  - failing-setup

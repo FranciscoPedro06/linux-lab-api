@@ -1,0 +1,36 @@
+schema: 1
+slug: weak-validation
+title: Validação fraca
+summary: "Uma solução que não resolve e um contraexemplo que resolve."
+difficulty: 1
+estimated_minutes: 5
+status: published
+
+briefing: briefing.md
+explanation: briefing.md
+objectives:
+  - "Existe `~/feito` com `ok`."
+
+environment:
+  image: base
+  profile: default
+
+setup:
+  script: setup.sh
+  timeout_seconds: 10
+
+validation:
+  id: done
+  type: file_content
+  path: /home/student/feito
+  contains: ok
+
+solutions:
+  - label: echo
+    script: tests/solution-echo.sh
+  - label: touch
+    script: tests/solution-touch.sh
+
+counterexamples:
+  - label: printf
+    script: tests/counter-printf.sh
