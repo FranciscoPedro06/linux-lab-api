@@ -2,9 +2,9 @@
 CI, runsc in the Runtime workflow), with PostgreSQL.
 
 - `content`: every case of every mission in the content directory under test.
-- Synthetic missions: those of tests/fixtures/content pass, except a counterexample
-  the harness shows to be too weak; those of tests/fixtures/harness fail each in the
-  way they were written to, and the draft among them passes.
+- Synthetic missions: those of tests/fixtures/content pass; those of
+  tests/fixtures/harness fail each in the way they were written to, and the draft
+  among them passes.
 """
 
 from collections.abc import AsyncIterator
@@ -19,6 +19,7 @@ from tests.labs.support import OCI_RUNTIME
 
 from .conftest import (
     HARNESS_FIXTURE,
+    ContentDirError,
     Databases,
     Prepared,
     active_labs,
@@ -33,7 +34,10 @@ pytestmark = pytest.mark.mission_labs
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "content_case" in metafunc.fixturenames:
-        ids = content_case_ids(content_dir())
+        try:
+            ids = content_case_ids(content_dir())
+        except ContentDirError:
+            ids = []
         metafunc.parametrize("content_case", ids, ids=ids)
 
 
@@ -80,17 +84,21 @@ async def broken(
 @pytest.mark.content
 def test_the_content_directory_has_cases() -> None:
     # Without it, a content directory with no missions would only skip test_mission_case.
-    root = content_dir()
-    assert content_case_ids(root), (
-        f"{root} has no mission cases to run; see test_content.py for the reason"
-    )
+    try:
+        root = content_dir()
+    except ContentDirError as error:
+        pytest.fail(str(error), pytrace=False)
+    if not content_case_ids(root):
+        pytest.fail(f"{root} has no mission cases to run", pytrace=False)
 
 
 @pytest.mark.content
 async def test_mission_case(content: tuple[Prepared, Harness], content_case: str) -> None:
     prepared, harness = content
     result = await harness.run(prepared.case(content_case))
-    assert result.ok, report(result)
+    if not result.ok:
+        # pytrace=False: no traceback or assertion details, only the sanitized report.
+        pytest.fail(report(result), pytrace=False)
 
 
 @pytest.mark.parametrize(
@@ -104,27 +112,13 @@ async def test_mission_case(content: tuple[Prepared, Harness], content_case: str
         "sample-answer:counterexample-1",
         "sample-draft:solution-1",
         "sample-draft:solution-2",
+        "sample-draft:counterexample-1",
     ],
 )
 async def test_the_synthetic_missions_pass(fixtures: tuple[Prepared, Harness], case: str) -> None:
     prepared, harness = fixtures
     result = await harness.run(prepared.case(case))
     assert result.ok, report(result)
-
-
-async def test_a_counterexample_the_validation_accepts_is_reported(
-    fixtures: tuple[Prepared, Harness],
-) -> None:
-    # sample-draft only asks that ~/out exists; its counterexample creates a file there.
-    prepared, harness = fixtures
-    result = await harness.run(prepared.case("sample-draft:counterexample-1"))
-
-    assert result.failure is not None
-    assert (result.failure.code, result.step) == (
-        FailureCode.COUNTEREXAMPLE_NOT_FAILED,
-        Step.VALIDATE,
-    )
-    assert result.failure.detail == "expected failed, got passed; out-missing=failed(mismatch)"
 
 
 @pytest.mark.parametrize(

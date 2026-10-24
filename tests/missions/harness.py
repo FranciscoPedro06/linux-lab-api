@@ -24,7 +24,7 @@ say how a mission is solved.
 import enum
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -164,7 +164,9 @@ class MissionUnderTest:
     slug: str
     version: int
     content_hash: str
-    spec: Mapping[str, Any]
+    # Holds the scripts and conditions: kept out of repr, so that no failure message,
+    # traceback or log prints it.
+    spec: Mapping[str, Any] = field(repr=False)
 
     @property
     def short_hash(self) -> str:

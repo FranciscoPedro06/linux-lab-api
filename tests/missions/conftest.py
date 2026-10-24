@@ -18,7 +18,6 @@ from pathlib import Path
 
 import aiodocker
 import pytest
-from pydantic import ValidationError
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
@@ -28,7 +27,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from linuxlab.config import DEFAULT_CONTENT_DIR, get_settings
+from linuxlab.config import get_settings
 from linuxlab.content.loader import ContentInvalid, load_content
 from linuxlab.db import create_engine, create_sessionmaker
 from linuxlab.labs.lifecycle import Labs
@@ -44,12 +43,31 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 HARNESS_FIXTURE = REPOSITORY / "tests" / "fixtures" / "harness"
 
 
+class ContentDirError(Exception):
+    pass
+
+
 def content_dir() -> Path:
-    """The content directory under test: CONTENT_DIR, as for `linuxlab content sync`."""
-    try:
-        return get_settings().content_dir
-    except ValidationError:
-        return Path(os.environ.get("CONTENT_DIR") or DEFAULT_CONTENT_DIR)
+    """The content directory under test, from CONTENT_DIR in the environment.
+
+    There is no default: mission content is private and lives outside this
+    repository, so an unset variable is an error rather than an empty catalog. A
+    directory inside this repository is refused too, so private content is never
+    placed where a commit, the image build context or an artifact could take it.
+    """
+    value = os.environ.get("CONTENT_DIR")
+    if not value:
+        raise ContentDirError(
+            "CONTENT_DIR is not set; point it to the content/ directory of the private "
+            "mission content (docs/missions.md#content-source)"
+        )
+    root = Path(value).resolve()
+    if root.is_relative_to(REPOSITORY):
+        raise ContentDirError(
+            f"CONTENT_DIR must be outside this repository, got {root} "
+            "(docs/missions.md#content-source)"
+        )
+    return root
 
 
 def content_case_ids(root: Path) -> list[str]:

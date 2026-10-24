@@ -1,7 +1,8 @@
 """Static checks of the mission harness, and the content directory under test.
 
-Tests marked `content` read the content directory under test (CONTENT_DIR, by
-default content/ of this repository) and fail when it lacks the initial missions.
+Tests marked `content` read the content directory under test (CONTENT_DIR, which
+has no default and must be outside this repository) and fail when it lacks the
+initial missions.
 The others check the static checks themselves on synthetic content.
 """
 
@@ -14,22 +15,50 @@ import pytest
 from linuxlab.content.loader import load_content
 from tests.content.support import FIXTURE, copy_fixture, edit_yaml, mission_file
 
-from .conftest import HARNESS_FIXTURE, content_dir
+from .conftest import HARNESS_FIXTURE, REPOSITORY, ContentDirError, content_dir
 from .harness import INITIAL_MISSIONS, static_check
+
+PUBLIC_CONTENT = REPOSITORY / "content"
 
 
 @pytest.mark.content
 def test_the_content_directory_holds_the_initial_missions() -> None:
-    root = content_dir()
+    try:
+        root = content_dir()
+    except ContentDirError as error:
+        pytest.fail(str(error), pytrace=False)
     problems = static_check(root)
-    assert not problems, f"{root}:\n" + "\n".join(problems)
+    if problems:
+        pytest.fail(f"{root}:\n" + "\n".join(problems), pytrace=False)
     slugs = {mission.slug for mission in load_content(root).missions}
     missing = [slug for slug in INITIAL_MISSIONS if slug not in slugs]
-    assert not missing, (
-        f"{root} lacks the initial missions {', '.join(missing)}. content/ in this "
-        "repository holds no missions until their source is decided (see "
-        "docs/missions.md#content-source); set CONTENT_DIR to a directory that holds them."
-    )
+    if missing:
+        pytest.fail(f"{root} lacks the initial missions {', '.join(missing)}", pytrace=False)
+
+
+def test_this_repository_publishes_no_missions() -> None:
+    # Mission content, solutions included, lives in the private content repository.
+    # content/ here only keeps the directory the production image copies.
+    files = [path.relative_to(PUBLIC_CONTENT).as_posix() for path in PUBLIC_CONTENT.rglob("*")]
+    assert files == [".gitkeep"]
+
+
+def test_the_harness_reads_only_an_explicit_content_directory_outside_the_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("CONTENT_DIR", raising=False)
+    with pytest.raises(ContentDirError, match="CONTENT_DIR is not set"):
+        content_dir()
+    monkeypatch.setenv("CONTENT_DIR", str(PUBLIC_CONTENT))
+    with pytest.raises(ContentDirError, match="must be outside this repository"):
+        content_dir()
+    monkeypatch.setenv("CONTENT_DIR", str(tmp_path))
+    assert content_dir() == tmp_path.resolve()
+
+
+def test_the_image_build_context_leaves_tests_out() -> None:
+    ignored = (REPOSITORY / ".dockerignore").read_text(encoding="utf-8").split()
+    assert "tests" in ignored
 
 
 def test_the_synthetic_content_passes_the_static_checks() -> None:
