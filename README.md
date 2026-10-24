@@ -174,7 +174,7 @@ uv run pytest                  # unit tests
 uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), content sync, catalog, schema, validation, migrations; PostgreSQL at DATABASE_URL
 uv run pytest -m docker                         # lab runtime, isolation, terminal, lab lifecycle, mission setup and validation; Docker, the lab image and PostgreSQL (Linux: see docs/runtime.md)
 uv run pytest -m missions                       # mission harness on a FakeRuntime; PostgreSQL
-uv run pytest -m content                        # static checks of the content under test (CONTENT_DIR)
+uv run pytest -m "content and not mission_labs"  # static checks of the content under test (CONTENT_DIR)
 uv run pytest -m mission_labs                   # mission cases in real labs; Docker, the lab image and PostgreSQL
 ```
 

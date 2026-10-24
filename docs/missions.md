@@ -342,7 +342,7 @@ Cases are named by position (`solution-2` is the second entry of `solutions`), s
 
 ```sh
 uv run pytest -m missions                                  # the harness on a FakeRuntime; PostgreSQL
-uv run pytest -m content                                   # static checks of CONTENT_DIR and the initial missions
+uv run pytest -m "content and not mission_labs"           # static checks of CONTENT_DIR and the initial missions
 uv run pytest -m mission_labs                              # cases in real labs; Docker, the lab image and PostgreSQL
 uv run pytest -m "mission_labs and content" -k secure-deploy-script
 CONTENT_DIR=/path/to/content uv run pytest -m "content or mission_labs"
