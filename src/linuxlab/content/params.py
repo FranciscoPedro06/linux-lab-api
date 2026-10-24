@@ -79,3 +79,23 @@ def _generate(param: Param, randomness: Randomness) -> str:
         case WordParam():
             return randomness.choice(WORDS)
     raise ParamError(f"unknown generator: {type(param).__name__}")
+
+
+def value_count(param: Param) -> int:
+    """How many distinct values the generator can draw for this parameter.
+
+    Follows _generate: each generator draws uniformly from exactly this many values.
+    The mission tests use it to refuse a parameter that cannot vary between labs.
+    """
+    match param:
+        case HexParam(length=length):
+            # int ** int is typed as Any, since a negative exponent gives a float.
+            count: int = len(HEX_DIGITS) ** length
+            return count
+        case IntParam(min=low, max=high):
+            return high - low + 1
+        case ChoiceParam(values=choices):
+            return len(set(choices))
+        case WordParam():
+            return len(set(WORDS))
+    raise ParamError(f"unknown generator: {type(param).__name__}")

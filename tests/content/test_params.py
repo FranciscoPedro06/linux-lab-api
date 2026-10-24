@@ -1,6 +1,7 @@
 """Parameter generation, with a scripted source of randomness."""
 
 import builtins
+import itertools
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -13,6 +14,7 @@ from linuxlab.content.params import (
     WORDS,
     ParamError,
     generate_params,
+    value_count,
 )
 from linuxlab.content.schema import PARAM_VALUE, ChoiceParam, IntParam, Param, ParamName
 
@@ -184,3 +186,42 @@ def test_generators_are_the_schema_models() -> None:
     )
     assert isinstance(params["n"], IntParam)
     assert isinstance(params["c"], ChoiceParam)
+
+
+def test_independent_calls_draw_new_values() -> None:
+    params = declared(token={"generator": "hex", "length": 1})
+    randomness = Scripted(3, 12)
+
+    first = generate_params(params, randomness)
+    second = generate_params(params, randomness)
+
+    assert (first, second) == ({"token": "3"}, {"token": "c"})
+    assert randomness.draws == [16, 16]
+
+
+@pytest.mark.parametrize(
+    ("param", "draws"),
+    [
+        ({"generator": "hex", "length": 1}, 1),
+        ({"generator": "hex", "length": 2}, 2),
+        ({"generator": "int", "min": -2, "max": 2}, 1),
+        ({"generator": "int", "min": 7, "max": 7}, 1),
+        ({"generator": "choice", "values": ["red", "green", "blue"]}, 1),
+        ({"generator": "choice", "values": ["red"]}, 1),
+        ({"generator": "word"}, 1),
+    ],
+)
+def test_value_count_is_what_the_generator_can_draw(param: dict[str, Any], draws: int) -> None:
+    params = declared(p=param)
+    bound = max(len(HEX_DIGITS), len(WORDS), 5)
+    values = {
+        generate_params(params, Scripted(*indexes))["p"]
+        for indexes in itertools.product(range(bound), repeat=draws)
+    }
+    assert value_count(params["p"]) == len(values)
+
+
+def test_value_count_of_large_ranges() -> None:
+    assert value_count(declared(t={"generator": "hex", "length": 64})["t"]) == 16**64
+    extreme = declared(n={"generator": "int", "min": -(10**18), "max": 10**18})
+    assert value_count(extreme["n"]) == 2 * 10**18 + 1
