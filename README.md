@@ -34,14 +34,14 @@ validation:
   all:
     - id: exists
       type: file_exists
-      path: /home/student/deploy.sh
+      path: /home/student/relatorio.txt
     - id: mode
       type: file_permissions
-      path: /home/student/deploy.sh
-      mode: "0700"
+      path: /home/student/relatorio.txt
+      mode: "0600"
 ```
 
-`chmod 700 deploy.sh`, `chmod u=rwx,go= deploy.sh`, or anything else that reaches the same state would pass.
+`chmod 600 relatorio.txt`, `chmod u=rw,go= relatorio.txt`, or anything else that reaches the same state would pass.
 
 ## Architecture
 
@@ -123,7 +123,7 @@ To use a terminal, build the lab image once, publish missions (below), sign up w
 docker build --tag linuxlab/lab-base:dev lab-image
 ```
 
-Labs are only created for published missions, and `content/` holds none yet ([docs/missions.md](docs/missions.md#content-source)). For local development, sync the synthetic missions used by the tests, from the host:
+Labs are only created for published missions. The missions are private and `content/` here holds none ([docs/missions.md](docs/missions.md#content-source)). For local development, sync the synthetic missions used by the tests, from the host:
 
 ```sh
 uv run linuxlab content sync --content-dir tests/fixtures/content
@@ -160,7 +160,7 @@ uv run linuxlab content sync                                        # API on the
 docker compose -f infra/compose.yml exec api linuxlab content sync   # Compose
 ```
 
-The sync validates everything first and writes in one transaction, so invalid content changes nothing. It refuses an empty `content/` unless given `--allow-empty`. The repository holds no missions yet ([docs/missions.md](docs/missions.md#content-source)); `CONTENT_DIR` can point the sync to another directory. The tests use synthetic content from `tests/fixtures/`, which is never synced outside development.
+The sync validates everything first and writes in one transaction, so invalid content changes nothing. It refuses an empty `content/` unless given `--allow-empty`. This repository holds no missions: they live in a private repository ([docs/missions.md](docs/missions.md#content-source)), and `CONTENT_DIR` points the sync to a checkout of it, outside this repository. The tests use synthetic content from `tests/fixtures/`, which is never synced outside development.
 
 `ENVIRONMENT` defaults to `production`, which refuses to start unless labs run under gVisor (`LAB_OCI_RUNTIME=runsc`, registered with Docker). `.env.example` and Compose set `development`. `GET /api/health` reports the database and the lab runtime separately.
 
@@ -173,18 +173,17 @@ uv run mypy
 uv run pytest                  # unit tests
 uv run pytest -m "integration and not docker"  # authentication, labs, reaper, terminal (FakeRuntime), content sync, catalog, schema, validation, migrations; PostgreSQL at DATABASE_URL
 uv run pytest -m docker                         # lab runtime, isolation, terminal, lab lifecycle, mission setup and validation; Docker, the lab image and PostgreSQL (Linux: see docs/runtime.md)
-uv run pytest -m missions                       # mission harness on a FakeRuntime; PostgreSQL
-uv run pytest -m "content and not mission_labs"  # static checks of the content under test (CONTENT_DIR)
-uv run pytest -m mission_labs                   # mission cases in real labs; Docker, the lab image and PostgreSQL
+uv run pytest -m missions                       # mission harness on a FakeRuntime, synthetic missions; PostgreSQL
+uv run pytest -m "mission_labs and not content"  # mission harness in real labs, synthetic missions; Docker, the lab image and PostgreSQL
 ```
 
-The mission tests, their reports and the content they read are described in [docs/missions.md](docs/missions.md#mission-tests).
+The real missions are tested with `CONTENT_DIR` pointing to the private content (`-m content`); the mission tests, their reports, the commands and where each runs are described in [docs/missions.md](docs/missions.md#mission-tests).
 
 Lab runtime tests, gVisor setup and the list of isolation checks are described in [docs/runtime.md](docs/runtime.md).
 
 The integration tests empty the `users`, `auth_sessions`, `lab_sessions`, `validation_runs`, `user_missions`, `modules`, `missions` and `mission_versions` tables and run the migrations down and up again, so point `DATABASE_URL` at a development database. The mission tests instead create their own databases on that server and drop them afterwards, so its user needs `CREATEDB`. On Windows, use `127.0.0.1` rather than `localhost` in `DATABASE_URL`; each connection to `localhost` can wait about two seconds for IPv6 first.
 
-CI runs the same checks, the integration tests against a PostgreSQL service, the Docker tests under runc, a migration downgrade and upgrade, the mission harness and the missions of `content/` (on a FakeRuntime and in labs under runc), and builds the API and lab images. A separate `Runtime` workflow runs the Docker tests and the mission cases under gVisor.
+CI runs the same checks, the integration tests against a PostgreSQL service, the Docker tests under runc, a migration downgrade and upgrade, the mission harness on synthetic missions (on a FakeRuntime and in labs under runc), and builds the API and lab images, checking that the API image holds no mission content. A separate `Runtime` workflow runs the Docker tests and the synthetic mission cases under gVisor. The real missions are tested by a workflow of the private content repository, under runc and runsc.
 
 Planned coverage as the project grows:
 
@@ -193,7 +192,7 @@ Planned coverage as the project grows:
 - **Security:** access to another user's lab, unauthenticated WebSocket, invalid `Origin`, and checks run inside the container (non-root user, no capabilities, no network, no Docker socket, read-only rootfs, fork bomb containment).
 ## Status
 
-Increments 01 to 10 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; the mission catalog, with content validated and synced from `content/` into immutable versions; labs created for a mission, pinned to its version, with generated parameters and the mission's setup run inside the lab; and the validation engine, which checks a lab's state against its pinned mission version with RE2 patterns and `labctl probe`, and stores each run in `validation_runs`; and progress, which records in `user_missions` the first completion of each mission, in the transaction of the run that passed, and shows it in the catalog; and reset and mission switching, which replace a lab with a new lab linked to it. In increment 11, the mission test harness runs each mission's solutions and counterexamples in fresh labs under runc and runsc; the first five missions wait for a content source that does not publish their solutions ([docs/missions.md](docs/missions.md#content-source)). Planned order:
+Increments 01 to 10 are implemented: application skeleton, database connection, local environment and CI; the lab image and the lab runtime with isolation tests; the terminal, a WebSocket to a real shell in the lab; accounts with server-side sessions; lab sessions, with ownership, the lab lifecycle, timeouts, the reaper and an authenticated terminal; the mission catalog, with content validated and synced from `content/` into immutable versions; labs created for a mission, pinned to its version, with generated parameters and the mission's setup run inside the lab; and the validation engine, which checks a lab's state against its pinned mission version with RE2 patterns and `labctl probe`, and stores each run in `validation_runs`; and progress, which records in `user_missions` the first completion of each mission, in the transaction of the run that passed, and shows it in the catalog; and reset and mission switching, which replace a lab with a new lab linked to it. In increment 11, the mission test harness runs each mission's solutions and counterexamples in fresh labs under runc and runsc, and the first five missions are written; they live in a private repository so their solutions stay unpublished ([docs/missions.md](docs/missions.md#content-source)). Planned order:
 
 | # | Increment |
 |---|---|

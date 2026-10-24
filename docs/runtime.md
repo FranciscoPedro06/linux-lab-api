@@ -103,9 +103,9 @@ LINUXLAB_TEST_OCI_RUNTIME=runsc uv run pytest -m "docker or runsc"
 
 Tests that use the lab lifecycle or the terminal also need PostgreSQL at `DATABASE_URL`, with migrations applied. Every lab container a test creates is labeled with a test-only `linuxlab.deployment`, so a local environment's reaper never removes it, and vice versa.
 
-The `CI` workflow runs the Docker tests under runc (job `Lab integration (Docker, runc)`). The `Runtime` workflow installs gVisor on an Ubuntu runner, with a PostgreSQL service, and runs the last command. It runs on pushes to `main`, on pull requests that touch application code, mission content, migrations, tests, the lab image or the workflow, and on demand. It is not a required check yet.
+The `CI` workflow runs the Docker tests under runc (job `Lab integration (Docker, runc)`). The `Runtime` workflow installs gVisor on an Ubuntu runner, with a PostgreSQL service, and runs the last command. It runs on pushes to `main`, on pull requests that touch application code, migrations, tests, the lab image or the workflow, and on demand. It is not a required check yet.
 
-The mission cases ([missions.md](missions.md#mission-tests)) run the same way, in jobs of their own: `Mission labs (Docker, runc)` in `CI` and `Mission labs (runsc)` in `Runtime`. runsc is the production runtime, so a mission is ready only when both pass.
+The mission harness ([missions.md](missions.md#mission-tests)) runs on synthetic missions the same way, in jobs of their own: `Mission harness, synthetic missions (Docker, runc)` in `CI` and `Mission harness, synthetic missions (runsc)` in `Runtime`. The real missions run under both runtimes in the private content repository. runsc is the production runtime, so a mission is ready only when it passes under both.
 
 ## Verification status
 

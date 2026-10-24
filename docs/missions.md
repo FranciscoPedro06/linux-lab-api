@@ -11,7 +11,7 @@ content/
   modules/
     fundamentals.yaml
   missions/
-    secure-deploy-script/
+    private-report/
       mission.yaml
       briefing.md
       explanation.md
@@ -71,20 +71,17 @@ title: Fundamentos
 description: Navegar, criar e organizar arquivos.
 status: published
 missions:
-  - notes-backup
-  - tidy-project
-  - secure-deploy-script
-  - hidden-file
-  - runaway-process
+  - private-report
+  - another-mission
 ```
 
 ## `mission.yaml`
 
 ```yaml
 schema: 1
-slug: secure-deploy-script
-title: Proteja o script de deploy
-summary: Qualquer usuário consegue ler um script que contém um token.
+slug: private-report
+title: Relatório privado
+summary: Qualquer usuário consegue ler um relatório confidencial.
 difficulty: 1
 estimated_minutes: 5
 status: published
@@ -93,15 +90,15 @@ tags: [permissions, chmod]
 briefing: briefing.md
 explanation: explanation.md
 objectives:
-  - "`~/deploy.sh` continua existindo, com o conteúdo original."
-  - "Somente o dono pode ler, escrever e executar o arquivo."
+  - "`~/relatorio.txt` continua existindo, com o conteúdo original."
+  - "Somente o dono pode ler e alterar o arquivo."
 
 environment:
   image: base
   profile: default
 
 params:
-  token: { generator: hex, length: 8 }
+  code: { generator: hex, length: 8 }
 
 setup:
   script: setup.sh
@@ -110,27 +107,26 @@ setup:
 
 hints:
   - "Veja as permissões atuais com `ls -l`."
-  - "Permissões podem ser escritas em octal ou na forma simbólica."
 
 validation:
   all:
     - id: exists
       type: file_exists
-      path: /home/student/deploy.sh
-      fail_message: "O arquivo ~/deploy.sh não existe ou não é um arquivo comum."
+      path: /home/student/relatorio.txt
+      fail_message: "O arquivo ~/relatorio.txt não existe ou não é um arquivo comum."
     - id: content-kept
       type: file_content
-      path: /home/student/deploy.sh
-      contains: "DEPLOY_TOKEN={{ token }}"
-      fail_message: "O conteúdo original do script foi perdido."
+      path: /home/student/relatorio.txt
+      contains: "CODIGO={{ code }}"
+      fail_message: "O conteúdo original do relatório foi perdido."
     - id: mode
       type: file_permissions
-      path: /home/student/deploy.sh
-      mode: "0700"
+      path: /home/student/relatorio.txt
+      mode: "0600"
       fail_message: "As permissões ainda não estão corretas."
     - id: owner
       type: file_owner
-      path: /home/student/deploy.sh
+      path: /home/student/relatorio.txt
       user: student
       fail_message: "O dono do arquivo mudou."
 
@@ -141,7 +137,7 @@ solutions:
     script: tests/solution-symbolic.sh
 
 counterexamples:
-  - label: Recriar o arquivo vazio com 700
+  - label: Recriar o arquivo vazio
     script: tests/counter-recreate-empty.sh
 ```
 
@@ -284,7 +280,7 @@ Authoring rules:
 
 Every mission declares at least two different solutions and one counterexample. Solutions show that validation accepts more than one way to reach the final state; counterexamples show that it rejects shortcuts. The mission tests (increment 11, `tests/missions/`) run them in real labs. They are test code: not part of the production image or of the `linuxlab` command.
 
-For every mission in the content directory under test (`CONTENT_DIR`, as for the sync; by default `content/`):
+For every mission in the content directory under test (`CONTENT_DIR`, the private content; see [Content source](#content-source)):
 
 1. **Static checks**, without a database or a lab: the content rules of the sync, and every parameter must be able to take at least two values.
 2. **Sync into a throwaway database.** The content is synced, with `sync_content`, into a database created for the test session on the PostgreSQL server of `DATABASE_URL`, and dropped at the end; the database `DATABASE_URL` names is never written to. Every module and mission is set to `published` on the loaded copy only. The status is not part of a version, so the stored version and its hash are the ones `linuxlab content sync` stores, and drafts are tested without being published anywhere.
@@ -333,7 +329,7 @@ A content failure means the mission has to change; a platform failure says nothi
 Each failure is reported on one line with the mission, its version, the first 12 characters of its hash, the case, the step, the class and the code, and the status and reason of each condition:
 
 ```
-secure-deploy-script v1 3fa9c01e2b7d solution-2 step=validate [content] solution_not_passed: expected passed, got failed; exists=passed mode=failed(mismatch)
+private-report v1 3fa9c01e2b7d solution-2 step=validate [content] solution_not_passed: expected passed, got failed; exists=passed mode=failed(mismatch)
 ```
 
 Cases are named by position (`solution-2` is the second entry of `solutions`), since script names and labels can say how a mission is solved. Reports never contain parameters, script output, answers, or expected or observed values.
@@ -341,25 +337,38 @@ Cases are named by position (`solution-2` is the second entry of `solutions`), s
 ### Running
 
 ```sh
-uv run pytest -m missions                                  # the harness on a FakeRuntime; PostgreSQL
-uv run pytest -m "content and not mission_labs"           # static checks of CONTENT_DIR and the initial missions
-uv run pytest -m mission_labs                              # cases in real labs; Docker, the lab image and PostgreSQL
-uv run pytest -m "mission_labs and content" -k secure-deploy-script
-CONTENT_DIR=/path/to/content uv run pytest -m "content or mission_labs"
+uv run pytest tests/missions                               # unit tests and static checks on synthetic content
+uv run pytest -m missions                                  # the harness on a FakeRuntime, synthetic missions; PostgreSQL
+uv run pytest -m "mission_labs and not content"            # the harness in real labs, synthetic missions; Docker, the lab image and PostgreSQL
+
+export CONTENT_DIR=../linux-lab-content/content            # the private content, outside this repository
+uv run pytest -m "content and not mission_labs"            # static checks of the content and the five initial missions
+uv run pytest -m "mission_labs and content"                # every case of every mission, in real labs
+uv run pytest -m "mission_labs and content" -k notes-backup
 ```
 
-The PostgreSQL user of `DATABASE_URL` needs the `CREATEDB` privilege. Cases in real labs run under `LINUXLAB_TEST_OCI_RUNTIME` and need Linux, as the other lab tests ([runtime.md](runtime.md#environment)). The harness itself is tested on synthetic missions: those in `tests/fixtures/content`, and those in `tests/fixtures/harness`, written to fail in one way each.
+`CONTENT_DIR` has no default for the tests: unset, or pointing inside this repository, the content tests fail instead of testing an empty catalog. The PostgreSQL user of `DATABASE_URL` needs the `CREATEDB` privilege. Cases in real labs run under `LINUXLAB_TEST_OCI_RUNTIME` (`runc` or `runsc`) and need Linux, as the other lab tests ([runtime.md](runtime.md#environment)). The harness itself is tested on synthetic missions: those in `tests/fixtures/content`, and those in `tests/fixtures/harness`, written to fail in one way each.
 
-CI runs every mission on every change, not only the missions that changed, since a change to the loader, setup, parameters, probe or evaluator can break a mission that did not: `Mission harness (PostgreSQL)` and `Mission labs (Docker, runc)` in the CI workflow, and `Mission labs (runsc)` in the Runtime workflow, which also runs for changes in `content/`. Each job runs the harness's own tests first, then the content under test as a separate step. A mission is ready to publish when the three jobs pass on the same commit.
+### Where the tests run
+
+| Runs | Where | Context | Can be a required check of this repository |
+|---|---|---|---|
+| Harness unit tests, static checks of synthetic content, the check that `content/` here holds no mission | `Tests` (CI) | Every pull request | Yes (already required) |
+| Harness on a FakeRuntime with PostgreSQL, synthetic missions | `Mission harness, synthetic missions (PostgreSQL)` (CI) | Every pull request | Yes |
+| Harness in real labs under runc, synthetic missions | `Mission harness, synthetic missions (Docker, runc)` (CI) | Every pull request | Yes |
+| Harness in real labs under runsc, synthetic missions | `Mission harness, synthetic missions (runsc)` (Runtime) | Pull requests that touch code, tests, migrations or the lab image | No: skipped for other changes, so it cannot block them |
+| The image holds no mission content and no tests | `Docker image` (CI) | Every pull request | Yes |
+| The five missions, static checks and every case under runc and runsc | `Missions (runc)`, `Missions (runsc)` in the private content repository | Pushes to its `main`, daily against this repository's `main`, and on demand for a given commit | No: the result stays in the private repository |
+
+Pull requests of this repository never get the real missions: their code would run next to the solutions. The private workflow checks out this repository at a full commit SHA, which must be on `main` or the head of an open pull request opened by the owner from a branch of this repository; anything else, forks included, is refused. It needs no credential: it runs in the repository that holds the content. Every mission runs on every run, whatever changed, since a change to the loader, setup, parameters, probe or evaluator can break a mission that did not change.
+
+A change of this repository is ready to merge when the checks above pass and the private workflow passed under runc and runsc for its head commit (`gh workflow run missions.yml -R FranciscoPedro06/linux-lab-content -f api_sha=<head>`). A mission is ready to publish when it passes there under both runtimes.
 
 ## Content source
 
-The repositories are public. A mission's solutions and counterexamples tell how it is solved, and are meant to reach a student only after completion (a candidate for increment 14); committed to a public repository, anyone could read them. For that reason `content/` in this repository holds no missions yet: the five initial missions planned for increment 11 (`notes-backup`, `tidy-project`, `secure-deploy-script`, `hidden-file`, `runaway-process`) wait for a content source whose visibility matches that decision.
+The repositories are public. A mission's solutions and counterexamples tell how it is solved, and are meant to reach a student only after completion (a candidate for increment 14); committed to a public repository, anyone could read them. Mission content therefore lives in the private repository `linux-lab-content`, in the layout above (`content/modules`, `content/missions`), and `content/` here holds no mission (a test enforces it).
 
-Until then:
+- `linuxlab content sync` and the mission tests read the content from `CONTENT_DIR`. Keep the private checkout outside this repository (for example next to it); `.gitignore` and `.dockerignore` also exclude a `linux-lab-content/` directory placed inside by mistake.
+- The production image copies `content/` from this repository, which holds only `.gitkeep`; CI checks that the image has no mission content and no tests. Syncing the private content on deploy, without putting it in a public image, is part of increment 13.
 
-- `linuxlab content sync` and the mission tests read `CONTENT_DIR`, which can point to a directory outside this repository;
-- the content tests fail and name the missing missions, so CI does not pass on an empty catalog;
-- the production image still copies `content/` from this repository (Dockerfile); deploying content from another source is part of increment 13.
-
-The examples in this document are illustrative and are not the content of those missions.
+The examples in this document are illustrative and are not the content of any mission.

@@ -124,7 +124,7 @@ Lab object:
   "created_at": "2026-10-01T12:00:00Z",
   "expires_at": "2026-10-01T14:00:00Z",
   "ended_at": "2026-10-01T12:20:03Z",
-  "mission": { "slug": "secure-deploy-script", "title": "Proteja o script de deploy", "version": 2 }
+  "mission": { "slug": "private-report", "title": "Relatório privado", "version": 2 }
 }
 ```
 
@@ -150,7 +150,7 @@ The lab, in any state, including after it ended, so the client can show why.
 ### `POST /api/labs`
 
 ```json
-{ "mission_slug": "secure-deploy-script" }
+{ "mission_slug": "private-report" }
 ```
 
 Creates a lab for the mission's current version: the API pins that version, generates the mission's parameters, starts the container and runs the mission's setup inside it ([missions.md](missions.md#setup)). Creation is synchronous: the response comes when the lab is ready or has failed, which can take up to about 70 seconds when setup is slow. Clients should show that the lab is being prepared and not repeat the request meanwhile; a repeated request gets `409 lab_provisioning`.
@@ -180,7 +180,7 @@ The rate limit and the default capacity are provisional values chosen in increme
 Implemented in increment 10.
 
 ```json
-{ "mission_slug": "secure-deploy-script" }
+{ "mission_slug": "private-report" }
 ```
 
 Replaces the lab with a new one: a new lab session with its own id, container and parameters.
@@ -248,7 +248,7 @@ The body holds at most `answer`: a string of up to 1 KiB in UTF-8, compared by t
   "run_id": 8812,
   "outcome": "failed",
   "newly_completed": false,
-  "mission": { "slug": "secure-deploy-script", "version": 2 },
+  "mission": { "slug": "private-report", "version": 2 },
   "progress": { "status": "not_completed", "completed_version": null, "completed_at": null },
   "result": {
     "kind": "all",
@@ -291,9 +291,9 @@ Mission card, as listed in a module:
 
 ```json
 {
-  "slug": "secure-deploy-script",
-  "title": "Proteja o script de deploy",
-  "summary": "Qualquer usuário consegue ler um script que contém um token.",
+  "slug": "private-report",
+  "title": "Relatório privado",
+  "summary": "Qualquer usuário consegue ler um relatório confidencial.",
   "difficulty": 1,
   "estimated_minutes": 5,
   "tags": ["permissions", "chmod"],
@@ -319,7 +319,7 @@ Published modules that have at least one visible mission, ordered by slug. Missi
     "slug": "fundamentals",
     "title": "Fundamentos",
     "description": "Navegar, criar e organizar arquivos.",
-    "missions": [ { "slug": "secure-deploy-script", "...": "mission card" } ]
+    "missions": [ { "slug": "private-report", "...": "mission card" } ]
   }
 ]
 ```
@@ -334,8 +334,8 @@ The mission card plus:
 {
   "current_version": 2,
   "module": { "slug": "fundamentals", "title": "Fundamentos" },
-  "briefing": "# Proteja o script de deploy\n\n...",
-  "objectives": ["`~/deploy.sh` continua existindo, com o conteúdo original."],
+  "briefing": "# Relatório privado\n\n...",
+  "objectives": ["`~/relatorio.txt` continua existindo, com o conteúdo original."],
   "hints": ["Veja as permissões atuais com `ls -l`."]
 }
 ```
