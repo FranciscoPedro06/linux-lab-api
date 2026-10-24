@@ -36,5 +36,5 @@ solutions:
     script: tests/solution-find.sh
 
 counterexamples:
-  - label: Resposta vazia
-    script: tests/counter-empty.sh
+  - label: Palpite
+    script: tests/counter-guess.sh

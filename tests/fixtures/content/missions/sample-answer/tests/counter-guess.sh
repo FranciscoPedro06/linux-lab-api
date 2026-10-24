@@ -1,1 +1,1 @@
-true
+echo palpite-errado
