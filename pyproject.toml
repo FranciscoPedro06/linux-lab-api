@@ -50,11 +50,18 @@ plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--strict-markers", "-m", "not integration and not docker and not runsc"]
+addopts = [
+    "--strict-markers",
+    "-m",
+    "not integration and not docker and not runsc and not missions and not mission_labs and not content",
+]
 markers = [
     "integration: requires a running PostgreSQL reachable through DATABASE_URL",
     "docker: requires Docker and the lab image; runs under LINUXLAB_TEST_OCI_RUNTIME",
     "runsc: requires LINUXLAB_TEST_OCI_RUNTIME=runsc (gVisor)",
+    "missions: mission harness on a FakeRuntime; PostgreSQL at DATABASE_URL (creates databases)",
+    "mission_labs: mission harness in real labs; Docker, the lab image and PostgreSQL",
+    "content: reads the content directory under test (CONTENT_DIR)",
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"

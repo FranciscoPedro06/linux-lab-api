@@ -1,0 +1,46 @@
+schema: 1
+slug: harness-draft
+title: Rascunho do harness
+summary: "Missão sintética em rascunho: copiar um arquivo para um backup."
+difficulty: 1
+estimated_minutes: 5
+status: draft
+
+briefing: briefing.md
+explanation: briefing.md
+objectives:
+  - "Existe uma cópia de `~/notas.txt` em `~/backup/`."
+
+environment:
+  image: base
+  profile: default
+
+params:
+  token: { generator: hex, length: 8 }
+  shelf: { generator: int, min: 1, max: 9 }
+  color: { generator: choice, values: [red, green] }
+
+setup:
+  script: setup.sh
+  timeout_seconds: 10
+
+validation:
+  all:
+    - id: original
+      type: file_content
+      path: /home/student/notas.txt
+      contains: "{{ token }}"
+    - id: copy
+      type: file_content
+      path: /home/student/backup/notas.txt
+      contains: "{{ token }}"
+
+solutions:
+  - label: cp
+    script: tests/solution-cp.sh
+  - label: cat
+    script: tests/solution-cat.sh
+
+counterexamples:
+  - label: mv
+    script: tests/counter-mv.sh
