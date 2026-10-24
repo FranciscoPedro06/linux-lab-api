@@ -129,7 +129,7 @@ When a lab ends (delete, logout, a timeout, the container dying), its terminal i
 
 ## Development
 
-With the Compose environment running (see the README), build the lab image once and publish missions; `content/` holds none until increment 11, so use the synthetic missions of the tests (see the README). Then sign up at http://localhost:5173/signup with the `SIGNUP_INVITE_CODE` Compose was started with, open a mission from the home page and start its lab:
+With the Compose environment running (see the README), build the lab image once and publish missions; `content/` holds none yet ([missions.md](missions.md#content-source)), so use the synthetic missions of the tests (see the README). Then sign up at http://localhost:5173/signup with the `SIGNUP_INVITE_CODE` Compose was started with, open a mission from the home page and start its lab:
 
 ```sh
 docker build --tag linuxlab/lab-base:dev lab-image
