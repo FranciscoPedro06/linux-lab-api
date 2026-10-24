@@ -123,7 +123,7 @@ jobs:
         run: uv run pytest -m missions -v -rA
       - name: Content under test (static checks, initial missions)
         if: ${{ !cancelled() }}
-        run: uv run pytest -m content -v -rA
+        run: uv run pytest -m "content and not mission_labs" -v -rA
 
   mission-labs:
     name: Mission labs (Docker, runc)
