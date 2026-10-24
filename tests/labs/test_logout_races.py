@@ -114,13 +114,22 @@ def test_logout_during_the_removal_of_the_replaced_lab(client: TestClient) -> No
 
     assert logging_out.result(timeout=10).status_code == 204
     response = replacing.result(timeout=10)
+    # Released together, the two requests can meet in three orders: the session is
+    # revoked before the successor is inserted (401); the successor is inserted first
+    # and the logout ends it while it is being prepared (201, ended by the logout); or
+    # it is ready, and answered so, before the logout's second pass ends it (201, ready).
     # Whichever came first, the session's replacement leaves no lab behind.
+    body = response.json()
     if response.status_code == 201:
-        assert response.json()["end_reason"] == "logout"
+        assert body["end_reason"] == "logout" or (body["status"], body["end_reason"]) == (
+            "ready",
+            None,
+        )
+        assert [s[1:] for s in successors(client, first["id"])] == [("terminated", "logout")]
     else:
         assert response.status_code == 401, response.text
+        assert successors(client, first["id"]) == []
     assert lab_row(client, first["id"]) == ("terminated", "reset")
-    assert [s[1:] for s in successors(client, first["id"])] in ([], [("terminated", "logout")])
     assert_logged_out(client, ana)
 
 
@@ -189,6 +198,36 @@ def test_successor_inserted_before_the_session_is_revoked_is_ended_by_the_logout
     assert response.status_code == 201, response.text
     assert response.json()["status"] == "terminated"
     assert response.json()["end_reason"] == "logout"
+    assert_logged_out(client, ana)
+
+
+def test_successor_ready_before_the_session_is_revoked_is_ended_by_the_logout(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ana = user(client, "ana@example.com")
+    first = ready_lab(client, ana)
+    first_pass, allow_revoke = patch_after_first_pass(client, monkeypatch)
+    logging_out: list[Any] = []
+
+    async def logout_passes_over_the_labs_first(service: Labs) -> None:
+        logging_out.append(in_background(lambda: logout(client, ana)))
+        await first_pass.wait()
+
+    patch_before_successor(client, monkeypatch, logout_passes_over_the_labs_first)
+    # The replacement finishes, successor ready, while the logout waits to revoke.
+    response = replace_lab(client, ana, first["id"])
+
+    assert response.status_code == 201, response.text
+    assert (response.json()["status"], response.json()["end_reason"]) == ("ready", None)
+    assert [s[1:] for s in successors(client, first["id"])] == [("ready", None)]
+
+    allow_revoke()
+
+    # The successor was inserted under the session's lock, before the revocation, so
+    # the logout's second pass finds it and ends it before answering.
+    assert logging_out[0].result(timeout=10).status_code == 204
+    assert [s[1:] for s in successors(client, first["id"])] == [("terminated", "logout")]
+    assert lab_row(client, first["id"]) == ("terminated", "reset")
     assert_logged_out(client, ana)
 
 
