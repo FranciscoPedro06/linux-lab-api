@@ -208,3 +208,36 @@ def test_a_page_holds_only_the_requested_lab(client: TestClient) -> None:
     record(client, mine, "ls")
 
     assert page(client, mine, 0, 10) == ([1], False)
+
+
+def test_a_failed_insert_takes_no_seq(client: TestClient, lab: uuid.UUID) -> None:
+    """The seq comes from the committed rows, not from a sequence: an insert that is
+    rolled back leaves no gap."""
+    with pytest.raises(IntegrityError, match="ck_command_history_command_characters"):
+        record(client, lab, "echo \x1b")
+    with pytest.raises(IntegrityError, match="ck_command_history_command_length"):
+        record(client, lab, "")
+
+    assert record(client, lab, "ls") == 1
+    assert rows(client, lab) == [(1, "ls")]
+
+
+def test_concurrent_writers_never_pass_the_limit(
+    client: TestClient, lab: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "MAX_ENTRIES_PER_LAB", 5)
+    history = store(client)
+
+    async def write_all() -> list[int | BaseException]:
+        return await asyncio.gather(
+            *(history.record(lab, f"echo {index}", AT) for index in range(20)),
+            return_exceptions=True,
+        )
+
+    results = run(client, write_all)
+
+    assert sorted(result for result in results if isinstance(result, int)) == [1, 2, 3, 4, 5]
+    assert all(
+        isinstance(result, LabHistoryFullError) for result in results if not isinstance(result, int)
+    )
+    assert [seq for seq, _ in rows(client, lab)] == [1, 2, 3, 4, 5]
