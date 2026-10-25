@@ -88,6 +88,24 @@ class Shell:
         assert MARKER_PREFIX not in self.output
         return output
 
+    async def prompt_after(self, needle: bytes, seconds: float = 15) -> bytes:
+        """Read until `needle`, then until bash is reading the next line. Readline turns
+        bracketed paste on (READLINE_READY) once it has set up the terminal, before it
+        handles signals itself, and only then writes the prompt; the prompt ends the
+        output while nothing else is typed. Seeing `$ ` alone is not enough: Ctrl+C sent
+        before readline is reading is not echoed, and the line typed before it is
+        dropped by the tty."""
+        output = b""
+        async with asyncio.timeout(seconds):
+            while not at_prompt(output.partition(needle)[2] if needle in output else b""):
+                message = await self.websocket.recv()
+                if isinstance(message, str):
+                    raise AssertionError(f"control message before the prompt: {message}")
+                output += message
+        self.output += output
+        assert MARKER_PREFIX not in self.output
+        return output
+
     async def send(self, data: bytes) -> None:
         await self.websocket.send(data)
 
@@ -96,6 +114,13 @@ class Shell:
         await self.send(f"{line}\r".encode())
         await self.send(f"echo {done}$((1))\r".encode())
         await self.until(f"{done}1\r\n".encode())
+
+
+READLINE_READY = b"\x1b[?2004h"
+
+
+def at_prompt(output: bytes) -> bool:
+    return READLINE_READY in output and output.rpartition(READLINE_READY)[2].endswith(b"$ ")
 
 
 async def shell(websocket: ClientConnection) -> Shell:
@@ -177,17 +202,19 @@ async def test_lines_bash_does_not_run_or_keep_are_left_out(lab: Lab) -> None:
 
 
 async def test_a_line_cancelled_with_ctrl_c_is_neither_run_nor_recorded(api: Api, lab: Lab) -> None:
-    """Nothing is typed after Ctrl+C: under runsc, input sent right after the prompt
+    """The line is typed once bash is reading it and cancelled once readline has echoed
+    it. Nothing is typed after Ctrl+C: under runsc, input sent right after the prompt
     that follows Ctrl+C can lose characters (docs/terminal.md, Known behavior), which
     has nothing to do with the history. The history is read through the API."""
     async with lab.terminal() as websocket:
         sh = await shell(websocket)
-        await sh.run("echo before", "done-a")
+        await sh.send(b"echo before\r")
+        await sh.send(b"echo done-a$((1))\r")
+        await sh.prompt_after(b"done-a1\r\n")
         await sh.send(b"touch /tmp/cancelled-line")
+        await sh.until(b"touch /tmp/cancelled-line")
         await sh.send(b"\x03")
-        after = (await sh.until(b"^C")).split(b"^C")[-1]
-        if b"$ " not in after:
-            await sh.until(b"$ ")
+        await sh.prompt_after(b"^C")
 
     await writers_finished()
     base_url = api.url.replace("ws://", "http://", 1)
