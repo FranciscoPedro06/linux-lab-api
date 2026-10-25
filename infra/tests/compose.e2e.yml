@@ -1,0 +1,22 @@
+# Override of infra/compose.prod.yml for infra/tests/e2e.sh, on a disposable project.
+# Only what a test host needs changes: Caddy publishes 443 on loopback (for a browser
+# on this machine) instead of 80 and 443 on every address, the API container gets
+# another name, and the lab runtime can be runc where runsc is not available (Docker
+# Desktop). Networks, addresses, commands, hardening and the trust in Caddy's address
+# are the production ones.
+
+services:
+  caddy:
+    ports: !override
+      - "127.0.0.1:${E2E_BROWSER_PORT:-8443}:443"
+
+  api:
+    container_name: linuxlab-e2e-api
+    environment:
+      ENVIRONMENT: ${E2E_ENVIRONMENT:-production}
+      LAB_OCI_RUNTIME: ${E2E_RUNTIME:-runsc}
+
+  task:
+    environment:
+      ENVIRONMENT: ${E2E_ENVIRONMENT:-production}
+      LAB_OCI_RUNTIME: ${E2E_RUNTIME:-runsc}

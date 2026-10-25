@@ -161,10 +161,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: docker build --target prod --tag linuxlab-api:ci .
-      - name: Check that the image holds no mission content and no tests
-        run: |
-          set -euo pipefail
-          files=$(docker run --rm --entrypoint find linuxlab-api:ci /app/content -type f)
-          test "$files" = "/app/content/.gitkeep"
-          docker run --rm --entrypoint sh linuxlab-api:ci -c 'test ! -e /app/tests'
       - run: docker build --tag linuxlab/lab-base:ci lab-image
+      - name: Check what the images contain (no mission content, tests or secrets)
+        run: infra/release/check-images.sh --api linuxlab-api:ci --lab linuxlab/lab-base:ci
+      - name: Check that contaminated images are refused
+        run: infra/tests/check-images-detects.sh linuxlab-api:ci linuxlab/lab-base:ci
+      - name: Validate the Caddy configuration
+        run: |
+          image=$(sed -n 's/^FROM \(caddy:.*\)$/\1/p' infra/caddy/Dockerfile)
+          docker run --rm --network none -v "$PWD/infra/caddy:/etc/caddy:ro" \
+            -e SITE_ADDRESS=lab.example.org "$image" \
+            sh -c 'caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile &&
+              for file in /etc/caddy/Caddyfile /etc/caddy/linuxlab.caddy; do
+                caddy fmt "$file" | diff -u "$file" -; done'
+      - name: Validate the production Compose file
+        run: |
+          printf '%s\n' API_IMAGE=a LAB_IMAGE=b EDGE_IMAGE=c SITE_ADDRESS=lab.example.org \
+            PUBLIC_ORIGIN=https://lab.example.org POSTGRES_PASSWORD=0 DOCKER_SOCKET_GID=0 \
+            LAB_DEPLOYMENT=ci LAB_CAPACITY=1 > "$RUNNER_TEMP/ci.env"
+          docker compose -f infra/compose.prod.yml --env-file "$RUNNER_TEMP/ci.env" config --quiet

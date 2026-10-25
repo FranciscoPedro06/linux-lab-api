@@ -14,6 +14,8 @@ on:
       - "migrations/**"
       - "tests/**"
       - "lab-image/**"
+      - "infra/**"
+      - "Dockerfile"
       - ".github/workflows/runtime.yml"
   workflow_dispatch:
 
@@ -140,3 +142,44 @@ jobs:
 
       - name: Harness in real labs (synthetic missions)
         run: uv run pytest -m "mission_labs and not content" -v -rA
+
+  production-stack:
+    name: Production stack end to end (runsc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: api
+      # The frontend at the tip of its main branch; its commit is printed below.
+      - uses: actions/checkout@v7
+        with:
+          repository: FranciscoPedro06/linux-lab-web
+          ref: main
+          path: web
+
+      - name: Install gVisor ${{ env.GVISOR_RELEASE }}
+        run: |
+          set -euo pipefail
+          curl -fsSLo gvisor.tar.bz2 \
+            "https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64/gvisor.tar.bz2"
+          echo "${GVISOR_SHA512}  gvisor.tar.bz2" | sha512sum --check --strict
+          sudo tar -xjf gvisor.tar.bz2 -C /usr/local/bin runsc containerd-shim-runsc-v1 gvisor-bin
+          rm gvisor.tar.bz2
+          sudo /usr/local/bin/runsc install
+          sudo systemctl restart docker
+
+      - name: Show versions
+        run: |
+          runsc --version
+          docker version --format 'Docker Engine {{.Server.Version}}'
+          docker compose version
+          echo "web commit: $(git -C web rev-parse HEAD)"
+
+      - name: Build the release
+        run: |
+          api/infra/release/build.sh --api-repo api --api-sha "$(git -C api rev-parse HEAD)" \
+            --web-repo web --web-sha "$(git -C web rev-parse HEAD)" --out "$RUNNER_TEMP/releases"
+
+      - name: Check the stack end to end
+        run: api/infra/tests/e2e.sh "$(ls "$RUNNER_TEMP"/releases/release-*.env)" --runtime runsc

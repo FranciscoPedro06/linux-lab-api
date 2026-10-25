@@ -1,0 +1,19 @@
+# Entry with the deployment's own domain: Caddy accepts connections straight from the
+# internet on 80 and 443, gets the certificate from an ACME CA and redirects HTTP to
+# HTTPS. See docs/deployment.md.
+#
+# No trusted_proxies: every connection comes from a client, so Caddy ignores any
+# X-Forwarded-* header the client sends and {client_ip} is the connection's peer.
+{
+	# Override with the staging directory while testing, to stay clear of rate limits.
+	acme_ca {$ACME_CA:https://acme-v02.api.letsencrypt.org/directory}
+	log {
+		output stdout
+		format json
+	}
+}
+
+{$SITE_ADDRESS} {
+	import /etc/caddy/linuxlab.caddy
+	header Strict-Transport-Security "max-age=31536000"
+}
