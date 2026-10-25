@@ -46,4 +46,8 @@ COPY migrations ./migrations
 COPY content ./content
 USER linuxlab
 EXPOSE 8000
-CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--ws-max-size", "65536", "--no-proxy-headers"]
+# Exactly one process: terminals, history recorders, rate limits and the reaper live in
+# it (docs/architecture.md#components). --workers is explicit so WEB_CONCURRENCY cannot
+# start more. Forwarded headers are ignored unless a deployment names its proxy:
+# infra/compose.prod.yml replaces this command.
+CMD ["uvicorn", "--factory", "linuxlab.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--ws-max-size", "65536", "--no-proxy-headers"]

@@ -115,7 +115,9 @@ CurrentUser = Annotated[User, Depends(current_user)]
 def _check_rate(request: Request, endpoint: str) -> None:
     """Counts the attempt against the peer address. Runs before any Argon2 work."""
     limiter: RateLimiter = request.app.state.auth_rate_limits[endpoint]
-    # The connection's peer, not X-Forwarded-For: there is no trusted proxy yet.
+    # The client address as uvicorn resolved it. Behind the reverse proxy, uvicorn
+    # takes it from X-Forwarded-For only when the connection comes from the proxy's
+    # fixed address (--forwarded-allow-ips); otherwise it is the TCP peer.
     peer = request.client.host if request.client else "unknown"
     retry_after = limiter.hit(f"{endpoint}:{peer}")
     if retry_after is not None:
