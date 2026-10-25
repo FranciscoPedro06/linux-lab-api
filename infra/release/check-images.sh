@@ -89,6 +89,8 @@ if [ -n "$edge" ]; then
     check "edge: no secrets in environment or history" no_secrets_in_config "$edge"
     check "edge: Caddyfile valid" docker run --rm --network none -e SITE_ADDRESS=lab.example.org \
         "$edge" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+    check "edge: Caddyfile.ngrok valid" docker run --rm --network none -e NGROK_AGENT_IP=172.30.3.3 \
+        "$edge" caddy validate --config /etc/caddy/Caddyfile.ngrok --adapter caddyfile
 fi
 
 if [ "$failures" -gt 0 ]; then

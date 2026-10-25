@@ -26,6 +26,7 @@ from typing import Any
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import ClientConnection, connect
 
+ENTRY = os.environ.get("E2E_ENTRY", "direct")
 HOST = os.environ.get("E2E_HOST", "")
 ORIGIN = os.environ.get("E2E_ORIGIN", "")
 INVITE = os.environ.get("E2E_INVITE", "")
@@ -51,7 +52,8 @@ def finish() -> None:
 
 
 def tls() -> ssl.SSLContext:
-    return ssl.create_default_context(cafile=CA)
+    # The test CA of the disposable stack, or the system's for a public endpoint.
+    return ssl.create_default_context(cafile=CA if os.path.exists(CA) else None)
 
 
 class Site:
@@ -196,7 +198,8 @@ def site_checks() -> None:
     csp = headers.get("content-security-policy", "")
     expect("default-src 'self'" in csp and "frame-ancestors 'none'" in csp, "CSP header", csp)
     expect(headers.get("x-content-type-options") == "nosniff", "nosniff header")
-    expect("strict-transport-security" in headers, "HSTS header")
+    if ENTRY == "direct":
+        expect("strict-transport-security" in headers, "HSTS header")
     expect("server" not in headers, "no Server header", headers.get("server"))
     expect(
         headers.get("cache-control") == "no-cache",
@@ -224,14 +227,17 @@ def site_checks() -> None:
     big = {"email": "x" * 70_000, "password": "y"}
     status, _ = site.json("POST", "/api/auth/login", big)
     expect(status == 413, "request body over 64 KB refused by Caddy", status)
-    plain = http.client.HTTPConnection(HOST, 80, timeout=10)
-    plain.request("GET", "/api/health")
-    response = plain.getresponse()
-    expect(
-        response.status in (301, 308) and response.getheader("location", "").startswith("https://"),
-        "HTTP redirects to HTTPS",
-        (response.status, response.getheader("location")),
-    )
+    if ENTRY == "direct":
+        # Through ngrok, TLS, HTTP and HSTS are ngrok's: its endpoint is HTTPS only.
+        plain = http.client.HTTPConnection(HOST, 80, timeout=10)
+        plain.request("GET", "/api/health")
+        response = plain.getresponse()
+        expect(
+            response.status in (301, 308)
+            and response.getheader("location", "").startswith("https://"),
+            "HTTP redirects to HTTPS",
+            (response.status, response.getheader("location")),
+        )
     finish()
 
 

@@ -1,0 +1,61 @@
+# Contingency entry: the same stack reached through an ngrok tunnel, for a beta when
+# the host cannot have its own domain or open ports. Layered on the production file:
+#
+#   docker compose -p linuxlab-prod -f infra/compose.prod.yml -f infra/compose.ngrok.yml \
+#     --env-file <release file> --env-file /etc/linuxlab/production.env up -d
+#
+# Caddy publishes nothing and has no route to the internet; only the agent does. The
+# agent reaches Caddy, and nothing else, over the internal "tunnel" network. See
+# docs/deployment.md#entry-through-ngrok for the conditions of using it.
+
+services:
+  caddy:
+    ports: !reset []
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile.ngrok", "--adapter", "caddyfile"]
+    environment:
+      NGROK_AGENT_IP: ${NGROK_AGENT_IP:-172.30.3.3}
+    networks: !override
+      tunnel:
+        ipv4_address: ${CADDY_TUNNEL_IP:-172.30.3.2}
+      edge:
+        ipv4_address: ${CADDY_EDGE_IP:-172.30.1.2}
+
+  ngrok:
+    image: ngrok/ngrok:3.39.13-alpine@sha256:a51a7637a70be573615b01852af0419c4ab9dc857601b3d61ea2a082be3ec0d3
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The image's entrypoint writes the authtoken into a config file here: memory only.
+    tmpfs: [/var/lib/ngrok]
+    command: ["http", "http://caddy:80", "--url", "${NGROK_URL:?}", "--inspect=false"]
+    # NGROK_AUTHTOKEN, from a root-owned file with mode 0600, never from this file.
+    env_file:
+      - ${NGROK_ENV_FILE:-/etc/linuxlab/ngrok.env}
+    environment:
+      NGROK_CONFIG: /etc/ngrok/agent.yml
+    volumes:
+      - ./ngrok/agent.yml:/etc/ngrok/agent.yml:ro
+    networks:
+      tunnel:
+        ipv4_address: ${NGROK_AGENT_IP:-172.30.3.3}
+      ngrok-egress: {}
+    depends_on:
+      caddy:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+networks:
+  tunnel:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${TUNNEL_SUBNET:-172.30.3.0/24}
+  ngrok-egress:
+    ipam:
+      config:
+        - subnet: ${NGROK_EGRESS_SUBNET:-172.30.4.0/24}

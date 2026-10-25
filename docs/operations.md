@@ -164,6 +164,22 @@ This replaces the API, Caddy and the frontend together; labs keep running and te
 
 `docker compose ... logs <service>`; Docker keeps 5 files of 10 MB per container. Caddy's access log is JSON with `client_ip`, method, URI, status and duration, and credentials redacted. The API logs lab and terminal events with lab ids, never tokens, passwords, parameters or history lines. Logs are read by the operator only, on the host.
 
+## Contingency: entry through ngrok
+
+Only when the conditions in [deployment.md](deployment.md#entry-through-ngrok) are met: account and plan chosen, the forged-header checks passed through the real tunnel, testers told that ngrok handles their traffic in clear.
+
+1. Reserve or note the ngrok domain. Set `SITE_ADDRESS` to it, `PUBLIC_ORIGIN` and `NGROK_URL` to `https://<domain>` in `/etc/linuxlab/production.env`.
+2. Copy `infra/ngrok/ngrok.env.example` to `/etc/linuxlab/ngrok.env` (root, 0600) with an authtoken made for this agent and restricted to that domain. Run `infra/release/check-env.sh /etc/linuxlab/production.env /etc/linuxlab/ngrok.env`.
+3. Deploy as above, adding the override to every Compose command and script:
+   ```sh
+   export LINUXLAB_OVERRIDES=$PWD/infra/compose.ngrok.yml
+   docker compose -p linuxlab-prod -f infra/compose.prod.yml -f infra/compose.ngrok.yml \
+     --env-file $R --env-file /etc/linuxlab/production.env up -d --wait
+   ```
+   Caddy then publishes no port; the host needs no inbound port but SSH.
+4. Acceptance as above, through the ngrok domain, including six failed logins from one address and a login from another.
+5. Going back to the own domain: set the settings back, run `docker compose ... -f infra/compose.prod.yml up -d --wait --remove-orphans` without the override (removes the agent), and revoke the authtoken in ngrok.
+
 ## Incidents
 
 | Situation | First steps |
