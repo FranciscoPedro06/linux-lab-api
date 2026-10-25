@@ -3,6 +3,7 @@
 import base64
 import itertools
 import random
+from pathlib import Path
 
 import pytest
 
@@ -184,3 +185,14 @@ def test_the_longest_command_is_accepted() -> None:
 
 def test_tab_and_newline_are_accepted() -> None:
     assert decode_payload(base64.b64encode(b"a\tb\nc")) == "a\tb\nc"
+
+
+# The hook in the lab image writes this marker.
+
+
+def test_the_hook_writes_this_marker_and_this_limit() -> None:
+    hook = (Path(__file__).resolve().parents[2] / "lab-image" / "history.bash").read_text()
+    assert MARKER_PREFIX == b"\x1b]7771;"
+    assert MARKER_END == b"\x07"
+    assert r"printf '\033]7771;%s\007'" in hook
+    assert f"(( ${{#command}} > {MAX_COMMAND_BYTES} ))" in hook
