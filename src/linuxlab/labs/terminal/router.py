@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketState
 from linuxlab.auth import sessions
 from linuxlab.auth.cookies import SESSION_COOKIE
 from linuxlab.auth.tokens import MAX_TOKEN_LENGTH
+from linuxlab.history.recorder import HistoryRecorder
 from linuxlab.labs.access import owned_lab
 from linuxlab.labs.lifecycle import LabGoneError, Labs
 from linuxlab.labs.models import LabSession, LabStatus
@@ -51,7 +52,6 @@ class Rejected(Exception):
 async def terminal_endpoint(websocket: WebSocket, lab_id: str) -> None:
     state = websocket.app.state
     labs: Labs = state.labs
-    terminals: TerminalRegistry = state.terminals
     connection = uuid.uuid4().hex[:12]
 
     # Checked before accepting: browsers send Origin on WebSocket handshakes and
@@ -91,18 +91,36 @@ async def terminal_endpoint(websocket: WebSocket, lab_id: str) -> None:
     if init is None:
         return
 
+    # The recorder outlives the claim: what it still has to write is drained after
+    # the terminal is released, so ending a lab never waits for the history.
+    recorder = HistoryRecorder(state.history, lab.id, connection)
+    async with recorder.running():
+        await _serve(websocket, state, lab, container.id, init, connection, recorder)
+
+
+async def _serve(
+    websocket: WebSocket,
+    state: State,
+    lab: LabSession,
+    container_id: str,
+    init: Init,
+    connection: str,
+    recorder: HistoryRecorder,
+) -> None:
+    labs: Labs = state.labs
+    terminals: TerminalRegistry = state.terminals
     outcome: Outcome | None = None
     failure: Exception | None = None
     exit_code: int | None = None
     async with terminals.claim(lab.lab_key) as claim:
         # From the claim on, ending the lab stops this connection. It may have ended
-        # between the checks above and the claim.
+        # between the authorization and the claim.
         current = await labs.get(lab.id)
         if current is None or current.status != LabStatus.READY:
             outcome = Outcome.LAB_ENDED
         else:
             outcome, failure, exit_code = await _run_terminal(
-                websocket, state, lab, container.id, init, claim, connection
+                websocket, state, lab, container_id, init, claim, connection, recorder
             )
 
     if outcome is Outcome.SHELL_EXITED or isinstance(failure, LabRuntimeError):
@@ -151,6 +169,7 @@ async def _run_terminal(
     init: Init,
     claim: TerminalClaim,
     connection: str,
+    recorder: HistoryRecorder,
 ) -> tuple[Outcome | None, Exception | None, int | None]:
     terminals: TerminalRegistry = state.terminals
     started = time.monotonic()
@@ -178,6 +197,8 @@ async def _run_terminal(
             claim,
             stats,
             on_input=lambda: terminals.touch(lab.lab_key),
+            on_command=recorder.observe,
+            on_rejection=recorder.reject,
         )
     except (ProtocolError, LabRuntimeError) as error:
         failure = error

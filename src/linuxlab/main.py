@@ -15,6 +15,7 @@ from linuxlab.auth.ratelimit import RateLimiter
 from linuxlab.catalog import router as catalog
 from linuxlab.config import Settings, get_settings
 from linuxlab.db import create_engine, create_sessionmaker
+from linuxlab.history.service import CommandHistory
 from linuxlab.labs import router as labs
 from linuxlab.labs.lifecycle import Labs
 from linuxlab.labs.reaper import run_reaper
@@ -70,6 +71,7 @@ def create_app(
             await engine.dispose()
             raise
         app.state.terminals = TerminalRegistry()
+        app.state.history = CommandHistory(app.state.sessionmaker)
         app.state.labs = Labs(
             app.state.sessionmaker,
             runtime,
