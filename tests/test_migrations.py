@@ -20,6 +20,8 @@ ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 BEFORE_PROGRESS = "c4e1a7b39d52"
 # The last revision of increment 09, before previous_lab_id.
 BEFORE_REPLACEMENT = "7d3f2a91c6e8"
+# The last revision of increment 11, before command_history.
+BEFORE_HISTORY = "a3f81c5d2e94"
 
 
 def tables() -> set[str]:
@@ -62,6 +64,7 @@ TABLES = {
     "mission_versions",
     "validation_runs",
     "user_missions",
+    "command_history",
 }
 
 
@@ -130,8 +133,8 @@ def test_downgrading_replacement_keeps_labs_and_their_reasons_valid() -> None:
     command.upgrade(config, "head")
     user_id, first, second, third = (uuid.uuid4() for _ in range(4))
     execute(
-        "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, user_missions, modules,"
-        " missions, mission_versions",
+        "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, user_missions,"
+        " command_history, modules, missions, mission_versions",
         "INSERT INTO users (id, email, password_hash, display_name)"
         " VALUES (:user, 'ana@example.com', '$argon2id$synthetic', 'Ana')",
         "INSERT INTO lab_sessions (id, user_id, status, end_reason, created_at,"
@@ -185,6 +188,47 @@ def test_downgrading_replacement_keeps_labs_and_their_reasons_valid() -> None:
 
         command.upgrade(config, "head")
         assert execute("SELECT count(*) FROM lab_sessions WHERE previous_lab_id IS NULL") == [(3,)]
+    finally:
+        command.downgrade(config, "base")
+        command.upgrade(config, "head")
+
+
+def test_history_starts_empty_on_a_migrated_database() -> None:
+    """Upgrading a database of increment 11 keeps its labs and records no command for
+    them; going back drops the history and leaves the labs."""
+    config = Config(str(ALEMBIC_INI))
+    command.downgrade(config, "base")
+    command.upgrade(config, BEFORE_HISTORY)
+    assert "command_history" not in tables()
+    user_id, lab_id = uuid.uuid4(), uuid.uuid4()
+    execute(
+        "INSERT INTO users (id, email, password_hash, display_name)"
+        " VALUES (:user, 'ana@example.com', '$argon2id$synthetic', 'Ana')",
+        "INSERT INTO lab_sessions (id, user_id, status, end_reason, created_at,"
+        " last_activity_at, expires_at, ended_at)"
+        " VALUES (:lab, :user, 'terminated', 'user', now(), now(),"
+        " now() + interval '2 hours', now())",
+        user=user_id,
+        lab=lab_id,
+    )
+
+    try:
+        command.upgrade(config, "head")
+        assert execute("SELECT count(*) FROM command_history") == [(0,)]
+        execute(
+            "INSERT INTO command_history (lab_session_id, seq, command, recorded_at)"
+            " VALUES (:lab, 1, 'ls', now())",
+            lab=lab_id,
+        )
+
+        command.downgrade(config, BEFORE_HISTORY)
+        assert "command_history" not in tables()
+        assert execute(
+            "SELECT count(*) FROM pg_proc WHERE proname = 'command_history_immutable'"
+        ) == [(0,)]
+        assert execute("SELECT id FROM lab_sessions") == [(lab_id,)]
+        command.upgrade(config, "head")
+        assert execute("SELECT count(*) FROM command_history") == [(0,)]
     finally:
         command.downgrade(config, "base")
         command.upgrade(config, "head")

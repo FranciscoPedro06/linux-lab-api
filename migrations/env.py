@@ -8,6 +8,7 @@ from linuxlab.auth import models as auth_models  # noqa: F401  (registers the ta
 from linuxlab.config import get_settings
 from linuxlab.content import models as content_models  # noqa: F401
 from linuxlab.db import Base, create_engine
+from linuxlab.history import models as history_models  # noqa: F401
 from linuxlab.labs import models as lab_models  # noqa: F401
 from linuxlab.progress import models as progress_models  # noqa: F401
 from linuxlab.validation import models as validation_models  # noqa: F401
