@@ -151,7 +151,7 @@ postgres_ip=$(docker inspect --format "{{(index .NetworkSettings.Networks \"${pr
 client() {
     local address=$1
     shift
-    docker run --rm --network "$network" --ip "$address" --add-host "linuxlab.localhost:$caddy_ip" \
+    docker run --rm --user "$(id -u):$(id -g)" --network "$network" --ip "$address" --add-host "linuxlab.localhost:$caddy_ip" \
         -e E2E_HOST=linuxlab.localhost -e E2E_ORIGIN=https://linuxlab.localhost:8443 -e E2E_INVITE="$invite" \
         -v "$(host_path "$work"):/e2e:ro" --entrypoint python "$api_image" /e2e/e2e.py "$@"
 }
