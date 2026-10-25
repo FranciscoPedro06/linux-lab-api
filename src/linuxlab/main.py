@@ -15,6 +15,7 @@ from linuxlab.auth.ratelimit import RateLimiter
 from linuxlab.catalog import router as catalog
 from linuxlab.config import Settings, get_settings
 from linuxlab.db import create_engine, create_sessionmaker
+from linuxlab.history import router as history
 from linuxlab.history.service import CommandHistory
 from linuxlab.labs import router as labs
 from linuxlab.labs.lifecycle import Labs
@@ -103,6 +104,7 @@ def create_app(
     app.include_router(labs.router)
     app.include_router(terminal.router)
     app.include_router(validation.router)
+    app.include_router(history.router)
     return app
 
 
