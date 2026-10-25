@@ -30,7 +30,9 @@ while [ $# -gt 0 ]; do
         *) usage ;;
     esac
 done
-[ -n "$api_repo" ] && [ -n "$api_sha" ] && [ -n "$web_repo" ] && [ -n "$web_sha" ] && [ -n "$out" ] || usage
+if [ -z "$api_repo" ] || [ -z "$api_sha" ] || [ -z "$web_repo" ] || [ -z "$web_sha" ] || [ -z "$out" ]; then
+    usage
+fi
 
 for sha in "$api_sha" "$web_sha"; do
     [[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "not a full commit SHA: $sha"
