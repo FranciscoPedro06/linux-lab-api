@@ -407,10 +407,10 @@ Implemented in increment 04, in `src/linuxlab/auth/`. Server-side sessions with 
 - Argon2id password hashing (`argon2-cffi` defaults: RFC 9106 low-memory parameters) in worker threads, with at most two hashes running at once, so it neither blocks the event loop nor takes unbounded CPU and memory;
 - a login for an unknown email verifies the password against a dummy hash, so its timing and response match a wrong password;
 - passwords of 12 to 128 characters with no composition rules; emails stripped and lowercased, ASCII only, unique case-insensitively through a unique index on `lower(email)`; display names stripped, 1 to 80 characters, without control characters, stored as plain text;
-- in-memory rate limits on sign-up and login: 5 attempts per 15 minutes per endpoint and peer address, checked before any Argon2 work;
+- in-memory rate limits on sign-up and login: 5 attempts per 15 minutes per endpoint and client address, checked before any Argon2 work;
 - sign-up gated by a single invite code from `SIGNUP_INVITE_CODE`, compared in constant time. Without it, sign-up is disabled.
 
-The rate limit uses the address of the TCP peer; `X-Forwarded-For` is ignored and uvicorn runs with `--no-proxy-headers`. Behind a reverse proxy every client would share the proxy's address, so the key has to change when Caddy is deployed. State lives in the single API process and resets on restart.
+The rate limit uses the client address as uvicorn resolves it. The image's default command ignores forwarded headers (`--no-proxy-headers`), so the address is the TCP peer. In production the API is reached only through Caddy, and `infra/compose.prod.yml` runs uvicorn with `--proxy-headers --forwarded-allow-ips=<Caddy's fixed address>`: `X-Forwarded-For` is read only on connections from that address, taking its last entry that is not a trusted proxy, and Caddy writes that header itself from the address it accepted the connection from ([deployment.md](deployment.md#client-addresses)). A client cannot choose its key by sending the header. State lives in the single API process and resets on restart.
 
 CSRF protection: `SameSite=Lax`, a required `Origin` header matching the allowlist on every non-GET request, and a JSON-only API. Both are checked for every HTTP route under `/api` before the body is read (`ApiRoute` in `src/linuxlab/api.py`). The WebSocket checks `Origin` before accepting the connection.
 

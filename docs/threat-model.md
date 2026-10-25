@@ -71,7 +71,7 @@ Labs are destroyed after 15 minutes with no terminal connected, 30 minutes with 
 | Cookie scoping | `__Host-` prefix: `Secure`, `Path=/`, no `Domain`, so no subdomain or plain-HTTP page can set or read it |
 | Long-lived stolen session | 7-day idle expiry and 30-day absolute expiry that activity cannot extend; logout deletes the session on the server |
 | CSRF | `SameSite=Lax`, required allowed `Origin` and JSON content type on every non-GET request |
-| Password guessing | 5 login attempts per 15 minutes per peer address, checked before Argon2 |
+| Password guessing | 5 login attempts per 15 minutes per client address, checked before Argon2 |
 | CPU and memory exhaustion through Argon2 | Rate limit first; at most two hashes at a time, in worker threads |
 | Account enumeration on login | Same status, code and message for unknown email and wrong password; an unknown email still runs one Argon2 verification |
 | Unwanted sign-ups | Invite code compared in constant time; sign-up disabled when none is configured |
@@ -157,7 +157,7 @@ Content in `content/` is reviewed in the repository, but the sync still treats i
 
 **Email enumeration on sign-up.** Accepted until there is an email flow. Only someone with the invite code gets past the check that precedes it.
 
-**Rate limiting by peer address, in memory.** Limits are kept in the API process, reset on restart and are not shared between processes, which matches the single-process closed beta. They key on the TCP peer: behind a reverse proxy all clients share one address and one budget, and one address can hold many users (NAT) or one user many addresses. `X-Forwarded-For` is ignored until a trusted proxy is configured. This has to be revisited together with the Caddy deployment.
+**Rate limiting by client address, in memory.** Limits are kept in the API process, reset on restart and are not shared between processes, which matches the single-process closed beta. They key on the client address: the TCP peer, or behind Caddy the address Caddy accepted the connection from, which uvicorn reads from `X-Forwarded-For` only on connections from Caddy's fixed address. One address can hold many users (NAT) and one user can hold many addresses (an IPv6 prefix in particular), so the limit slows guessing but does not identify people. The trust chain holds only while the API has no published port and nothing but Caddy shares its network; see [deployment.md](deployment.md#client-addresses).
 
 **Lab state in one process.** Terminal connections and their activity live in the single API process; activity reaches the database at most 30 seconds late, and is lost if the API crashes in between, which can only shorten a lab's idle time. Running more than one API process requires moving lab control into its own service (`lab-agent`).
 

@@ -1,0 +1,52 @@
+# The site, shared by every entry (Caddyfile and the entries in infra/): the frontend's
+# static files and the API, on one origin. See docs/deployment.md.
+
+# Access log on standard output, rotated by Docker. Caddy logs Cookie, Set-Cookie,
+# Authorization and Proxy-Authorization as REDACTED.
+log {
+	output stdout
+	format json
+}
+
+# Scripts only from this origin. Styles also allow inline: xterm.js adds <style>
+# elements for the terminal's theme, which style-src 'self' blocks (checked in
+# Chromium, docs/deployment.md#headers).
+header {
+	Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+	X-Content-Type-Options nosniff
+	X-Frame-Options DENY
+	Referrer-Policy same-origin
+	Cross-Origin-Opener-Policy same-origin
+	Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+	-Server
+}
+
+# Everything under /api and /ws goes to the API, and nothing else does: its
+# documentation routes (/docs, /openapi.json) are not reachable from outside.
+@api path /api/* /ws/*
+handle @api {
+	# The largest valid request body is a few kilobytes.
+	request_body {
+		max_size 64KB
+	}
+	# No timeouts of its own: replacing a lab takes up to about 100 s, and a terminal
+	# WebSocket lasts as long as the lab allows (docs/architecture.md#timeouts).
+	reverse_proxy {$API_UPSTREAM:api:8000} {
+		# The API trusts this header only from Caddy, and reads its last entry. It
+		# holds exactly the address Caddy resolved, never a value from the client.
+		header_up X-Forwarded-For {client_ip}
+	}
+}
+
+handle {
+	root * /srv/web
+	encode zstd gzip
+	# Vite names assets by content hash; anything else is revalidated on every load.
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+	@entry not path /assets/*
+	header @entry Cache-Control "no-cache"
+	# Client-side routes are served the entry page.
+	try_files {path} /index.html
+	file_server
+}
