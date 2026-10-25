@@ -163,13 +163,18 @@ async def test_the_hook_keeps_the_exit_status_and_last_argument(lab: Lab) -> Non
 async def test_lines_bash_does_not_run_or_keep_are_left_out(lab: Lab) -> None:
     async with lab.terminal() as websocket:
         sh = await shell(websocket)
-        await sh.send(b"echo cancelled\x03")
         await sh.send(b"\r")
         await sh.send(b"\r")
         await sh.send(b" echo hidden$((1))\r")
         await sh.until(b"hidden1\r\n")
         await sh.send(b"if then fi\r")
         await sh.until(b"syntax error")
+        # Input typed while bash recovers from Ctrl+C can lose characters, so the next
+        # line is typed only once the new prompt is shown, as a person would.
+        await sh.send(b"echo cancelled\x03")
+        after = (await sh.until(b"^C")).split(b"^C")[-1]
+        if b"$ " not in after:
+            await sh.until(b"$ ")
         await sh.run("true", "done-a")
 
     assert without_markers(await lab.history()) == ["true"]
