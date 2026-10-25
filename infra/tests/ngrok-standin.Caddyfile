@@ -1,0 +1,17 @@
+# Stand-in for the ngrok agent in `infra/tests/e2e.sh --entry ngrok`, at the agent's
+# address on the tunnel network. It does what ngrok documents for HTTP endpoints:
+# terminates TLS, keeps the X-Forwarded-For the client sent and appends the address
+# the connection came from, then forwards plain HTTP to Caddy. It tests the chain
+# from the agent on; it is not ngrok.
+{
+	servers {
+		# Trusting every peer makes Caddy keep incoming X-Forwarded-For values and
+		# append the peer, as ngrok does.
+		trusted_proxies static 0.0.0.0/0
+	}
+}
+
+linuxlab.localhost {
+	tls internal
+	reverse_proxy caddy:80
+}

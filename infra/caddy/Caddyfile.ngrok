@@ -1,0 +1,23 @@
+# Entry through an ngrok tunnel (infra/compose.ngrok.yml): ngrok terminates TLS for
+# its domain and the agent forwards plain HTTP to Caddy over the internal "tunnel"
+# network. Caddy publishes no port. See docs/deployment.md#entry-through-ngrok.
+#
+# Only the agent's fixed address is trusted. ngrok appends the address it accepted
+# the connection from to X-Forwarded-For, after anything the client sent;
+# trusted_proxies_strict reads the header right to left and stops at the first
+# untrusted address, which is that one. A value the client wrote is never taken.
+{
+	auto_https off
+	servers {
+		trusted_proxies static {$NGROK_AGENT_IP}/32
+		trusted_proxies_strict
+	}
+	log {
+		output stdout
+		format json
+	}
+}
+
+:80 {
+	import /etc/caddy/linuxlab.caddy
+}

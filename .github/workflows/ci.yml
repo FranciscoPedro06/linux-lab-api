@@ -174,9 +174,10 @@ jobs:
         run: |
           image=$(sed -n 's/^FROM \(caddy:.*\)$/\1/p' infra/caddy/Dockerfile)
           docker run --rm --network none -v "$PWD/infra/caddy:/etc/caddy:ro" \
-            -e SITE_ADDRESS=lab.example.org "$image" \
+            -e SITE_ADDRESS=lab.example.org -e NGROK_AGENT_IP=172.30.3.3 "$image" \
             sh -c 'caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile &&
-              for file in /etc/caddy/Caddyfile /etc/caddy/linuxlab.caddy; do
+              caddy validate --config /etc/caddy/Caddyfile.ngrok --adapter caddyfile &&
+              for file in /etc/caddy/Caddyfile /etc/caddy/Caddyfile.ngrok /etc/caddy/linuxlab.caddy; do
                 caddy fmt "$file" | diff -u "$file" -; done'
       - name: Validate the production Compose file
         run: |
@@ -184,3 +185,14 @@ jobs:
             PUBLIC_ORIGIN=https://lab.example.org POSTGRES_PASSWORD=0 DOCKER_SOCKET_GID=0 \
             LAB_DEPLOYMENT=ci LAB_CAPACITY=1 > "$RUNNER_TEMP/ci.env"
           docker compose -f infra/compose.prod.yml --env-file "$RUNNER_TEMP/ci.env" config --quiet
+          touch "$RUNNER_TEMP/ngrok.env"
+          printf '%s\n' NGROK_URL=https://lab.example.org "NGROK_ENV_FILE=$RUNNER_TEMP/ngrok.env" >> "$RUNNER_TEMP/ci.env"
+          docker compose -f infra/compose.prod.yml -f infra/compose.ngrok.yml \
+            --env-file "$RUNNER_TEMP/ci.env" config --quiet
+      - name: Validate the ngrok agent settings
+        run: |
+          image=$(sed -n 's/^    image: \(ngrok\/ngrok:.*\)$/\1/p' infra/compose.ngrok.yml)
+          docker run --rm --network none -v "$PWD/infra/ngrok/agent.yml:/etc/ngrok/agent.yml:ro" \
+            --entrypoint ngrok "$image" config check --config /etc/ngrok/agent.yml
+      - name: Check that incomplete or unsafe environment files are refused
+        run: infra/tests/check-env-detects.sh

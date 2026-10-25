@@ -1,0 +1,19 @@
+# Override for `infra/tests/e2e.sh --entry ngrok`, after infra/compose.ngrok.yml and
+# compose.e2e.yml: the ngrok service runs a stand-in (ngrok-standin.Caddyfile) at the
+# agent's address instead of the agent, and needs no authtoken. Clients are on the
+# agent's egress network, as the internet is for the real agent.
+
+services:
+  caddy:
+    ports: !reset []
+
+  ngrok:
+    image: caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    env_file: !reset []
+    cap_add: [NET_BIND_SERVICE]
+    tmpfs: !override [/data, /config]
+    volumes: !override
+      - ./tests/ngrok-standin.Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "127.0.0.1:${E2E_BROWSER_PORT:-8443}:443"

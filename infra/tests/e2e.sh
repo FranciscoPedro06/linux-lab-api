@@ -2,10 +2,14 @@
 # End-to-end checks of the production stack (docs/deployment.md#checking-a-release):
 # starts infra/compose.prod.yml with the release's images as a disposable project,
 # with the synthetic missions of tests/fixtures/content, and checks it from clients
-# on its public network, each with its own address, through Caddy only.
+# on the entry's outer network, each with its own address, through the entry only.
 #
-#   infra/tests/e2e.sh RELEASE_FILE [--runtime runsc|runc] [--keep]
+#   infra/tests/e2e.sh RELEASE_FILE [--entry direct|ngrok] [--runtime runsc|runc] [--keep]
 #
+# --entry direct (the default) is infra/caddy/Caddyfile: clients reach Caddy on the
+# public network. --entry ngrok adds infra/compose.ngrok.yml with a stand-in for the
+# agent (compose.ngrok-standin.yml): clients reach the stand-in on the agent's egress
+# network, and it forwards to Caddy over the tunnel network as ngrok does.
 # --runtime runc is for hosts without gVisor (Docker Desktop); it also runs the API
 # with ENVIRONMENT=development, which is what allows runc. Everything is removed at
 # the end unless --keep. Never run it with the production project name.
@@ -14,16 +18,18 @@ set -euo pipefail
 # must reach docker as written, and host paths go through host_path.
 docker() { MSYS_NO_PATHCONV=1 command docker "$@"; }
 
-release='' runtime=runsc keep=false
+release='' entry=direct runtime=runsc keep=false
 while [ $# -gt 0 ]; do
     case "$1" in
+        --entry) entry=$2; shift 2 ;;
         --runtime) runtime=$2; shift 2 ;;
         --keep) keep=true; shift ;;
-        -*) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) release=$1; shift ;;
     esac
 done
-[ -f "$release" ] || { echo "usage: e2e.sh RELEASE_FILE [--runtime runsc|runc] [--keep]" >&2; exit 2; }
+[ -f "$release" ] || { echo "usage: e2e.sh RELEASE_FILE [--entry direct|ngrok] [--runtime runsc|runc] [--keep]" >&2; exit 2; }
+case "$entry" in direct | ngrok) ;; *) echo "error: --entry is direct or ngrok" >&2; exit 2 ;; esac
 
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
@@ -55,7 +61,6 @@ SIGNUP_INVITE_CODE=$invite
 DOCKER_SOCKET_GID=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock --entrypoint stat "$api_image" -c %g /var/run/docker.sock)
 LAB_DEPLOYMENT=$deployment
 LAB_CAPACITY=4
-PUBLIC_SUBNET=172.31.0.0/24
 EDGE_SUBNET=172.31.1.0/24
 DB_SUBNET=172.31.2.0/24
 CADDY_EDGE_IP=172.31.1.2
@@ -65,12 +70,32 @@ E2E_ENVIRONMENT=$([ "$runtime" = runsc ] && echo production || echo development)
 BACKUP_DIR=$work/backups
 BACKUP_KEEP_DAYS=1
 EOF
+    # Clients are always on 172.31.0.0/24: the public network, or the agent's egress.
+    if [ "$entry" = direct ]; then
+        echo PUBLIC_SUBNET=172.31.0.0/24
+    else
+        printf '%s\n' PUBLIC_SUBNET=172.31.4.0/24 NGROK_EGRESS_SUBNET=172.31.0.0/24 \
+            TUNNEL_SUBNET=172.31.3.0/24 CADDY_TUNNEL_IP=172.31.3.2 NGROK_AGENT_IP=172.31.3.3 \
+            NGROK_URL=https://linuxlab.localhost "NGROK_ENV_FILE=$(host_path "$work/ngrok.env")"
+        # The stand-in needs no authtoken; the file only has to exist.
+        echo "# no authtoken: the agent is replaced by a stand-in" >"$work/ngrok.env"
+    fi >>"$env_file"
 )
 
-compose_files=(-f "$(host_path "$repo/infra/compose.prod.yml")"
-    --env-file "$(host_path "$release")" --env-file "$(host_path "$env_file")")
+# The deployment's files, then the test's.
+deployment_files=("$repo/infra/compose.prod.yml")
+test_files=("$here/compose.e2e.yml")
+if [ "$entry" = ngrok ]; then
+    deployment_files+=("$repo/infra/compose.ngrok.yml")
+    test_files+=("$here/compose.ngrok-standin.yml")
+fi
+compose_files=()
+for file in "${deployment_files[@]}"; do compose_files+=(-f "$(host_path "$file")"); done
+compose_files+=(--env-file "$(host_path "$release")" --env-file "$(host_path "$env_file")")
+test_args=()
+for file in "${test_files[@]}"; do test_args+=(-f "$(host_path "$file")"); done
 compose() {
-    docker compose -p "$project" "${compose_files[@]}" -f "$(host_path "$here/compose.e2e.yml")" "$@"
+    docker compose -p "$project" "${compose_files[@]}" "${test_args[@]}" "$@"
 }
 
 cleanup() {
@@ -95,19 +120,35 @@ expect_fails() { local what=$1; shift; if "$@" >/dev/null 2>&1; then result 1 "$
 echo "== configuration"
 config=$(docker compose -p linuxlab-prod "${compose_files[@]}" config --format json)
 check_config() {
-    docker run -i --rm --network none --entrypoint python "$api_image" -c '
-import json, sys
+    docker run -i --rm --network none -e ENTRY="$entry" --entrypoint python "$api_image" -c '
+import json, os, sys
 config = json.load(sys.stdin)
 services, networks = config["services"], config["networks"]
+entry = os.environ["ENTRY"]
 problems = []
 for name, service in services.items():
-    if service.get("ports") and name != "caddy":
+    if service.get("ports") and (entry == "ngrok" or name != "caddy"):
         problems.append(f"{name} publishes ports")
     if "WEB_CONCURRENCY" in (service.get("environment") or {}):
         problems.append(f"{name} sets WEB_CONCURRENCY")
-ports = sorted(port["target"] for port in services["caddy"]["ports"])
-if ports != [80, 443]:
-    problems.append(f"caddy publishes {ports}")
+if entry == "direct":
+    ports = sorted(port["target"] for port in services["caddy"]["ports"])
+    if ports != [80, 443]:
+        problems.append(f"caddy publishes {ports}")
+    if sorted(services["caddy"]["networks"]) != ["edge", "public"]:
+        problems.append("caddy networks")
+else:
+    caddy, agent = services["caddy"], services["ngrok"]
+    if sorted(caddy["networks"]) != ["edge", "tunnel"]:
+        problems.append("caddy networks")
+    if sorted(agent["networks"]) != ["ngrok-egress", "tunnel"] or not networks["tunnel"].get("internal"):
+        problems.append("agent networks")
+    if "/etc/caddy/Caddyfile.ngrok" not in caddy["command"]:
+        problems.append("caddy does not use the tunnel entry")
+    if caddy["environment"]["NGROK_AGENT_IP"] != agent["networks"]["tunnel"]["ipv4_address"]:
+        problems.append("caddy trusts an address that is not the agent")
+    if "NGROK_AUTHTOKEN" in (agent.get("environment") or {}):
+        problems.append("authtoken in the compose file instead of the environment file")
 api = services["api"]
 command = api["command"]
 caddy_ip = services["caddy"]["networks"]["edge"]["ipv4_address"]
@@ -119,8 +160,6 @@ if not api.get("container_name") or api.get("deploy", {}).get("replicas", 1) != 
     problems.append("api can be scaled")
 if sorted(api["networks"]) != ["db", "edge"] or sorted(services["postgres"]["networks"]) != ["db"]:
     problems.append("api or postgres on an unexpected network")
-if sorted(services["caddy"]["networks"]) != ["edge", "public"]:
-    problems.append("caddy networks")
 for name in ("edge", "db"):
     if not networks[name].get("internal"):
         problems.append(f"network {name} is not internal")
@@ -131,11 +170,14 @@ print("\n".join(problems) or "ok")
 sys.exit(1 if problems else 0)
 ' <<<"$config"
 }
-expect_ok "production compose: only Caddy publishes ports, one API process trusting only Caddy, internal networks, socket only in the API" \
+expect_ok "deployment compose ($entry): published ports, one API process trusting only Caddy, internal networks, socket only in the API" \
     check_config
 
 echo "== start, with the operation scripts"
-export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project LINUXLAB_OVERRIDES="$here/compose.e2e.yml"
+overrides=("${deployment_files[@]:1}" "${test_files[@]}")
+export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project
+LINUXLAB_OVERRIDES=$(IFS=:; echo "${overrides[*]}")
+export LINUXLAB_OVERRIDES
 # The synthetic missions, committed in a throwaway repository like the private one.
 content="$work/content-repo"
 mkdir -p "$content"
@@ -163,26 +205,31 @@ expect_ok "content-sync.sh: synthetic missions synced from the checkout" \
 expect_ok "no container kept the content mount" \
     test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$project" --filter volume=/content)"
 compose up -d --wait >/dev/null
-echo "stack up ($runtime)"
+echo "stack up ($entry entry, $runtime)"
 
+# What clients connect to: Caddy on the public network, or the agent on its egress.
+if [ "$entry" = direct ]; then
+    entry_service=caddy network="${project}_public"
+else
+    entry_service=ngrok network="${project}_ngrok-egress"
+fi
 for _ in $(seq 30); do
-    compose cp caddy:/data/caddy/pki/authorities/local/root.crt "$(host_path "$work/root.crt")" >/dev/null 2>&1 && break
+    compose exec -T "$entry_service" cat /data/caddy/pki/authorities/local/root.crt >"$work/root.crt" 2>/dev/null && break
     sleep 1
 done
 cp "$here/e2e.py" "$work/e2e.py"
-network="${project}_public"
-caddy_ip=$(docker inspect --format "{{(index .NetworkSettings.Networks \"$network\").IPAddress}}" "$(compose ps -q caddy)")
+entry_ip=$(docker inspect --format "{{(index .NetworkSettings.Networks \"$network\").IPAddress}}" "$(compose ps -q "$entry_service")")
 postgres_ip=$(docker inspect --format "{{(index .NetworkSettings.Networks \"${project}_db\").IPAddress}}" "$(compose ps -q postgres)")
 
 client() {
     local address=$1
     shift
-    docker run --rm --user "$(id -u):$(id -g)" --network "$network" --ip "$address" --add-host "linuxlab.localhost:$caddy_ip" \
-        -e E2E_HOST=linuxlab.localhost -e E2E_ORIGIN=https://linuxlab.localhost:8443 -e E2E_INVITE="$invite" \
+    docker run --rm --user "$(id -u):$(id -g)" --network "$network" --ip "$address" --add-host "linuxlab.localhost:$entry_ip" \
+        -e E2E_ENTRY="$entry" -e E2E_HOST=linuxlab.localhost -e E2E_ORIGIN=https://linuxlab.localhost:8443 -e E2E_INVITE="$invite" \
         -v "$(host_path "$work"):/e2e:ro" --entrypoint python "$api_image" /e2e/e2e.py "$@"
 }
 
-echo "== site through Caddy"
+echo "== site through the $entry entry"
 expect_ok "site checks" client 172.31.0.101 site
 
 echo "== client addresses and the rate limit"
@@ -203,11 +250,18 @@ expect_ok "Caddy logged the real client addresses, never the forged ones ($login
     seen_real_addresses
 
 echo "== what is reachable"
-expect_ok "public network reaches Caddy on 443 (control)" client 172.31.0.120 connect "$caddy_ip" 443
-expect_fails "public network cannot resolve the API" client 172.31.0.120 connect api 8000
-expect_fails "public network cannot reach the API's address" client 172.31.0.120 connect 172.31.1.3 8000
-expect_fails "public network cannot reach PostgreSQL" client 172.31.0.120 connect "$postgres_ip" 5432
-expect_fails "public network cannot reach Caddy's admin endpoint" client 172.31.0.120 connect "$caddy_ip" 2019
+expect_ok "clients reach the entry on 443 (control)" client 172.31.0.120 connect "$entry_ip" 443
+expect_fails "clients cannot resolve the API" client 172.31.0.120 connect api 8000
+expect_fails "clients cannot reach the API's address" client 172.31.0.120 connect 172.31.1.3 8000
+expect_fails "clients cannot reach PostgreSQL" client 172.31.0.120 connect "$postgres_ip" 5432
+expect_fails "clients cannot reach the entry's admin endpoint" client 172.31.0.120 connect "$entry_ip" 2019
+if [ "$entry" = ngrok ]; then
+    expect_fails "clients cannot resolve Caddy" client 172.31.0.120 connect caddy 80
+    expect_fails "clients cannot reach Caddy's tunnel address" client 172.31.0.120 connect 172.31.3.2 80
+    expect_fails "clients cannot reach Caddy's edge address" client 172.31.0.120 connect 172.31.1.2 80
+    in_caddy() { compose exec -T caddy wget -q -T 3 -O /dev/null "$1"; }
+    expect_fails "Caddy has no route to the internet in this entry" in_caddy http://1.1.1.1/
+fi
 in_api() { compose exec -T api python -c "import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3)" "$@"; }
 expect_ok "API reaches PostgreSQL (control)" in_api postgres 5432
 expect_fails "API has no route to the internet" in_api 1.1.1.1 443
@@ -246,7 +300,7 @@ if [ -n "$lab" ]; then
         test "$(docker inspect --format '{{.HostConfig.Runtime}} {{.HostConfig.NetworkMode}} {{len .Mounts}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.Privileged}}' "$lab")" = "$runtime none 0 true false"
     expect_ok "lab: no Docker socket inside" docker exec "$lab" sh -c '! find / -xdev -name docker.sock 2>/dev/null | grep -q . && test ! -e /var/run/docker.sock'
     expect_ok "lab: only the loopback interface" test "$(docker exec "$lab" ip -o link | awk -F': ' '{print $2}')" = lo
-    for target in "172.31.1.3 8000" "$postgres_ip 5432" "$caddy_ip 443" "1.1.1.1 443"; do
+    for target in "172.31.1.3 8000" "$postgres_ip 5432" "172.31.1.2 443" "1.1.1.1 443"; do
         # shellcheck disable=SC2086 # $target is "host port", two arguments.
         expect_fails "lab cannot reach $target" docker exec "$lab" python3 -c "import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3)" $target
     done
@@ -263,9 +317,11 @@ expect_ok "terminal closed by the restart and reopened on the same lab" wait "$r
 cat "$work/restart.log"
 
 echo "== logs"
-for service in caddy api postgres; do
+services=(caddy api postgres)
+[ "$entry" = direct ] || services+=(ngrok)
+for service in "${services[@]}"; do
     expect_ok "$service logs rotate (json-file, 10m x 5)" \
-        test "$(docker inspect --format '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "$(compose ps -q $service)")" = "json-file 10m 5"
+        test "$(docker inspect --format '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "$(compose ps -q "$service")")" = "json-file 10m 5"
 done
 logs=$(compose logs 2>&1)
 expect_fails "no invite code in any log" grep -qF "$invite" <<<"$logs"

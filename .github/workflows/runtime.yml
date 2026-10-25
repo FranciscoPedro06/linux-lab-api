@@ -181,5 +181,8 @@ jobs:
           api/infra/release/build.sh --api-repo api --api-sha "$(git -C api rev-parse HEAD)" \
             --web-repo web --web-sha "$(git -C web rev-parse HEAD)" --out "$RUNNER_TEMP/releases"
 
-      - name: Check the stack end to end
-        run: api/infra/tests/e2e.sh "$(ls "$RUNNER_TEMP"/releases/release-*.env)" --runtime runsc
+      - name: Check the stack end to end, entry with its own domain
+        run: api/infra/tests/e2e.sh "$(ls "$RUNNER_TEMP"/releases/release-*.env)" --entry direct --runtime runsc
+
+      - name: Check the stack end to end, entry through ngrok (stand-in agent)
+        run: api/infra/tests/e2e.sh "$(ls "$RUNNER_TEMP"/releases/release-*.env)" --entry ngrok --runtime runsc

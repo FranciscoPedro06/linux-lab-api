@@ -152,4 +152,50 @@ Caddy writes a JSON access log to standard output, with `Cookie`, `Set-Cookie`, 
 - logs: rotation, no invite code or database password in any log, cookies redacted;
 - every lab container of the run removed by the API.
 
-`--runtime runc` runs the labs under runc with `ENVIRONMENT=development`, for hosts without gVisor such as Docker Desktop; CI runs it under runsc (`Runtime` workflow).
+`--runtime runc` runs the labs under runc with `ENVIRONMENT=development`, for hosts without gVisor such as Docker Desktop; CI runs it under runsc (`Runtime` workflow). `--entry ngrok` runs the same checks through the entry below, with a stand-in for the agent.
+
+## Entry through ngrok
+
+A contingency for a beta or a demonstration when the host cannot have its own domain, DNS record or open ports in time. It changes only the entry: the API, PostgreSQL, the labs and the frontend are the same images and settings. `infra/compose.ngrok.yml` is layered on the production file.
+
+```
+Browser --HTTPS/WSS--> ngrok (TLS for its domain) <--outbound-- agent (ngrok-egress)
+                                                                   |
+                                          [tunnel, internal]  caddy :80 (Caddyfile.ngrok)
+                                                                   |
+                                          [edge, internal]    api ... as above
+```
+
+| | Own domain (`Caddyfile`) | Through ngrok (`Caddyfile.ngrok`) |
+|---|---|---|
+| Published ports | 80 and 443 | None |
+| TLS | Caddy, ACME certificate | ngrok, for its domain; plain HTTP from the agent to Caddy |
+| Caddy's networks | `public`, `edge` | `tunnel` (internal), `edge`: no route to the internet |
+| Who reaches Caddy | Any client | Only the agent, at its fixed address on `tunnel` |
+| Client address | The connection's peer | The last entry ngrok appended to `X-Forwarded-For` |
+| HSTS, HTTP redirect | Caddy | ngrok (its endpoints are HTTPS) |
+| Public origin | `https://<own domain>` | `https://<ngrok domain>`: `PUBLIC_ORIGIN` and `SITE_ADDRESS` follow it |
+
+### Client addresses through ngrok
+
+ngrok's HTTP endpoints add `X-Forwarded-For` with the address of the client that connected to them, and append it when the request already carries the header: whatever a client sends comes first, ngrok's value last ([ngrok: HTTP endpoints, upstream headers](https://ngrok.com/docs/gateway/endpoints/http.md)). So:
+
+1. Caddy trusts exactly one address, the agent's (`trusted_proxies static <agent>/32`), with `trusted_proxies_strict`: it reads `X-Forwarded-For` right to left and takes the first address that is not trusted, the one ngrok appended. Values the client wrote are to its left and never taken.
+2. Caddy sends the API `X-Forwarded-For: {client_ip}`, as in the other entry, and the API trusts only Caddy.
+3. Nothing but the agent is on `tunnel`, and Caddy publishes no port, so no other peer can present the agent's address.
+
+`e2e.sh --entry ngrok` checks this chain with a stand-in that behaves as documented (keeps the client's header and appends the peer): forged headers neither escape a limit nor charge another client, and clients on the agent's egress network reach neither Caddy, the API nor PostgreSQL. With `trusted_proxies_strict` removed, the forged-header checks fail. **The stand-in is not ngrok**: the chain through the real service has not been tested (no account or authtoken was available, and opening a tunnel publishes the site). Before this entry is used, run the forged-header checks through the real tunnel on a deployment without real data: `E2E_HOST=<ngrok domain> E2E_ORIGIN=https://<ngrok domain> E2E_CA=none python infra/tests/e2e.py logins ...` from two machines with different addresses, as `e2e.sh` does.
+
+### Credentials
+
+The agent's authtoken is in `/etc/linuxlab/ngrok.env` (root, mode 0600, from `infra/ngrok/ngrok.env.example`), read by Compose as the agent's environment file. The image's entrypoint writes it into a config file on a tmpfs. It is not in the repository, the images, the Compose files, command lines or the agent's settings (`infra/ngrok/agent.yml`); like any container environment, it is visible to whoever can use the Docker socket, which is root on the host anyway. Use a token made for this agent only, restricted with an ACL to the endpoint's domain ([ngrok: authtokens](https://ngrok.com/docs/gateway/agent/authtokens.md)). The agent's local web interface and request inspection are off: requests carry session cookies.
+
+### What changes for users and operators
+
+- **A third party in the path.** ngrok terminates TLS, so it handles everything in clear: passwords at login, session cookies, terminal input and output, command history pages. Testers must be told before using it.
+- **Availability** depends on ngrok's service and on the agent's outbound connection.
+- **Limits of the free plan** ([ngrok: free plan limits](https://ngrok.com/docs/pricing-limits/free-plan-limits.md)): 1 GB of data out and 20,000 HTTP requests per month, 4,000 requests per minute, one assigned dev domain. Terminal output counts as data. An interstitial page is shown to browsers before the site until the visitor accepts it (a cookie, 7 days); paid plans remove it.
+- **The rate limit** relies on ngrok reporting the right client address; this is trust in ngrok.
+- Caddy's certificate, the HSTS header and the HTTP redirect of the other entry do not apply.
+
+The entry is ready to use only when an account and plan are chosen, the forged-header checks pass through the real tunnel, and testers have been told. Until then the entry with the deployment's own domain is the only production path.

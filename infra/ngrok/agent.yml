@@ -1,0 +1,10 @@
+# ngrok agent settings for infra/compose.ngrok.yml. No credentials: the authtoken
+# comes from the environment file named by NGROK_ENV_FILE.
+version: 3
+agent:
+  # No local web interface or request inspection: requests carry session cookies.
+  web_addr: false
+  inspect_db_size: -1
+  log: stdout
+  log_format: json
+  log_level: info
