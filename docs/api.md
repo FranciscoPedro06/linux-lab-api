@@ -48,6 +48,7 @@ General errors, shared by every route:
 | POST | `/api/labs` | Create a lab for a mission. Body: `mission_slug` |
 | POST | `/api/labs/{id}/replace` | Replace the lab with a new one, for the same mission (reset) or another (mission switch). Body: `mission_slug` |
 | POST | `/api/labs/{id}/validate` | Validate the current state. Optional body: `answer` |
+| GET | `/api/labs/{id}/history` | The lab's command history, in any state. Query: `after`, `limit` |
 | DELETE | `/api/labs/{id}` | End the lab |
 | GET | `/api/health` | Database and lab runtime status |
 | WS | `/ws/labs/{id}/terminal` | Terminal |
@@ -279,9 +280,42 @@ The body holds at most `answer`: a string of up to 1 KiB in UTF-8, compared by t
 | More than 20 validations by this user in 60 seconds | `429 rate_limited`, with `Retry-After` |
 | The run or the completion could not be stored | `500 internal_error`; neither is stored |
 
-Validation never changes the lab, its parameters or its version, never runs setup again, and does not count as terminal activity. Repeating it creates a new run each time, and the first passed run records the completion. Clients should not validate automatically or retry in a loop: the request is made when the student asks.
+Validation never changes the lab, its parameters or its version, never runs setup again, does not count as terminal activity and never reads the command history. Repeating it creates a new run each time, and the first passed run records the completion. Clients should not validate automatically or retry in a loop: the request is made when the student asks.
 
 The run and the completion are committed in one transaction. A response lost after that commit (a dropped connection) does not undo it: a client that did not get the response should read the progress again from the catalog rather than assume nothing was stored. Validating again then returns `newly_completed: false`.
+
+### `GET /api/labs/{id}/history`
+
+Implemented in increment 12. The command lines the lab's interactive bash accepted, as the terminal relay observed them, in the order they were recorded ([architecture.md](architecture.md#command-history)). Readable in any state of the lab, including after it ended or was replaced.
+
+```
+GET /api/labs/7f0b.../history?after=0&limit=200
+```
+
+```json
+{
+  "entries": [
+    { "seq": 1, "command": "ls -la", "recorded_at": "2026-10-25T12:00:00Z" },
+    { "seq": 2, "command": "cat <<EOF > notas.txt\nolá\nEOF", "recorded_at": "2026-10-25T12:00:04Z" }
+  ],
+  "more": false
+}
+```
+
+- `after` (default `0`) returns entries with a greater `seq`; `limit` (1 to 500, default 200) caps the page. `more` says whether entries exist after the last one returned, so a client reads everything by passing the last `seq` as `after` until `more` is `false`, and polls for new entries the same way.
+- `seq` starts at 1 and grows by one per lab, in the order entries were recorded. A repeated command is a new entry with its own `seq`.
+- `command` is the line as bash recorded it: 1 to 4096 bytes, possibly with newlines and tabs, never with other control characters. It is plain text and may contain secrets the student typed; there is no redaction.
+- `recorded_at` is when the API observed the line, not when the command ran or finished. An entry does not mean the command ran or succeeded.
+- A lab holds at most 2000 entries; later commands are not recorded.
+- The history belongs to the lab. A reset or mission switch creates a lab with an empty history; the replaced lab keeps its own.
+
+| Situation | Response |
+|---|---|
+| The caller owns the lab | `200` with a page, possibly empty |
+| `after` or `limit` missing a number, or out of range | `422 invalid_request` |
+| No such lab, or another user's | `404 lab_not_found` |
+
+There is no route to write, change or delete entries: they are recorded by the terminal relay only, never from a request.
 
 ## Catalog
 
@@ -368,7 +402,7 @@ There is no route to read or change another user's progress, nor a route that ta
 
 ## Missions (planned)
 
-Releasing `explanation` and `solutions` to a user who completed the mission, in `GET /api/missions/{slug}` and in the validation response, is a candidate for increment 14, after the closed beta deployment (13). Until then the server never returns them. From increment 12 the validation response also carries the commands recorded in the lab.
+Releasing `explanation` and `solutions` to a user who completed the mission, in `GET /api/missions/{slug}` and in the validation response, is a candidate for increment 14, after the closed beta deployment (13). Until then the server never returns them.
 
 ## Terminal
 

@@ -6,7 +6,7 @@ This document covers Linux Lab's components, main flows and the decisions behind
 
 A mission is approved based only on the final state of the lab, or on an answer submitted by the student. How the student got there is not evaluated.
 
-Command history exists for learning and analytics. It takes no part in validation, and the validation module does not depend on the history module.
+Command history exists so that students can look back at and reuse what they typed. It takes no part in validation or progress, and neither module depends on the history module.
 
 ## Components
 
@@ -38,7 +38,7 @@ The API runs as a single process in the MVP. WebSocket connections, rate limitin
 | `labs` | Lab lifecycle, container configuration, reaper |
 | `terminal` | WebSocket bridge to `docker exec` |
 | `validation` | Condition tree, validators, fact collection |
-| `history` | Command history collection and redaction |
+| `history` | Command history: markers in the terminal output, recording and reading |
 
 ## Labs
 
@@ -338,16 +338,61 @@ The format is described in [missions.md](missions.md).
 
 ## Command history
 
-The lab image configures `bash` to append events to `/run/lab/history.log`:
+Implemented in increment 12, in `src/linuxlab/history/` and `lab-image/history.bash`. A lab's history is the list of command lines its interactive bash accepted, as the terminal relay observed them. It is best-effort and informational: it is not a record of everything that ran, not an audit log, and not evidence of anything.
 
-- `PS0` records the start of a command, before it runs;
-- `PROMPT_COMMAND` records the end, with exit code and working directory.
+```
+bash in the lab: PS0 hook writes a marker to the terminal
+   | PTY output
+relay output task: MarkerFilter takes markers out --> output to the browser
+   | command line
+HistoryRecorder (rate limit, bounded queue) --> writer task --> command_history
+```
 
-Command and directory are stored base64-encoded to avoid escaping issues. The API collects the file on validation, reset, mission switch and lab shutdown, and writes it with an upsert on `(lab_session_id, seq)`, so collecting twice is harmless.
+### What is recorded
 
-Known limitations: commands inside scripts and what happens inside programs such as `vim` are not recorded, the student can disable the hook, and entries can be forged. None of this affects validation.
+An entry is a line that interactive bash accepted for execution. The hook reads it from bash's own history, from `PS0`, which bash expands after reading a line and before running it. An entry therefore does not mean that the command ran, succeeded or finished, and no exit code is recorded.
 
-Before storing, the API redacts common secret patterns (`password=`, `token=`, `Authorization:`, `-p<password>`) and truncates each command to 2 KB. History is visible only to its owner.
+- One entry per accepted line. `a; b && c || d`, pipelines and redirections are one entry. A multi-line command (a loop, a quoted string over several lines, a heredoc with its body) is one entry holding its lines.
+- The line is recorded as bash keeps it in its history: aliases as typed, history expansion (`!!`) expanded, a line recalled with the up arrow once more.
+- Repeated lines are separate entries. The image's default `~/.bashrc` sets `HISTCONTROL=ignorespace` instead of Ubuntu's `ignoreboth`.
+- Not recorded: lines that start with a space, empty lines, lines cancelled with Ctrl+C, lines with a syntax error, and lines over 4096 bytes, which are left out whole rather than cut.
+- Not recorded: input read by programs instead of by bash at its prompt, such as a password typed into `read -s` or `passwd`, input to `python`, editors and pagers.
+- Not recorded: commands run by scripts, `bash -c`, `sh` or any other non-interactive shell. An interactive `bash` started from the terminal loads the hook too, so its lines are recorded.
+- Nothing else is stored: no output, environment, file contents, working directory, exit codes, mission parameters, probe results or answers.
+
+### Marker and relay
+
+The hook is `/etc/linuxlab/history.bash`, owned by root and read-only, sourced at the end of `/etc/bash.bashrc` and therefore only by interactive bash. For each new history entry it writes a marker to the terminal, `ESC ] 7771 ; <base64 of the line in UTF-8> BEL`, using only bash builtins and `/usr/bin/base64`; the line is passed as data and never run or expanded. The format is defined in `history/marker.py` and checked against the hook by a test.
+
+The relay's output task passes every chunk through `MarkerFilter` before pacing and sending it. Complete markers are taken out, and every other byte is passed on unchanged and in order, however the output is split into chunks. A chunk that ends in what may be the start of a marker is held until the next chunk, or for at most 200 ms when no output follows, so the bytes held are bounded by one marker (about 5.5 KiB) and output is never held for long. A complete marker whose payload is not valid base64 or UTF-8, is empty, is over 4096 bytes or contains a control character other than tab and newline is taken out and counted, never stored. The browser never receives a marker.
+
+### Recording
+
+The output task never waits for the database. Each terminal connection has a `HistoryRecorder`, bound to the lab the connection was authorized for, which queues lines for its own writer task or drops them:
+
+| Limit | Value |
+|---|---|
+| Command line | 4096 bytes in UTF-8 |
+| Entries per lab | 2000; later lines are dropped |
+| Rate per connection | 20 lines per second, with a burst of 20 |
+| Queue per connection | 100 lines |
+| Writing what is queued when the connection ends | 2 s, then the writer is cancelled |
+
+A line dropped by a limit, by a failed insert (the database is unavailable) or by the end of the connection is lost; the terminal is never slowed down, blocked or closed because of the history. Each connection logs one line with the number of entries recorded, dropped (by reason) and rejected (by reason), and the type of the first failed insert. Commands and payloads are never logged.
+
+The writer inserts each entry in its own short transaction. `seq` is assigned by the insert itself, one more than the lab's highest, under a transaction-level advisory lock keyed by the lab, so writers of the same lab (a connection being replaced while the next one starts, or two API processes) are serialized: `seq` starts at 1, has no gaps and follows the commit order, and paging with `after` never misses an entry. No other lock is held, and nothing touches the lab's row or its container.
+
+The recorder starts before the terminal and drains after the terminal is released, so ending a lab (logout, reset, mission switch, the reaper) never waits for the history; entries observed before the end are still written within the drain time. A reconnect starts a new shell and a new recorder that continue the same lab's history; nothing is replayed, so nothing is duplicated. A connection only ever writes to its own lab: the history of a replaced lab stays on it, and its successor starts empty.
+
+### Privacy
+
+The history stores what the student types at the prompt, as typed, including secrets: tokens and passwords passed as arguments (`mysql -psecret`, `curl -H "Authorization: Bearer ..."`, `export TOKEN=...`), credentials in URLs and heredoc bodies. There is no redaction: no pattern tells a secret from an ordinary argument, and a redacted line could not be reused. A line that starts with a space is left out by bash itself; this holds only while `HISTCONTROL` keeps `ignorespace` and is not a guarantee. Mission parameters never reach the terminal's environment, but a value the student found in the lab and typed, the answer to a mission included, is stored like any other text. The web page tells the student all of this next to the terminal.
+
+Entries belong to the lab (`command_history.lab_session_id`) and are read only by the lab's owner, through `GET /api/labs/{id}/history`, which resolves the lab with `owned_lab` like every lab route ([api.md](api.md#get-apilabsidhistory)). They cannot be changed, and they are kept as long as the lab's row, which is removed only with its user; no retention policy exists for labs yet.
+
+### Integrity
+
+The hook runs in the student's shell. The student can turn it off (`PS0=`, `set +o history`, redirecting bash's standard error), change `HISTCONTROL`, or write markers themselves: a valid marker printed by any program in the lab is recorded as an entry. Forged entries only reach the student's own history, which serves nothing but the student.
 
 ## Authentication
 
@@ -385,7 +430,7 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 | `user_missions` | The first completion of a mission by a user: the version it was on and when; PK `(user_id, mission_id)` |
 | `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time, the pinned mission version and the generated parameters |
 | `validation_runs` | Every finished validation: the lab, its pinned version, the outcome (`passed`, `failed`, `error`), an error code for `error`, the tree of statuses and reasons, whether an answer was sent, start and end times |
-| `command_history` | Collected commands; unique on `(lab_session_id, seq)` |
+| `command_history` | Command lines accepted by a lab's interactive shell: the lab, a sequence number per lab, the line, when the API observed it; PK `(lab_session_id, seq)` |
 
 ```
 modules 1-N missions 1-N mission_versions
@@ -413,6 +458,7 @@ Other rules:
 - `lab_sessions` references `mission_versions` with a composite foreign key `(mission_id, mission_version)`, so the version exists and belongs to the mission. The mission, the version and `params` are all set or all `NULL` (labs created before increment 07), and the trigger refuses changing any of them.
 - `mission_versions` has a trigger that rejects `UPDATE` and `DELETE`.
 - `validation_runs` references `lab_sessions` with a composite foreign key `(lab_session_id, mission_id, mission_version)` to `(id, mission_id, mission_version)`, so a run records exactly its lab's pinned version, and `mission_versions` with `(mission_id, mission_version)`. `CHECK` constraints tie `error_code` (a closed list) to `outcome = 'error'` and allow a missing `result` only for `invalid_spec`. A trigger rejects `UPDATE`; `DELETE` stays possible so that deleting a user cascades. No retention policy is defined yet.
+- `command_history` references `lab_sessions` with `ON DELETE CASCADE` and has no user column: its owner is the lab's owner. `CHECK` constraints keep `seq` positive and the line between 1 and 4096 bytes, without control characters other than tab and newline. A trigger rejects `UPDATE`. Nothing references it, and it references neither `validation_runs` nor `user_missions`.
 - `missions` has a foreign key `(id, current_version)` to `mission_versions`, so the current version always exists and belongs to the mission. It and the uniqueness of `(module_id, position)` are checked at commit, which lets a sync insert a mission with its first version and reorder a module in one transaction.
 - `modules` and `missions` have `CHECK` constraints on the status (`draft`, `published`, `archived`) and the slug format; a mission without a position must be `archived`.
 - States and reasons are `text` columns with `CHECK` constraints rather than `ENUM`, which keeps schema changes simple.
@@ -435,4 +481,4 @@ Organizations and classes, when they exist, will be new tables. Content and prog
 | Missions | Content versioned in the repository | Review, diffs and automated tests |
 | Versioning | Automatic, from a content hash | Does not rely on someone remembering to bump a number |
 | Validation | Declarative conditions over facts collected by a platform utility | No validation code from content; testable without Docker |
-| History | Bash hook, informational only | Cleaner data than keystroke capture; never affects approval |
+| History | Bash hook writing a marker the relay takes out of the output; informational only | Only bash knows the line it accepted; no keystroke parsing, no exec into the lab, no change to the lab lifecycle; never affects approval |
