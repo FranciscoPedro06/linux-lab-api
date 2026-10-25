@@ -16,12 +16,13 @@ lab container: bash --login, stdin/stdout on the exec's TTY
 |---|---|
 | `labs/terminal/router.py` | WebSocket endpoint: origin, session and lab checks, init, logging, close codes |
 | `labs/terminal/protocol.py` | Message format, limits and close codes |
-| `labs/terminal/relay.py` | Moves bytes both ways; the terminal registry (one connection per lab, closing a lab's terminal, activity); output pacing |
+| `labs/terminal/relay.py` | Moves bytes both ways; the terminal registry (one connection per lab, closing a lab's terminal, activity); output pacing; takes history markers out of the output |
+| `history/marker.py`, `history/recorder.py` | The history marker and its filter; queueing observed command lines for the database |
 | `labs/access.py` | Resolves a lab id for a user: only that user's own lab |
 | `labs/lifecycle.py` | Lab state; checks the container and ends the lab when it died |
 | `labs/runtime/docker.py` | `open_terminal`, `DockerTerminalSession` and process cleanup |
 
-The API never parses or filters what is typed. The student can run anything the lab allows; isolation is the runtime's job (see [runtime.md](runtime.md) and [threat-model.md](threat-model.md)).
+The API never parses or filters what is typed. The student can run anything the lab allows; isolation is the runtime's job (see [runtime.md](runtime.md) and [threat-model.md](threat-model.md)). The only thing the API looks for in the output is the private marker the lab's bash writes for each command line it accepts, which the relay takes out before the output reaches the browser ([Command history](#command-history)).
 
 ## Protocol
 
@@ -75,7 +76,7 @@ Server to client:
 5. The client sends `init` with the size xterm.js computed for its container.
 6. The connection claims the lab in the terminal registry. If the lab already has a terminal connection, that one is closed with 4409 and its shell is ended. The lab's state is read again: if it ended between step 4 and the claim, the connection closes with 4410. From the claim on, ending the lab stops this connection.
 7. The runtime starts `bash --login` as the student on a PTY of the requested size, and the server sends `ready`.
-8. Input and output run as two asyncio tasks, with a third waiting for the claim to be stopped (replaced, or the lab ended). When one finishes, the others are cancelled and awaited.
+8. Input and output run as two asyncio tasks, with a third waiting for the claim to be stopped (replaced, or the lab ended). When one finishes, the others are cancelled and awaited. The connection's history writer runs beside them, from before the claim until after the WebSocket is closed.
 9. Whatever ended the connection, the terminal session is closed (see below) before the WebSocket is closed with the matching code. If the shell ended or the runtime failed, the container is checked: if it died, the lab is ended and the close code is 4410 rather than 4000 or 1011.
 
 Keepalive pings are handled by uvicorn at the WebSocket protocol level (every 20 seconds by default), so a connection whose network disappeared is detected and ends like any other disconnect.
@@ -106,6 +107,17 @@ Anything detached inside a lab lives until the lab is removed, which the reaper 
 
 If the lab is killed or removed while the cleanup runs, the cleanup exec dies with it (exit 137 under runc, 128 or 137 under runsc), and Docker keeps reporting the container as running for some tens of milliseconds. A failed cleanup therefore waits up to two seconds for the container to stop or disappear; only a cleanup that fails on a lab that keeps running is reported as an error. This removed a false `terminal cleanup failed: exit 128` error logged under runsc, and both cases are covered by tests under runc and runsc.
 
+## Command history
+
+Interactive bash in the lab image writes a marker for each command line it accepts, `ESC ] 7771 ; <base64 of the line> BEL`, from `PS0` ([architecture.md](architecture.md#command-history)). The output task passes each chunk through `MarkerFilter` before pacing and sending it:
+
+- complete markers are taken out, and their lines are handed to the connection's recorder, which never waits;
+- every other byte is passed on unchanged and in order, however the output is split into chunks; this is tested byte for byte, including a marker cut at every position;
+- a chunk that ends in what may be the start of a marker is held until the next chunk, or for at most 200 ms when no output follows. The read is never cancelled to do this: it keeps running as a task while the held bytes are passed on. At most one marker's worth of bytes (about 5.5 KiB) is held;
+- a sequence that does not complete the marker grammar is not a marker and is passed on as it is; a complete marker with an invalid payload is taken out and counted.
+
+The browser never receives a marker. Recording drops lines rather than wait (rate, queue and per-lab limits, database failures), so the history can lose entries but never slows down, blocks or closes the terminal. Lines are written to the lab the connection was authorized for, and what is queued when the connection ends is written within 2 seconds after the terminal is released, so ending a lab never waits for it.
+
 ## Limits
 
 | Limit | Value |
@@ -118,6 +130,8 @@ If the lab is killed or removed while the cleanup runs, the cleanup exec dies wi
 | Docker control calls (start, write, resize) | 5 s |
 | Cleanup exec | 10 s |
 | Output rate | about 256 KiB/s per connection, with a 256 KiB burst |
+| Bytes held for a possible history marker | one marker (about 5.5 KiB), at most 200 ms without further output |
+| History lines | 4096 bytes each, 20 per second and 100 queued per connection, 2000 per lab |
 
 Output is never truncated or dropped. Output frames are at most 64 KiB. The rate limit only slows the relay down: while it waits it stops reading from the PTY, the PTY buffer fills and the writing process blocks, as it would on a slow terminal. `Ctrl+C` still reaches the shell because input has its own task. CPU, memory and process limits belong to the lab runtime.
 
@@ -142,13 +156,14 @@ The API logs, for each connection, a short random connection id and the lab id, 
 - `terminal opened`: terminal size;
 - `terminal closed`: reason (`shell_exited`, `client_closed`, `replaced`, `lab_ended`, or the error type), exit code, duration, bytes in and out;
 - `terminal rejected`: origin, `not_authenticated`, `lab_unavailable`, the lab's state (`lab_terminated`, `lab_provisioning`, ...), `lab_gone`, or a protocol error;
+- `terminal history`: entries recorded, dropped and rejected, by reason, and the type of the first failed insert;
 - failures to start, run or clean up the terminal.
 
-Terminal content, typed commands, session tokens and the terminal token are never logged.
+Terminal content, typed commands, history entries and markers, session tokens and the terminal token are never logged.
 
 ## Known behavior
 
 - Input that arrives before bash has set up line editing can be discarded by bash itself, for example a Ctrl+D sent before the first prompt. People type after seeing the prompt; the tests wait for it.
 - In development, React's Strict Mode mounts the page twice, so the browser opens a terminal, closes it and opens another. The first one is cleaned up normally.
-- A reconnect starts a new shell: files and detached processes remain, but the working directory, variables and history of the old shell do not.
+- A reconnect starts a new shell: files and detached processes remain, but the working directory and variables of the old shell do not. Bash's own history (the up arrow) survives in `~/.bash_history` when the old shell saved it on hangup. The lab's command history continues in the API either way.
 - The terminal device differs between runtimes. Under runc the shell's terminal is a traditional pseudo-terminal, `/dev/pts/N`. Under runsc (gVisor) it is a host terminal passed into the sandbox and no `/dev/pts` device is exposed for it, so `tty` prints `not a tty` and programs that need `ttyname()` fail. In both runtimes the exec's TTY provides the terminal behavior the product needs, and the tests check it under both: line editing, history, window size and resize, Ctrl+C, Ctrl+D, `isatty` and interactive input. There is no additional PTY or intermediate shell.

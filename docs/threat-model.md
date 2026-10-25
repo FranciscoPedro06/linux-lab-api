@@ -153,7 +153,7 @@ Content in `content/` is reviewed in the repository, but the sync still treats i
 
 **Validation coordination in one process.** The one-validation-per-lab rule and the validation rate limit live in the API process, like the terminal registry, and are reset on restart. Running several workers requires moving them.
 
-**Command history.** Secret redaction is heuristic. The risk is low because labs have no network.
+**Command history.** The history stores what the student types at the bash prompt, as typed, secrets and heredoc bodies included, with no redaction: no pattern can tell a secret from an ordinary argument. It never stores output, environments, file contents, parameters or answers sent for validation, and input read by programs (password prompts, `read -s`) never reaches it. Entries are readable only by the lab's owner and kept as long as the lab's row. Starting a line with a space keeps it out only while bash's `HISTCONTROL` keeps `ignorespace`. The hook runs in the student's shell, so the student can turn it off or forge entries, but only in their own history, which takes no part in validation or progress and proves nothing. Showing a history to anyone but its owner (teachers, analytics) would need this reassessed first ([architecture.md](architecture.md#command-history)).
 
 **Email enumeration on sign-up.** Accepted until there is an email flow. Only someone with the invite code gets past the check that precedes it.
 
