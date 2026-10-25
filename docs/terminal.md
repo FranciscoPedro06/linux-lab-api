@@ -113,10 +113,10 @@ Interactive bash in the lab image writes a marker for each command line it accep
 
 - complete markers are taken out, and their lines are handed to the connection's recorder, which never waits;
 - every other byte is passed on unchanged and in order, however the output is split into chunks; this is tested byte for byte, including a marker cut at every position;
-- a chunk that ends in what may be the start of a marker is held until the next chunk, or for at most 200 ms when no output follows. The read is never cancelled to do this: it keeps running as a task while the held bytes are passed on. At most one marker's worth of bytes (about 5.5 KiB) is held;
+- a chunk that ends in what may be the start of a marker is held until the next chunk, or for at most 200 ms when no output follows. The read is never cancelled to do this: it keeps running as a task while the held bytes are passed on. At most one marker's worth of bytes (about 5.5 KiB) is held. bash writes a marker in one write, so its parts arrive together; should the rest of one arrive more than 200 ms after its start, both parts are passed on as ordinary output (xterm.js ignores the unknown sequence, and the base64 of the line may show as text) and the line is not recorded;
 - a sequence that does not complete the marker grammar is not a marker and is passed on as it is; a complete marker with an invalid payload is taken out and counted.
 
-The browser never receives a marker. Recording drops lines rather than wait (rate, queue and per-lab limits, database failures), so the history can lose entries but never slows down, blocks or closes the terminal. Lines are written to the lab the connection was authorized for, and what is queued when the connection ends is written within 2 seconds after the terminal is released, so ending a lab never waits for it.
+The browser never receives a marker. Recording drops lines rather than wait (rate, queue and per-lab limits, database failures), so the history can lose entries but never slows down, blocks or closes the terminal. Lines are written to the lab the connection was authorized for, after any lines the lab's previous connection still had to write, so the history keeps the order in which lines were observed across reconnects. What is queued when the connection ends is written within 2 seconds after the terminal is released, so ending a lab never waits for it.
 
 ## Limits
 
