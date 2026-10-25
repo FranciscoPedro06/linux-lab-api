@@ -369,6 +369,6 @@ A change of this repository is ready to merge when the checks above pass and the
 The repositories are public. A mission's solutions and counterexamples tell how it is solved, and are meant to reach a student only after completion (a candidate for increment 14); committed to a public repository, anyone could read them. Mission content therefore lives in the private repository `linux-lab-content`, in the layout above (`content/modules`, `content/missions`), and `content/` here holds no mission (a test enforces it).
 
 - `linuxlab content sync` and the mission tests read the content from `CONTENT_DIR`. Keep the private checkout outside this repository (for example next to it); `.gitignore` and `.dockerignore` also exclude a `linux-lab-content/` directory placed inside by mistake.
-- The production image copies `content/` from this repository, which holds only `.gitkeep`; CI checks that the image has no mission content and no tests. Syncing the private content on deploy, without putting it in a public image, is part of increment 13.
+- The production image copies `content/` from this repository, which holds only `.gitkeep`; CI checks that the image has no mission content and no tests ([deployment.md](deployment.md#building-a-release)). On deploy, the private content is synced from a read-only checkout by a one-off task, never built into an image ([operations.md](operations.md#syncing-mission-content)).
 
 The examples in this document are illustrative and are not the content of any mission.

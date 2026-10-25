@@ -23,7 +23,7 @@ x-hardening: &hardening
 
 x-database: &database
   ENVIRONMENT: production
-  DATABASE_URL: postgresql+asyncpg://linuxlab:${POSTGRES_PASSWORD:?}@postgres:5432/linuxlab
+  DATABASE_URL: postgresql+asyncpg://linuxlab:${POSTGRES_PASSWORD:?}@postgres:5432/${DATABASE_NAME:-linuxlab}
   # Required by the production settings; tasks never start labs.
   LAB_OCI_RUNTIME: runsc
 

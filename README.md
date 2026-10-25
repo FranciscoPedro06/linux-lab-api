@@ -216,6 +216,7 @@ Increments 01 to 10 are implemented: application skeleton, database connection, 
 - [docs/architecture.md](docs/architecture.md): components, flows and decisions
 - [docs/api.md](docs/api.md): HTTP endpoints and terminal protocol
 - [docs/deployment.md](docs/deployment.md): production stack, client addresses, release images and their checks
+- [docs/operations.md](docs/operations.md): installing, deploying, backups, restoring, checking labs, rollback
 - [docs/missions.md](docs/missions.md): mission format and authoring rules
 - [docs/runtime.md](docs/runtime.md): lab runtime, gVisor setup and verification status
 - [docs/terminal.md](docs/terminal.md): terminal protocol, lifecycle and limits
