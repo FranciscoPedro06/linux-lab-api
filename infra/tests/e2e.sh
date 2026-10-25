@@ -10,8 +10,9 @@
 # with ENVIRONMENT=development, which is what allows runc. Everything is removed at
 # the end unless --keep. Never run it with the production project name.
 set -euo pipefail
-# Container paths below must reach docker as written (Git Bash would rewrite them).
-export MSYS_NO_PATHCONV=1
+# Git Bash on Windows rewrites arguments that look like paths: container paths
+# must reach docker as written, and host paths go through host_path.
+docker() { MSYS_NO_PATHCONV=1 command docker "$@"; }
 
 release='' runtime=runsc keep=false
 while [ $# -gt 0 ]; do
@@ -61,6 +62,8 @@ CADDY_EDGE_IP=172.31.1.2
 API_EDGE_IP=172.31.1.3
 E2E_RUNTIME=$runtime
 E2E_ENVIRONMENT=$([ "$runtime" = runsc ] && echo production || echo development)
+BACKUP_DIR=$work/backups
+BACKUP_KEEP_DAYS=1
 EOF
 )
 
@@ -74,7 +77,7 @@ cleanup() {
     if [ "$keep" = false ]; then
         compose --profile tasks down --volumes --remove-orphans >/dev/null 2>&1 || true
         # Labs of this disposable deployment only.
-        docker ps -aq --filter label=linuxlab.deployment=$deployment | xargs -r docker rm -f >/dev/null
+        for id in $(docker ps -aq --filter label=linuxlab.deployment=$deployment); do docker rm -f "$id" >/dev/null; done
         rm -rf "$work"
     else
         echo "kept project $project; env file $env_file"
@@ -131,11 +134,31 @@ sys.exit(1 if problems else 0)
 expect_ok "production compose: only Caddy publishes ports, one API process trusting only Caddy, internal networks, socket only in the API" \
     check_config
 
-echo "== start"
-compose up -d --wait postgres >/dev/null
-compose run --rm task alembic upgrade head >/dev/null
-compose run --rm -v "$(host_path "$repo/tests/fixtures/content"):/content:ro" \
-    task linuxlab content sync --content-dir /content
+echo "== start, with the operation scripts"
+export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project LINUXLAB_OVERRIDES="$here/compose.e2e.yml"
+# The synthetic missions, committed in a throwaway repository like the private one.
+content="$work/content-repo"
+mkdir -p "$content"
+cp -r "$repo/tests/fixtures/content" "$content/content"
+git -C "$content" init -q
+git -C "$content" config core.autocrlf false
+git -C "$content" add content
+git -C "$content" -c user.name=e2e -c user.email=e2e@e2e.example commit -q -m content
+content_sha=$(git -C "$content" rev-parse HEAD)
+
+expect_ok "migrate.sh: backup, restore test, then upgrade from an empty database" \
+    "$repo/infra/ops/migrate.sh" "$release"
+expect_ok "migrate.sh again: nothing to migrate" "$repo/infra/ops/migrate.sh" "$release"
+expect_fails "content-sync.sh refuses a checkout at another commit" \
+    "$repo/infra/ops/content-sync.sh" "$release" "$content" "$(printf '0%.0s' $(seq 40))"
+touch "$content/content/untracked.txt"
+expect_fails "content-sync.sh refuses untracked files" \
+    "$repo/infra/ops/content-sync.sh" "$release" "$content" "$content_sha"
+rm "$content/content/untracked.txt"
+expect_ok "content-sync.sh: synthetic missions synced from the checkout" \
+    "$repo/infra/ops/content-sync.sh" "$release" "$content" "$content_sha"
+expect_ok "no container kept the content mount" \
+    test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$project" --filter volume=/content)"
 compose up -d --wait >/dev/null
 echo "stack up ($runtime)"
 
@@ -240,6 +263,52 @@ logs=$(compose logs 2>&1)
 expect_fails "no invite code in any log" grep -qF "$invite" <<<"$logs"
 expect_fails "no database password in any log" grep -qF "$(sed -n 's/^POSTGRES_PASSWORD=//p' "$env_file")" <<<"$logs"
 expect_ok "Caddy access log redacts cookies" grep -q '"Cookie":\["REDACTED"\]' <<<"$logs"
+
+echo "== backups"
+dump=$("$repo/infra/ops/backup.sh" "$release" e2e 2>"$work/backup.log")
+expect_ok "backup.sh wrote a readable dump and Caddy's data" \
+    test -s "$dump" -a -s "$(ls "$work"/backups/caddy-data-*-e2e.tar.gz)"
+if [ "$(uname -s)" = Linux ]; then
+    expect_ok "backups are readable only by their owner" \
+        test "$(stat -c %a "$work/backups")" = 700 -a "$(stat -c %a "$dump")" = 600
+else
+    echo "skip  backup file modes: not checkable on $(uname -s)"
+fi
+expect_ok "backup.sh reported that nothing was copied off the host" \
+    grep -q "BACKUP_COPY_COMMAND not set" "$work/backup.log"
+users_before=$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')
+expect_ok "restore.sh: restored into a new database and dropped it" \
+    "$repo/infra/ops/restore.sh" "$release" "$dump"
+expect_ok "the database in use was not touched ($users_before users)" \
+    test "$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')" = "$users_before"
+expect_ok "no restore database left" \
+    test "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0
+printf 'corrupt' >>"$dump"
+expect_fails "restore.sh refuses a dump that does not match its checksum" \
+    "$repo/infra/ops/restore.sh" "$release" "$dump"
+
+echo "== lab checks"
+for _ in $(seq 60); do
+    [ -z "$(docker ps -aq --filter label=linuxlab.deployment=$deployment)" ] && break
+    sleep 1
+done
+expect_ok "check-labs.sh: nothing to report" "$repo/infra/ops/check-labs.sh" "$release"
+lab_image=$(value LAB_IMAGE)
+orphan_key=$(random 16)
+docker run -d --name "ll-lab-$orphan_key" --network none --label linuxlab.managed=true \
+    --label linuxlab.lab_id="$orphan_key" --label linuxlab.deployment=$deployment "$lab_image" >/dev/null
+docker run -d --name "e2e-unidentified" --network none \
+    --label linuxlab.deployment=$deployment "$lab_image" >/dev/null
+"$repo/infra/ops/check-labs.sh" "$release" >"$work/check-labs.log" 2>&1 && checked=0 || checked=$?
+expect_ok "check-labs.sh reports an orphan and an unidentified container, exit 1" \
+    test "$checked" = 1 -a "$(grep -c -E 'ATTENTION  (orphan container ll-lab-|unidentified container e2e-unidentified)' "$work/check-labs.log")" = 2
+for _ in $(seq 45); do
+    docker inspect "ll-lab-$orphan_key" >/dev/null 2>&1 || break
+    sleep 1
+done
+expect_fails "the reaper removed the orphan" docker inspect "ll-lab-$orphan_key"
+expect_ok "the unidentified container was left alone" docker inspect e2e-unidentified
+docker rm -f e2e-unidentified >/dev/null
 
 echo "== cleanup by the API"
 for _ in $(seq 60); do

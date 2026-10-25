@@ -160,6 +160,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - name: Check the deployment scripts
+        run: shellcheck -x infra/release/*.sh infra/ops/*.sh infra/tests/*.sh
       - run: docker build --target prod --tag linuxlab-api:ci .
       - run: docker build --tag linuxlab/lab-base:ci lab-image
       - name: Check what the images contain (no mission content, tests or secrets)
