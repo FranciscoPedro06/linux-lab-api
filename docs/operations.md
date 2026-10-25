@@ -73,7 +73,7 @@ Production only moves forward: `alembic downgrade` is never run on the productio
 
 ## Syncing mission content
 
-`content-sync.sh` runs `linuxlab content sync --content-dir /content` in a one-off container of the release's API image, with the checkout's `content/` mounted read-only, and removes the container when it ends. It refuses a checkout that is not at the given commit or that has modified or untracked files. No running service mounts the content, and no image contains it: the sync writes it into PostgreSQL, where the API reads it ([architecture.md](architecture.md#missions-and-versioning)). Solutions and counterexamples are part of the stored versions and never leave the API ([api.md](api.md)).
+`content-sync.sh` runs `linuxlab content sync --content-dir /content` in a one-off container of the release's API image, with the checkout's `content/` mounted read-only, as the checkout's owner (root) without capabilities, and removes the container when it ends. It refuses a checkout that is not at the given commit or that has modified or untracked files. No running service mounts the content, and no image contains it: the sync writes it into PostgreSQL, where the API reads it ([architecture.md](architecture.md#missions-and-versioning)). Solutions and counterexamples are part of the stored versions and never leave the API ([api.md](api.md)).
 
 How the host gets the checkout is pending. The options:
 

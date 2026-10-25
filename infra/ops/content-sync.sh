@@ -26,6 +26,10 @@ dirty=$(git -C "$checkout" status --porcelain --untracked-files=all -- content)
 
 note "syncing content $content_sha with API $API_SHA"
 compose up -d --wait postgres >/dev/null
-compose run --rm --no-deps -v "$(host_path "$(cd "$checkout/content" && pwd)"):/content:ro" \
+# The task runs as the checkout's owner (root on the host, see docs/operations.md),
+# still without capabilities: the checkout stays readable by its owner only.
+source_dir=$(cd "$checkout/content" && pwd)
+compose run --rm --no-deps --user "$(stat -c %u:%g "$source_dir")" \
+    -v "$(host_path "$source_dir"):/content:ro" \
     task linuxlab content sync --content-dir /content
 note "content $content_sha synced"
