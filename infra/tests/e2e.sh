@@ -251,6 +251,11 @@ else
     result 1 "lab of the restart scenario found"
 fi
 compose restart api >/dev/null
+# The checks below expect a healthy API, which takes a health check after a restart.
+for _ in $(seq 60); do
+    [ "$(docker inspect --format '{{.State.Health.Status}}' "$(compose ps -q api)")" = healthy ] && break
+    sleep 1
+done
 expect_ok "terminal closed by the restart and reopened on the same lab" wait "$restart_client"
 cat "$work/restart.log"
 
