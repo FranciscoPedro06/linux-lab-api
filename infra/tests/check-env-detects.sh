@@ -10,7 +10,10 @@ check="$(cd "$(dirname "$0")/../release" && pwd)/check-env.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 failures=0
-gid=$( [ -S /var/run/docker.sock ] && stat -c %g /var/run/docker.sock || echo 999)
+gid=999
+if [ -S /var/run/docker.sock ]; then
+    gid=$(stat -c %g /var/run/docker.sock)
+fi
 
 write() {
     local name=$1
