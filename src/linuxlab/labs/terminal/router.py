@@ -14,7 +14,7 @@ from starlette.websockets import WebSocketState
 from linuxlab.auth import sessions
 from linuxlab.auth.cookies import SESSION_COOKIE
 from linuxlab.auth.tokens import MAX_TOKEN_LENGTH
-from linuxlab.history.recorder import HistoryRecorder
+from linuxlab.history.recorder import HistoryRecorder, HistoryRecorders
 from linuxlab.labs.access import owned_lab
 from linuxlab.labs.lifecycle import LabGoneError, Labs
 from linuxlab.labs.models import LabSession, LabStatus
@@ -92,9 +92,10 @@ async def terminal_endpoint(websocket: WebSocket, lab_id: str) -> None:
         return
 
     # The recorder outlives the claim: what it still has to write is drained after
-    # the terminal is released, so ending a lab never waits for the history.
-    recorder = HistoryRecorder(state.history, lab.id, connection)
-    async with recorder.running():
+    # the terminal is released, so ending a lab never waits for the history. It writes
+    # only after the lab's previous connection has written what it observed.
+    recorders: HistoryRecorders = state.history_recorders
+    async with recorders.recording(state.history, lab.id, connection) as recorder:
         await _serve(websocket, state, lab, container.id, init, connection, recorder)
 
 
@@ -203,6 +204,8 @@ async def _run_terminal(
     except (ProtocolError, LabRuntimeError) as error:
         failure = error
     finally:
+        # No more lines from this connection: the next one may write once these are.
+        recorder.stop_observing()
         exit_code = await _close_terminal(terminal, connection)
 
     reason = outcome.value if outcome else type(failure).__name__

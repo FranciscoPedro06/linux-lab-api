@@ -16,6 +16,7 @@ from linuxlab.catalog import router as catalog
 from linuxlab.config import Settings, get_settings
 from linuxlab.db import create_engine, create_sessionmaker
 from linuxlab.history import router as history
+from linuxlab.history.recorder import HistoryRecorders
 from linuxlab.history.service import CommandHistory
 from linuxlab.labs import router as labs
 from linuxlab.labs.lifecycle import Labs
@@ -73,6 +74,7 @@ def create_app(
             raise
         app.state.terminals = TerminalRegistry()
         app.state.history = CommandHistory(app.state.sessionmaker)
+        app.state.history_recorders = HistoryRecorders()
         app.state.labs = Labs(
             app.state.sessionmaker,
             runtime,

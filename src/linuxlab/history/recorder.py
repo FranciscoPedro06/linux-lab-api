@@ -13,6 +13,17 @@ ends a terminal. The best-effort rules:
 - when the connection ends, the writer has DRAIN_SECONDS to write what is queued;
   what is left is dropped and the writer is cancelled.
 
+Order across connections. The store gives each entry the next seq when it commits, so
+seq follows the order of the inserts. A connection's writer can still hold lines when
+the connection is replaced or closed, and the next connection to the same lab would
+otherwise insert its lines first. So recorders are created through HistoryRecorders,
+which chains them per lab: a writer inserts nothing before the previous connection's
+recorder has settled, that is, has stopped observing and has nothing left to write (or
+has ended). Lines observed meanwhile wait in the queue. Seq then follows the order in
+which the relay observed the lines, across connections. The chain lives in the API
+process, like the terminal registry; it does not order connections served by
+different processes.
+
 The recorder is bound to one lab when it is created, from the lab the connection was
 authorized for, so a connection only ever writes to its own lab. Logs carry counts
 and error types, never a command.
@@ -58,12 +69,14 @@ class HistoryRecorder:
         lab_id: uuid.UUID,
         connection: str,
         *,
+        previous: "HistoryRecorder | None" = None,
         clock: Callable[[], float] = time.monotonic,
         drain_seconds: float = DRAIN_SECONDS,
     ) -> None:
         self._store = store
         self._lab_id = lab_id
         self._connection = connection
+        self._previous = previous
         self._clock = clock
         self._drain_seconds = drain_seconds
         self._queue: asyncio.Queue[tuple[str, datetime]] = asyncio.Queue(QUEUE_SIZE)
@@ -73,9 +86,16 @@ class HistoryRecorder:
         self._open = False
         # Set while an insert runs, so a cancelled one is counted as not drained.
         self._writing = False
+        # Set once this recorder will insert nothing more: it stopped observing and its
+        # queue is empty, or it ended. The next connection's writer waits for it.
+        self.settled = asyncio.Event()
         self.recorded = 0
         self.dropped: collections.Counter[Dropped] = collections.Counter()
         self.rejected: collections.Counter[Rejection] = collections.Counter()
+
+    @property
+    def lab_id(self) -> uuid.UUID:
+        return self._lab_id
 
     def observe(self, command: str) -> None:
         """Queue a command line for writing, or drop it. Never waits."""
@@ -102,6 +122,11 @@ class HistoryRecorder:
         """Count a marker whose content was refused."""
         self.rejected[rejection] += 1
 
+    def stop_observing(self) -> None:
+        """No more lines will come: the relay has ended. Queued lines are still written."""
+        self._open = False
+        self._settle_if_done()
+
     @asynccontextmanager
     async def running(self) -> AsyncIterator["HistoryRecorder"]:
         """Accept commands and write them until the block ends, then drain."""
@@ -110,20 +135,26 @@ class HistoryRecorder:
         try:
             yield self
         finally:
-            self._open = False
-            with suppress(TimeoutError):
-                async with asyncio.timeout(self._drain_seconds):
-                    await self._queue.join()
-            writer.cancel()
-            with suppress(asyncio.CancelledError):
-                await writer
-            # Left in the queue, or being written when the writer was cancelled.
-            not_drained = self._queue.qsize() + int(self._writing)
-            if not_drained:
-                self.dropped[Dropped.NOT_DRAINED] += not_drained
-            self._log()
+            self.stop_observing()
+            try:
+                with suppress(TimeoutError):
+                    async with asyncio.timeout(self._drain_seconds):
+                        await self._queue.join()
+            finally:
+                # Also when the drain itself is cancelled: the writer never outlives this.
+                writer.cancel()
+                await asyncio.gather(writer, return_exceptions=True)
+                # Left in the queue, or being written when the writer was cancelled.
+                not_drained = self._queue.qsize() + int(self._writing)
+                if not_drained:
+                    self.dropped[Dropped.NOT_DRAINED] += not_drained
+                self.settled.set()
+                self._log()
 
     async def _write(self) -> None:
+        if self._previous is not None:
+            await self._previous.settled.wait()
+            self._previous = None
         failure_logged = False
         while True:
             command, at = await self._queue.get()
@@ -146,6 +177,11 @@ class HistoryRecorder:
                     )
             self._writing = False
             self._queue.task_done()
+            self._settle_if_done()
+
+    def _settle_if_done(self) -> None:
+        if not self._open and not self._writing and self._queue.empty():
+            self.settled.set()
 
     def _log(self) -> None:
         if not (self.recorded or self.dropped or self.rejected):
@@ -159,3 +195,23 @@ class HistoryRecorder:
             self.recorded,
             "".join(f" {detail}" for detail in details),
         )
+
+
+class HistoryRecorders:
+    """Creates the recorders of the API process, chained per lab (see the module)."""
+
+    def __init__(self) -> None:
+        self._latest: dict[uuid.UUID, HistoryRecorder] = {}
+
+    @asynccontextmanager
+    async def recording(
+        self, store: HistoryStore, lab_id: uuid.UUID, connection: str
+    ) -> AsyncIterator[HistoryRecorder]:
+        recorder = HistoryRecorder(store, lab_id, connection, previous=self._latest.get(lab_id))
+        self._latest[lab_id] = recorder
+        try:
+            async with recorder.running():
+                yield recorder
+        finally:
+            if self._latest.get(lab_id) is recorder:
+                del self._latest[lab_id]

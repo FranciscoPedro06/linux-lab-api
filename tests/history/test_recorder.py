@@ -14,6 +14,7 @@ from linuxlab.history.recorder import (
     QUEUE_SIZE,
     Dropped,
     HistoryRecorder,
+    HistoryRecorders,
 )
 from linuxlab.history.service import LabHistoryFullError
 
@@ -22,17 +23,19 @@ SECRET = "mysql -psecret-value"
 
 
 class Store:
-    """Records what it is given. `gate`, when set, makes each insert wait for it."""
+    """Records what it is given. `gate`, when set, makes each insert wait for it, or
+    only the inserts of the commands in `held` when that is set."""
 
     def __init__(self) -> None:
         self.written: list[tuple[uuid.UUID, str]] = []
         self.gate: asyncio.Event | None = None
         self.started = 0
         self.fail_with: Exception | None = None
+        self.held: set[str] | None = None
 
     async def record(self, lab_id: uuid.UUID, command: str, at: datetime) -> int:
         self.started += 1
-        if self.gate is not None:
+        if self.gate is not None and (self.held is None or command in self.held):
             await self.gate.wait()
         if self.fail_with is not None:
             raise self.fail_with
@@ -224,3 +227,99 @@ async def test_a_connection_without_history_logs_nothing(
 
 def test_limits() -> None:
     assert recorder_module.DRAIN_SECONDS <= 2
+
+
+# Order across connections of one lab
+
+
+async def test_a_writer_waits_for_the_previous_connection_of_the_lab() -> None:
+    store = Store()
+    store.gate = asyncio.Event()
+    recorders = HistoryRecorders()
+    async with recorders.recording(store, LAB, "first") as first:
+        first.observe("A")
+        first.observe("B")
+        await settle(store, 1)  # A is being written, B is queued
+        async with recorders.recording(store, LAB, "second") as second:
+            first.stop_observing()
+            second.observe("C")
+            await asyncio.sleep(0.05)
+            assert store.started == 1
+            store.gate.set()
+            async with asyncio.timeout(2):
+                await first.settled.wait()
+            await settle(store, 3)
+
+    assert [command for _, command in store.written] == ["A", "B", "C"]
+
+
+async def test_the_next_writer_does_not_wait_for_the_previous_connection_to_end() -> None:
+    store = Store()
+    recorders = HistoryRecorders()
+    async with recorders.recording(store, LAB, "first") as first:
+        first.observe("A")
+        await settle(store, 1)
+        first.stop_observing()  # the relay ended; the terminal cleanup is still running
+        async with recorders.recording(store, LAB, "second") as second:
+            second.observe("C")
+            await settle(store, 2)
+            assert [command for _, command in store.written] == ["A", "C"]
+
+
+async def test_other_labs_are_not_chained() -> None:
+    store = Store()
+    store.gate = asyncio.Event()
+    store.held = {"held"}
+    recorders = HistoryRecorders()
+    other = uuid.uuid4()
+    async with recorders.recording(store, LAB, "first") as first:
+        first.observe("held")
+        await settle(store, 1)
+        async with recorders.recording(store, other, "second") as second:
+            second.observe("other lab")
+            await settle(store, 2)
+        store.gate.set()
+
+    assert sorted(store.written) == sorted([(LAB, "held"), (other, "other lab")])
+
+
+async def test_a_previous_recorder_that_ended_without_draining_releases_the_next() -> None:
+    store = Store()
+    store.gate = asyncio.Event()
+    recorders = HistoryRecorders()
+    first_block = recorders.recording(store, LAB, "first")
+    first = await first_block.__aenter__()
+    first._drain_seconds = 0.1
+    first.observe("stuck")
+    await settle(store, 1)
+    second_block = recorders.recording(store, LAB, "second")
+    second = await second_block.__aenter__()
+    second.observe("C")
+
+    await first_block.__aexit__(None, None, None)  # drain times out; writer cancelled
+    assert first.settled.is_set()
+    assert first.dropped == {Dropped.NOT_DRAINED: 1}
+    store.gate.set()
+    await second_block.__aexit__(None, None, None)
+
+    assert [command for _, command in store.written] == ["C"]
+
+
+async def test_cancelling_the_drain_still_ends_the_writer() -> None:
+    store = Store()
+    store.gate = asyncio.Event()
+    recorder = make(store)
+
+    async def connection() -> None:
+        async with recorder.running():
+            recorder.observe("stuck")
+            await settle(store, 1)
+
+    task = asyncio.get_running_loop().create_task(connection())
+    await settle(store, 1)
+    await asyncio.sleep(0.05)  # now draining
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert recorder.settled.is_set()
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "terminal-history"]

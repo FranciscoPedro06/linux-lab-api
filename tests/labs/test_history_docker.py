@@ -141,6 +141,25 @@ async def test_multiline_lines_are_one_entry(lab: Lab) -> None:
     ]
 
 
+async def test_the_hook_keeps_the_exit_status_and_last_argument(lab: Lab) -> None:
+    """PS0 runs before each command; $? and $_ still refer to the previous command."""
+    async with lab.terminal() as websocket:
+        sh = await shell(websocket)
+        await sh.send(b"false\r")
+        await sh.send(b"echo status=$?\r")
+        await sh.until(b"status=1\r\n")
+        await sh.send(b"echo lastarg\r")
+        await sh.send(b"echo underscore=$_\r")
+        await sh.until(b"underscore=lastarg\r\n")
+
+    assert await lab.history() == [
+        "false",
+        "echo status=$?",
+        "echo lastarg",
+        "echo underscore=$_",
+    ]
+
+
 async def test_lines_bash_does_not_run_or_keep_are_left_out(lab: Lab) -> None:
     async with lab.terminal() as websocket:
         sh = await shell(websocket)
