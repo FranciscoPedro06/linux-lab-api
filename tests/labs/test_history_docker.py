@@ -12,9 +12,11 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 
 import aiodocker
+import httpx2
 import pytest
 from websockets.asyncio.client import ClientConnection
 
+from linuxlab.auth.cookies import SESSION_COOKIE
 from linuxlab.history.marker import MARKER_PREFIX
 from linuxlab.labs.models import LabSession
 from linuxlab.labs.runtime.docker import DockerRuntime
@@ -169,15 +171,43 @@ async def test_lines_bash_does_not_run_or_keep_are_left_out(lab: Lab) -> None:
         await sh.until(b"hidden1\r\n")
         await sh.send(b"if then fi\r")
         await sh.until(b"syntax error")
-        # Input typed while bash recovers from Ctrl+C can lose characters, so the next
-        # line is typed only once the new prompt is shown, as a person would.
-        await sh.send(b"echo cancelled\x03")
-        after = (await sh.until(b"^C")).split(b"^C")[-1]
-        if b"$ " not in after:
-            await sh.until(b"$ ")
         await sh.run("true", "done-a")
 
     assert without_markers(await lab.history()) == ["true"]
+
+
+async def test_a_line_cancelled_with_ctrl_c_is_neither_run_nor_recorded(api: Api, lab: Lab) -> None:
+    """Nothing is typed after Ctrl+C: under runsc, input sent right after the prompt
+    that follows Ctrl+C can lose characters (docs/terminal.md, Known behavior), which
+    has nothing to do with the history. The history is read through the API."""
+    async with lab.terminal() as websocket:
+        sh = await shell(websocket)
+        await sh.run("echo before", "done-a")
+        await sh.send(b"touch /tmp/cancelled-line")
+        await sh.send(b"\x03")
+        after = (await sh.until(b"^C")).split(b"^C")[-1]
+        if b"$ " not in after:
+            await sh.until(b"$ ")
+
+    await writers_finished()
+    base_url = api.url.replace("ws://", "http://", 1)
+    async with httpx2.AsyncClient(base_url=base_url) as http:
+        response = await http.get(
+            f"/api/labs/{lab.session.id}/history",
+            headers={"cookie": f"{SESSION_COOKIE}={lab.account.token}"},
+        )
+    assert response.status_code == 200, response.text
+    commands = [entry["command"] for entry in response.json()["entries"]]
+    assert commands == ["echo before", "echo done-a$((1))"]
+
+    runtime: DockerRuntime = api.app.state.runtime
+    result = await runtime.exec(
+        f"ll-lab-{lab.session.lab_key}",
+        ["sh", "-c", "test -e /tmp/cancelled-line && echo exists || echo absent"],
+        user="student",
+        time_limit=10,
+    )
+    assert result.stdout == b"absent\n"
 
 
 async def test_repeated_lines_are_separate_entries(lab: Lab) -> None:
