@@ -59,8 +59,9 @@ load_release() {
         image=$(release_value "${name}_IMAGE")
         recorded=$(release_value "${name}_IMAGE_ID")
         actual=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)
-        [ -n "$image" ] && [ "$actual" = "$recorded" ] \
-            || fail "$image is not the image recorded in $RELEASE (rebuild or use the right release)"
+        if [ -z "$image" ] || [ "$actual" != "$recorded" ]; then
+            fail "$image is not the image recorded in $RELEASE (rebuild or use the right release)"
+        fi
     done
     API_IMAGE=$(release_value API_IMAGE)
     API_SHA=$(release_value API_SHA)

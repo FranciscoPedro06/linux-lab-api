@@ -83,9 +83,14 @@ for key in "${!lab_status[@]}"; do
 done
 echo "labs: $unfinished unfinished in the database, $container_count containers, capacity ${capacity:-?}"
 
-api=$(compose ps -q api)
-if [ -z "$api" ] || [ "$(docker inspect --format '{{.State.Health.Status}}' "$api")" != healthy ]; then
-    report "the API is not running or not healthy"
+api=$(compose ps --all -q api)
+api_state=''
+if [ -n "$api" ]; then
+    # shellcheck disable=SC2086 # Every API container, if more than one exists.
+    api_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' $api | tr '\n' ' ')
+fi
+if [ "${api_state% }" != "running healthy" ]; then
+    report "the API is not running and healthy: ${api_state:-no container}"
 else
     errors=$(docker logs --since 1h "$api" 2>&1 \
         | grep -c -E 'lab reconciliation (failed|skipped)|lab removal failed|orphan removal failed|terminal cleanup failed|refusing to start' || true)
@@ -96,7 +101,9 @@ fi
 
 docker_root=$(docker info --format '{{.DockerRootDir}}')
 for path in "$docker_root" "$(setting BACKUP_DIR)"; do
-    [ -n "$path" ] && [ -d "$path" ] || continue
+    if [ -z "$path" ] || [ ! -d "$path" ]; then
+        continue
+    fi
     used=$(df -P "$path" | awk 'NR == 2 {sub("%", "", $5); print $5}')
     [ "$used" -lt "$DISK_WARN_PERCENT" ] || report "disk of $path is $used% full"
 done

@@ -292,7 +292,12 @@ for _ in $(seq 60); do
     [ -z "$(docker ps -aq --filter label=linuxlab.deployment=$deployment)" ] && break
     sleep 1
 done
-expect_ok "check-labs.sh: nothing to report" "$repo/infra/ops/check-labs.sh" "$release"
+if "$repo/infra/ops/check-labs.sh" "$release" >"$work/check-labs-clean.log" 2>&1; then
+    result 0 "check-labs.sh: nothing to report"
+else
+    result 1 "check-labs.sh: nothing to report"
+    cat "$work/check-labs-clean.log"
+fi
 lab_image=$(value LAB_IMAGE)
 orphan_key=$(random 16)
 docker run -d --name "ll-lab-$orphan_key" --network none --label linuxlab.managed=true \
