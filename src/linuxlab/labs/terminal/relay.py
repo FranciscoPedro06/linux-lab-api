@@ -10,6 +10,7 @@ from enum import Enum
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from linuxlab.history.marker import HOLD_SECONDS, MarkerFilter, Rejection
 from linuxlab.labs.runtime import TerminalSession
 from linuxlab.labs.terminal.protocol import (
     MAX_FRAME_BYTES,
@@ -124,27 +125,67 @@ async def relay(
     claim: TerminalClaim,
     stats: RelayStats,
     on_input: Callable[[], None] = lambda: None,
+    on_command: Callable[[str], None] = lambda command: None,
+    on_rejection: Callable[[Rejection], None] = lambda rejection: None,
 ) -> Outcome:
     """Run until the shell exits, the client leaves, or the claim is stopped (another
     connection took over or the lab ended).
+
+    History markers (linuxlab.history.marker) are removed from the output; the command
+    lines they carry go to `on_command` and refused ones to `on_rejection`. Both must
+    return at once: they run in the output task.
 
     Raises ProtocolError for an invalid message and LabRuntimeError if the runtime
     fails. Both directions run as tasks; when one finishes, the others are cancelled
     and awaited, so nothing is left running.
     """
 
+    pacer = OutputPacer(OUTPUT_BYTES_PER_SECOND)
+
+    async def send(data: bytes) -> bool:
+        for start in range(0, len(data), MAX_FRAME_BYTES):
+            piece = data[start : start + MAX_FRAME_BYTES]
+            try:
+                await websocket.send_bytes(piece)
+            except (WebSocketDisconnect, OSError, RuntimeError):
+                return False
+            stats.bytes_out += len(piece)
+            await pacer.consume(len(piece))
+        return True
+
     async def output() -> Outcome:
-        pacer = OutputPacer(OUTPUT_BYTES_PER_SECOND)
-        while (chunk := await terminal.read()) is not None:
-            for start in range(0, len(chunk), MAX_FRAME_BYTES):
-                piece = chunk[start : start + MAX_FRAME_BYTES]
-                try:
-                    await websocket.send_bytes(piece)
-                except (WebSocketDisconnect, OSError, RuntimeError):
+        # History markers are taken out before anything is sent or paced. A read is
+        # never cancelled to flush held bytes: it keeps running as a task, and held
+        # bytes are passed on when no output follows them in time.
+        markers = MarkerFilter()
+        pending: asyncio.Task[bytes | None] | None = None
+        try:
+            while True:
+                if pending is None:
+                    pending = asyncio.create_task(terminal.read(), name="terminal-read")
+                if markers.holding:
+                    done, _ = await asyncio.wait({pending}, timeout=HOLD_SECONDS)
+                    if not done:
+                        if not await send(markers.flush()):
+                            return Outcome.CLIENT_CLOSED
+                        continue
+                chunk = await pending
+                pending = None
+                if chunk is None:
+                    if not await send(markers.flush()):
+                        return Outcome.CLIENT_CLOSED
+                    return Outcome.SHELL_EXITED
+                filtered = markers.feed(chunk)
+                for command in filtered.commands:
+                    on_command(command)
+                for rejection in filtered.rejections:
+                    on_rejection(rejection)
+                if not await send(filtered.output):
                     return Outcome.CLIENT_CLOSED
-                stats.bytes_out += len(piece)
-                await pacer.consume(len(piece))
-        return Outcome.SHELL_EXITED
+        finally:
+            if pending is not None:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
 
     async def input() -> Outcome:
         while True:
