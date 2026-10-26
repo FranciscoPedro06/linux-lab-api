@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Stand-in for the docker CLI in infra/tests/migrate-cases.sh. Records every call in
+# $STUB_LOG and answers the calls infra/ops/migrate.sh makes (directly and through
+# backup.sh and restore.sh) as the case under test says:
+#
+#   STUB_HEADS, STUB_HEADS_RC        output and status of `alembic heads`
+#   STUB_CURRENT, STUB_CURRENT_RC    output and status of `alembic current` before
+#                                    the upgrade; STUB_AFTER for after it
+#   STUB_UPGRADE_RC                  status of `alembic upgrade head`
+set -uo pipefail
+
+echo "$*" >>"$STUB_LOG"
+args=" $* "
+
+case "$args" in
+    *" image inspect "*) echo sha256:stub ;;
+    *" alembic heads "*)
+        printf '%b' "${STUB_HEADS:-}"
+        echo "alembic heads diagnostics" >&2
+        exit "${STUB_HEADS_RC:-0}"
+        ;;
+    *" alembic current "*)
+        if grep -q "alembic upgrade" "$STUB_LOG"; then
+            printf '%b' "${STUB_AFTER:-}"
+        else
+            printf '%b' "${STUB_CURRENT:-}"
+            echo "alembic current diagnostics" >&2
+            exit "${STUB_CURRENT_RC:-0}"
+        fi
+        ;;
+    *" alembic upgrade head "*)
+        echo "alembic upgrade diagnostics" >&2
+        exit "${STUB_UPGRADE_RC:-0}"
+        ;;
+    *" pg_dump "*) echo "synthetic dump" ;;
+    *" pg_database "*) echo 0 ;;
+    *" volume inspect "*) exit 1 ;;
+    *) ;;
+esac
+exit 0

@@ -161,7 +161,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check the deployment scripts
-        run: shellcheck -x infra/release/*.sh infra/ops/*.sh infra/tests/*.sh
+        run: shellcheck -x infra/release/*.sh infra/ops/*.sh infra/tests/*.sh infra/tests/stubs/docker
+      - name: Check the decisions of migrate.sh (docker replaced by a stub)
+        run: infra/tests/migrate-cases.sh
       - run: docker build --target prod --tag linuxlab-api:ci .
       - run: docker build --tag linuxlab/lab-base:ci lab-image
       - name: Check what the images contain (no mission content, tests or secrets)

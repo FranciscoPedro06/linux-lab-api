@@ -149,6 +149,9 @@ content_sha=$(git -C "$content" rev-parse HEAD)
 expect_ok "migrate.sh: backup, restore test, then upgrade from an empty database" \
     "$repo/infra/ops/migrate.sh" "$release"
 expect_ok "migrate.sh again: nothing to migrate" "$repo/infra/ops/migrate.sh" "$release"
+compose run --rm --no-deps -T task alembic downgrade -1 >/dev/null 2>&1
+expect_ok "migrate.sh on a database one revision behind: upgraded to the head" \
+    "$repo/infra/ops/migrate.sh" "$release"
 expect_fails "content-sync.sh refuses a checkout at another commit" \
     "$repo/infra/ops/content-sync.sh" "$release" "$content" "$(printf '0%.0s' $(seq 40))"
 touch "$content/content/untracked.txt"
