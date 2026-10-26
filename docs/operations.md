@@ -70,6 +70,7 @@ Production only moves forward: `alembic downgrade` is never run on the productio
 - Write migrations as expand and contract: first add (columns, tables, nullable or with defaults) in a release whose code works with and without them, then remove what is no longer used in a later release. The previous release then keeps working on the new schema, which is what makes a rollback of the application possible.
 - A migration that rewrites or deletes data cannot be undone by the application. Before it, `migrate.sh` has taken a backup and restored it into a new database; if the new release is broken after such a migration, fix forward with a new release. Restoring the backup is the emergency procedure ([Restoring](#restoring)), and loses everything written since.
 - A migration that fails part way stops `migrate.sh`; PostgreSQL runs each migration in a transaction, so check `alembic current` (shown by the script) before doing anything else.
+- `migrate.sh` exits 0 only when the database ends at the release's head. It stops with Alembic's own error output when `alembic heads` or `alembic current` fails or prints anything but revision ids, when the release has more than one head (the history is linear) or the database is at more than one revision, and when the upgrade fails or leaves the database short of the head. A database with no revision yet is migrated. `infra/tests/migrate-cases.sh` checks each case with the docker CLI replaced by a stub.
 
 ## Syncing mission content
 
