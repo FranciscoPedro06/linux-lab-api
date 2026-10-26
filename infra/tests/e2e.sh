@@ -306,21 +306,46 @@ else
     result 1 "check-labs.sh: nothing to report"
     cat "$work/check-labs-clean.log"
 fi
+# check-labs.sh and the reaper are checked apart. The reaper (in the API) removes any
+# orphan it recognizes on its next pass, so with the API running an orphan created
+# for check-labs.sh could be gone before the report. With the API stopped no pass
+# can run: the report sees both containers, and must leave both in place.
 lab_image=$(value LAB_IMAGE)
 orphan_key=$(random 16)
+compose stop api >/dev/null
 docker run -d --name "ll-lab-$orphan_key" --network none --label linuxlab.managed=true \
     --label linuxlab.lab_id="$orphan_key" --label linuxlab.deployment=$deployment "$lab_image" >/dev/null
 docker run -d --name "e2e-unidentified" --network none \
     --label linuxlab.deployment=$deployment "$lab_image" >/dev/null
 "$repo/infra/ops/check-labs.sh" "$release" >"$work/check-labs.log" 2>&1 && checked=0 || checked=$?
-expect_ok "check-labs.sh reports an orphan and an unidentified container, exit 1" \
-    test "$checked" = 1 -a "$(grep -c -E 'ATTENTION  (orphan container ll-lab-|unidentified container e2e-unidentified)' "$work/check-labs.log")" = 2
-for _ in $(seq 45); do
-    docker inspect "ll-lab-$orphan_key" >/dev/null 2>&1 || break
-    sleep 1
-done
-expect_fails "the reaper removed the orphan" docker inspect "ll-lab-$orphan_key"
-expect_ok "the unidentified container was left alone" docker inspect e2e-unidentified
+findings=$(grep -c -E 'ATTENTION  (orphan container ll-lab-|unidentified container e2e-unidentified|the API is not running and healthy)' "$work/check-labs.log" || true)
+expect_ok "check-labs.sh reports the orphan, the unidentified container and the stopped API, exit 1" \
+    test "$checked" = 1 -a "$findings" = 3 -a "$(grep -c ATTENTION "$work/check-labs.log")" = 3
+exists() { docker inspect "$1" >/dev/null 2>&1; }
+expect_ok "check-labs.sh removed neither container" exists "ll-lab-$orphan_key"
+expect_ok "check-labs.sh left the unidentified container alone" exists e2e-unidentified
+
+# Blocks until Docker reports the container removed (Engine API wait with
+# condition=removed); a container already gone answers 404. Fails after $2 seconds.
+wait_removed() {
+    docker run --rm --network none --user 0 -v /var/run/docker.sock:/var/run/docker.sock \
+        --entrypoint python "$api_image" -c '
+import http.client, socket, sys
+class Docker(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.settimeout(float(sys.argv[2]))
+        self.sock.connect("/var/run/docker.sock")
+connection = Docker("docker")
+connection.request("POST", f"/containers/{sys.argv[1]}/wait?condition=removed")
+response = connection.getresponse()
+response.read()
+sys.exit(0 if response.status in (200, 404) else 1)' "$1" "$2"
+}
+# The reaper's first pass runs when the API starts.
+compose up -d --wait --no-recreate api >/dev/null
+expect_ok "the reaper's startup pass removed the orphan" wait_removed "ll-lab-$orphan_key" 120
+expect_ok "the reaper left the unidentified container alone" exists e2e-unidentified
 docker rm -f e2e-unidentified >/dev/null
 
 echo "== cleanup by the API"
