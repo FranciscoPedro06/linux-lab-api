@@ -19,6 +19,16 @@
 #                                    creates $STUB_HOLD.started and waits for
 #                                    $STUB_HOLD.release (at most 60 s) before answering
 #
+# What backup.sh records in the manifest and restore.sh compares (STUB_RESTORED_*
+# for the database being restored, restore_*; the backup's value otherwise):
+#   STUB_IMAGE_ID                    id of every image (default sha256:a...a)
+#   STUB_REVISION_<image>            revision label of the image api, lab or edge
+#   STUB_RUNNING_<service>           image id of the service's running container
+#   STUB_ROLES                       roles (default linuxlab:true)
+#   STUB_ALEMBIC, STUB_SCHEMA, STUB_CONTENT, STUB_TABLES
+#                                    revision, schema and content fingerprints, and
+#                                    whether tables exist (t or f)
+#
 # The synthetic dump stands for pg_dump's custom format: a header line, the data,
 # and a last line with the data's SHA-256. Like the real pg_restore, `--list` reads
 # only the header, and a full read (-f /dev/null, or into a database) fails unless
@@ -52,8 +62,49 @@ read_dump() {
     fi
 }
 
+image_id=${STUB_IMAGE_ID:-sha256:$(printf 'a%.0s' $(seq 64))}
+restored=false
+[[ $args == *" -d restore_"* ]] && restored=true
+# fact NAME DEFAULT: STUB_RESTORED_NAME when restoring, else STUB_NAME, else DEFAULT.
+fact() {
+    local backup="STUB_$1" restore="STUB_RESTORED_$1"
+    if [ "$restored" = true ] && [ -n "${!restore+set}" ]; then
+        echo "${!restore}"
+    else
+        echo "${!backup-$2}"
+    fi
+}
+
 case "$args" in
-    *" image inspect "*) echo sha256:stub ;;
+    *" image inspect --format {{.Id}} "*) echo "$image_id" ;;
+    *" image inspect "*"image.revision"*)
+        image=${*: -1}
+        label="STUB_REVISION_$image"
+        echo "${!label:-}"
+        ;;
+    *" compose "*" ps -q "*)
+        service=${*: -1}
+        running="STUB_RUNNING_$service"
+        [ -z "${!running:-}" ] || echo "container-$service"
+        ;;
+    *" inspect --format {{.Image}} container-"*)
+        service=${*: -1}
+        running="STUB_RUNNING_${service#container-}"
+        echo "${!running}"
+        ;;
+    *" pg_dump --version "*) echo "pg_dump (PostgreSQL) 16.15" ;;
+    *" SHOW server_version_num "*) echo 160015 ;;
+    *" SHOW server_version "*) echo 16.15 ;;
+    *" pg_roles "*) fact ROLES linuxlab:true ;;
+    *"to_regclass('public."*) fact TABLES t ;;
+    *" FROM alembic_version "*) fact ALEMBIC e6b40c7d9a18 ;;
+    *" -f - "*)
+        sql=$(cat)
+        case "$sql" in
+            *"schema fingerprint"*) fact SCHEMA "$(printf 'c%.0s' $(seq 64))" ;;
+            *"content fingerprint"*) fact CONTENT "5 $(printf 'd%.0s' $(seq 64))" ;;
+        esac
+        ;;
     *" alembic heads "*)
         printf '%b' "${STUB_HEADS:-}"
         echo "alembic heads diagnostics" >&2
