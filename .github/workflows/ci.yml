@@ -167,6 +167,21 @@ jobs:
         run: |
           infra/release/install-age.sh "$RUNNER_TEMP/age"
           echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+      # Owners, modes, links and filesystems, all real: as this user (its files on
+      # ext4), as root (production), and as root in a container (overlayfs). A ramfs
+      # and a 1 MiB tmpfs are mounted for the work directory's cases.
+      - name: Check the key files and the work directory on real filesystems
+        run: |
+          sudo mkdir -p /mnt/key-cases-ramfs /mnt/key-cases-small
+          sudo mount -t ramfs ramfs /mnt/key-cases-ramfs
+          sudo mount -t tmpfs -o size=1m tmpfs /mnt/key-cases-small
+          sudo chmod 1777 /mnt/key-cases-ramfs /mnt/key-cases-small
+          export KEY_CASES_RAMFS=/mnt/key-cases-ramfs KEY_CASES_SMALL_TMPFS=/mnt/key-cases-small KEY_CASES_REQUIRE_ALL=1
+          infra/tests/key-files-cases.sh
+          sudo --preserve-env=KEY_CASES_RAMFS,KEY_CASES_SMALL_TMPFS,KEY_CASES_REQUIRE_ALL env "PATH=$PATH" \
+            infra/tests/key-files-cases.sh
+          docker run --rm -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/age:/opt/age:ro" \
+            -e PATH=/opt/age:/usr/local/bin:/usr/bin:/bin -w /repo python:3.12-slim infra/tests/key-files-cases.sh
       - name: Check the decisions of migrate.sh (docker replaced by a stub)
         run: infra/tests/migrate-cases.sh
       - name: Check backup.sh, restore.sh and their lock (docker replaced by a stub)

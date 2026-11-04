@@ -47,9 +47,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "${#identities[@]}" -gt 0 ] || fail "no --identity-file: an encrypted package cannot be restored without a key ($usage)"
+# Each key file, before age reads any: a regular file of this user (root), not a link,
+# mode 0600 or 0400, on a path nobody else can change (infra/ops/age.sh).
 for ((i = 1; i < ${#identities[@]}; i += 2)); do
-    identity=${identities[i]}
-    if [ ! -f "$identity" ] || [ ! -r "$identity" ]; then fail "identity file $identity is not a readable file"; fi
+    age_identity "${identities[i]}" || fail "refusing the identity file ${identities[i]}"
 done
 load_release "$release"
 command -v python3 >/dev/null || fail "python3 is required (infra/ops/package.py)"

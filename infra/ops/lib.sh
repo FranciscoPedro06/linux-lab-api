@@ -268,8 +268,9 @@ publish() {
 
 # Where unencrypted packages exist while backup.sh builds one or restore.sh unpacks
 # one: BACKUP_WORK_DIR, by default /run/linuxlab-backup, on /run's tmpfs (memory,
-# gone at reboot). It must be a directory of this user, mode 0700, and not a link;
-# it is made so when missing, never chosen in its place. Each run works in a
+# gone at reboot). It must be a directory of this user, mode 0700, not a link, and on
+# tmpfs or ramfs (memory), whatever its path; it is made when missing, never chosen
+# in its place, and no disk is ever used instead. Each run works in a
 # directory of its own in it, run.<random>, removed when the run ends (trap). Run
 # directories left by a run that was killed are removed by the next backup or
 # restore, which holds the lock, so none of them can still be in use.
@@ -282,7 +283,7 @@ work_root() {
 # prepare_work NEEDED_BYTES: checks the work directory and its free space, removes
 # what killed runs left in it, and sets RUN_DIR to a new run directory. Needs the lock.
 prepare_work() {
-    local root needed=$1 free stale
+    local root needed=$1 free stale fs
     root=$(work_root)
     [[ $root == /* ]] || fail "BACKUP_WORK_DIR must be an absolute path: $root"
     if [ ! -e "$root" ]; then
@@ -291,12 +292,23 @@ prepare_work() {
     if [ ! -d "$root" ] || [ -L "$root" ]; then fail "the work directory $root is not a directory"; fi
     [ "$(stat -c %u "$root")" = "$(id -u)" ] || fail "the work directory $root is not owned by $(id -un)"
     [ "$(stat -c %a "$root")" = 700 ] || fail "the work directory $root has mode $(stat -c %a "$root"), not 700"
+    # In memory only: the filesystem the directory is really on, not its path, decides.
+    fs=$(stat -f -c %T -- "$root")
+    case "$fs" in
+        tmpfs | ramfs) ;;
+        *) fail "the work directory $root is on $fs, not in memory (tmpfs or ramfs): the unencrypted package must not reach a disk; nothing was written (docs/operations.md#encryption)" ;;
+    esac
     stale=$(find "$root" -mindepth 1 -maxdepth 1 -name 'run.*' | wc -l)
     if [ "$stale" != 0 ]; then
         find "$root" -mindepth 1 -maxdepth 1 -name 'run.*' -exec rm -rf -- {} +
         note "removed $stale run director(ies) left in $root by runs that were killed"
     fi
-    free=$(($(df -Pk -- "$root" | awk 'NR == 2 {print $4}') * 1024))
+    if [ "$fs" = ramfs ]; then
+        # ramfs has no size of its own (df says 0): it takes memory until there is none.
+        free=$(($(awk '/^MemAvailable:/ {print $2}' /proc/meminfo) * 1024))
+    else
+        free=$(($(df -Pk -- "$root" | awk 'NR == 2 {print $4}') * 1024))
+    fi
     [ "$free" -ge "$needed" ] \
         || fail "not enough room in the work directory $root: $free bytes free, about $needed needed; nothing was written (BACKUP_WORK_DIR, docs/operations.md#encryption)"
     RUN_DIR=$(mktemp -d -- "$root/run.XXXXXXXX")
