@@ -96,8 +96,15 @@ expect refused "a private key among the recipients" "$work/secret.txt.env"
 recipients writable.txt "$operator" "$recovery"
 chmod 664 "$work/writable.txt"
 expect refused "recipients file writable by its group" "$work/writable.txt.env"
+mkdir -m 770 "$work/shared"
+(umask 077; printf '%s\n' "$operator" "$recovery" >"$work/shared/recipients.txt")
+write shared.env "${good[@]}" "BACKUP_AGE_RECIPIENTS_FILE=$work/shared/recipients.txt"
+expect refused "recipients file in a directory its group can change" "$work/shared.env"
+ln -s "$work/recipients.txt" "$work/link.txt"
+write link.env "${good[@]}" "BACKUP_AGE_RECIPIENTS_FILE=$work/link.txt"
+expect refused "recipients file that is a link" "$work/link.env"
 no_age=$(mktemp -d)
-for program in dirname stat sed tail head grep sort uniq wc cat tr cut; do
+for program in dirname stat sed tail head grep sort uniq wc cat tr cut id readlink; do
     ln -s "$(command -v "$program")" "$no_age/$program"
 done
 bash=$(command -v bash)

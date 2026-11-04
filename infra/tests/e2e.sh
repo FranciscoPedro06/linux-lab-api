@@ -50,7 +50,9 @@ work=$(mktemp -d)
 chmod 700 "$work"
 # Backups are encrypted to two keys made for this run only, removed with $work:
 # "operator" and "recovery" are the recipients, "stranger" is not.
-mkdir -m 700 "$work/keys" "$work/plain"
+mkdir -m 700 "$work/keys"
+# Unencrypted packages exist only in memory (infra/ops/lib.sh): /dev/shm is a tmpfs.
+memory=$(mktemp -d /dev/shm/linuxlab-e2e.XXXXXX)
 for key in operator recovery stranger; do age-keygen -o "$work/keys/$key.key" 2>/dev/null; done
 { age-keygen -y "$work/keys/operator.key"; age-keygen -y "$work/keys/recovery.key"; } >"$work/keys/recipients.txt"
 random() { docker run --rm --network none --entrypoint python "$api_image" -c "import secrets; print(secrets.token_hex($1))"; }
@@ -74,7 +76,7 @@ E2E_RUNTIME=$runtime
 E2E_ENVIRONMENT=$([ "$runtime" = runsc ] && echo production || echo development)
 BACKUP_DIR=$work/backups
 BACKUP_AGE_RECIPIENTS_FILE=$work/keys/recipients.txt
-BACKUP_WORK_DIR=$work/plain
+BACKUP_WORK_DIR=$memory/work
 EOF
     # Clients are always on 172.31.0.0/24: the public network, or the agent's egress.
     if [ "$entry" = direct ]; then
@@ -113,6 +115,7 @@ cleanup() {
     else
         echo "kept project $project; env file $env_file"
     fi
+    rm -rf "$memory"
 }
 trap cleanup EXIT
 
@@ -353,7 +356,7 @@ only_encrypted() {
     done
 }
 expect_ok "nothing unencrypted in BACKUP_DIR (the migrations' backups included)" only_encrypted
-expect_ok "nothing left in the work directory" test -z "$(find "$work/plain" -mindepth 1)"
+expect_ok "nothing left in the work directory" test -z "$(find "$memory/work" -mindepth 1)"
 if [ "$(uname -s)" = Linux ]; then
     expect_ok "backups are readable only by their owner" \
         test "$(stat -c %a "$work/backups")" = 700 -a "$(stat -c %a "$package")" = 600
@@ -418,7 +421,7 @@ expect_fails "restore.sh with a key that is not a recipient: refused" \
 in_use_untouched() {
     test "$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')" = "$users_before" \
         -a "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0 \
-        -a -z "$(find "$work/plain" -mindepth 1)"
+        -a -z "$(find "$memory/work" -mindepth 1)"
 }
 expect_ok "the database in use was not touched ($users_before users), no restore database or decrypted file left" in_use_untouched
 

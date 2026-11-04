@@ -17,17 +17,20 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 ops="$here/../ops"
 work=$(mktemp -d)
+# The work directory must be in memory (lib.sh): /dev/shm is a tmpfs, here and in CI.
+[ "$(stat -f -c %T /dev/shm)" = tmpfs ] || { echo "error: /dev/shm is not a tmpfs here" >&2; exit 1; }
+shm=$(mktemp -d /dev/shm/backup-cases.XXXXXX)
 cleanup() {
     touch "$work/hold.release"
     wait
-    rm -rf "$work"
+    rm -rf "$work" "$shm"
 }
 trap cleanup EXIT
 export PATH="$here/stubs:$PATH" STUB_LOG="$work/calls"
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-backup-cases
 export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
 backups="$work/backups"
-plain_dir="$work/plain"
+plain_dir="$shm/plain"
 release="$work/release.env"
 api_sha=0123456789abcdef0123456789abcdef01234567
 web_sha=fedcba9876543210fedcba9876543210fedcba98
@@ -311,8 +314,31 @@ check "three recipients: accepted" succeeded
 check "  three stanzas, and the third key decrypts" \
     test "$(LC_ALL=C sed -n '/^--- /q;p' "$package" | grep -c '^-> X25519 ')" = 3
 check "  the third key decrypts" decrypt "$package" three
+# Its owner and the directories above it (infra/tests/key-files-cases.sh has the rest).
+mkdir -m 770 "$work/shared"
+printf '%s\n' "$operator" "$recovery" >"$work/shared/recipients.txt"
+chmod 644 "$work/shared/recipients.txt"
+reset "BACKUP_AGE_RECIPIENTS_FILE=$work/shared/recipients.txt"
+backup
+check "recipients file in a directory its group can change: refused" failed
+check "  and says so" err_says "has mode 770"
+check "  before any dump" not_called "pg_dump -U"
+ln -s "$keys/recipients.txt" "$work/recipients-link.txt"
+reset "BACKUP_AGE_RECIPIENTS_FILE=$work/recipients-link.txt"
+backup
+check "recipients file that is a link: refused" failed
+check "  before any dump" not_called "pg_dump -U"
 
 echo "== backup.sh: the work directory"
+mkdir -m 700 "$work/disk"
+reset "BACKUP_WORK_DIR=$work/disk/work"
+backup
+check "a work directory on $(stat -f -c %T "$work") (a disk): refused" failed
+check "  and says so" err_says "not in memory (tmpfs or ramfs)"
+check "  before any dump" not_called "pg_dump -U"
+check "  nothing written: not in BACKUP_DIR" test -z "$(find "$backups" -mindepth 1)"
+check "  nor in the disk directory" test -z "$(find "$work/disk/work" -mindepth 1)"
+check "  nor anywhere else in memory instead" work_empty
 reset
 STUB_DATABASE_SIZE=1000000000000000 backup
 check "not enough room for the unencrypted package: refused" failed
@@ -561,6 +587,27 @@ check "  nothing is left in the work directory" work_empty
 : >"$STUB_LOG"
 run "$ops/restore.sh" "$release" "$backups/x.tar.age" --identity-file "$keys/three.key" --identity-file "$keys/two.key"
 check "several keys, one of them a recipient: restored" succeeded
+# Key files others could read or change are refused before age reads them
+# (infra/tests/key-files-cases.sh has every case).
+cp "$keys/one.key" "$work/open.key"
+for case_ in "644:readable by others" "640:readable by its group"; do
+    chmod "${case_%%:*}" "$work/open.key"
+    : >"$STUB_LOG"
+    run "$ops/restore.sh" "$release" "$backups/x.tar.age" --identity-file "$work/open.key"
+    check "a key file ${case_#*:} (mode ${case_%%:*}): refused" failed
+    check "  and says so" err_says "has mode ${case_%%:*}"
+    check "  before anything is done" test ! -s "$STUB_LOG"
+    check "  nothing in the work directory" work_empty
+done
+ln -s "$keys/one.key" "$work/link.key"
+: >"$STUB_LOG"
+run "$ops/restore.sh" "$release" "$backups/x.tar.age" --identity-file "$work/link.key"
+check "a key file that is a link: refused" failed
+check "  before anything is done" test ! -s "$STUB_LOG"
+: >"$STUB_LOG"
+run "$ops/restore.sh" "$release" "$backups/x.tar.age" --identity-file "$keys/one.key" --identity-file "$work/link.key"
+check "a valid key next to a refused one: refused all the same" failed
+check "  before anything is done" test ! -s "$STUB_LOG"
 : >"$STUB_LOG"
 run "$ops/restore.sh" "$release" "$backups/x.tar.age"
 check "no key given: refused" failed
