@@ -16,9 +16,11 @@ export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-migrate-cases
 export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
 printf '%s\n' "BACKUP_DIR=$work/backups" >"$LINUXLAB_ENV_FILE"
 release="$work/release.env"
+image_id=sha256:$(printf 'a%.0s' $(seq 64))
 printf '%s\n' API_SHA=0123456789abcdef0123456789abcdef01234567 \
-    API_IMAGE=api API_IMAGE_ID=sha256:stub LAB_IMAGE=lab LAB_IMAGE_ID=sha256:stub \
-    EDGE_IMAGE=edge EDGE_IMAGE_ID=sha256:stub >"$release"
+    WEB_SHA=fedcba9876543210fedcba9876543210fedcba98 \
+    API_IMAGE=api "API_IMAGE_ID=$image_id" LAB_IMAGE=lab "LAB_IMAGE_ID=$image_id" \
+    EDGE_IMAGE=edge "EDGE_IMAGE_ID=$image_id" >"$release"
 
 HEAD='e6b40c7d9a18 (head)\n'
 failures=0

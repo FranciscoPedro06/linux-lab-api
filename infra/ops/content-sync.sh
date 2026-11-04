@@ -14,6 +14,8 @@
 source "$(dirname "$0")/lib.sh"
 
 load_release "${1:-}"
+# Under the operations' lock: a backup records the missions it dumps (lib.sh).
+take_lock
 checkout=${2:?usage: content-sync.sh RELEASE_FILE CHECKOUT CONTENT_SHA}
 content_sha=${3:?usage: content-sync.sh RELEASE_FILE CHECKOUT CONTENT_SHA}
 [[ $content_sha =~ ^[0-9a-f]{40}$ ]] || fail "CONTENT_SHA must be a full commit SHA"

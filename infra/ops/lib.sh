@@ -113,8 +113,87 @@ database_name() {
     echo "${name:-linuxlab}"
 }
 
-# One operation at a time: backup.sh, restore.sh and migrate.sh take the same lock,
-# without waiting, and stop when another one holds it. The lock is held on file
+# Facts about a database, for the backup's manifest and for restore.sh to compare
+# with what it restored. None of them changes while the lock is held: migrations and
+# content syncs take it too, and the API changes neither the schema nor the missions.
+
+# Status 0 when the table exists in the public schema.
+has_table() {
+    [ "$(psql_on "$1" -c "SELECT to_regclass('public.$2') IS NOT NULL")" = t ]
+}
+
+# The Alembic revision (empty for a database never migrated).
+alembic_revision() {
+    if has_table "$1" alembic_version; then
+        psql_on "$1" -c "SELECT coalesce(string_agg(version_num, ','), '') FROM alembic_version"
+    fi
+}
+
+# SHA-256 of the schema: columns, constraints, indexes, triggers, functions and
+# sequences of the public schema, without owners, positions or sequence values, so
+# that a database restored with --no-owner has the same one.
+schema_fingerprint() {
+    psql_on "$1" -f - <<'SQL'
+-- linuxlab: schema fingerprint
+SELECT encode(sha256(convert_to(coalesce(string_agg(item, E'\n' ORDER BY item), ''), 'UTF8')), 'hex')
+FROM (
+    SELECT format('column %s.%s %s %s %s %s', table_name, column_name, data_type,
+                  is_nullable, coalesce(column_default, ''), is_identity) AS item
+    FROM information_schema.columns WHERE table_schema = 'public'
+    UNION ALL
+    SELECT format('constraint %s %s %s', conrelid::regclass, conname, pg_get_constraintdef(oid))
+    FROM pg_constraint WHERE connamespace = 'public'::regnamespace
+    UNION ALL
+    SELECT format('index %s', indexdef) FROM pg_indexes WHERE schemaname = 'public'
+    UNION ALL
+    SELECT format('trigger %s', pg_get_triggerdef(t.oid))
+    FROM pg_trigger AS t JOIN pg_class AS c ON c.oid = t.tgrelid
+    WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace
+    UNION ALL
+    SELECT format('function %s %s', oid::regprocedure, md5(prosrc))
+    FROM pg_proc WHERE pronamespace = 'public'::regnamespace
+    UNION ALL
+    SELECT format('sequence %s %s', sequence_name, data_type)
+    FROM information_schema.sequences WHERE sequence_schema = 'public'
+) AS items
+SQL
+}
+
+# "<missions> <SHA-256>" of the missions as synced: slug, status, current version and
+# its content_hash (empty when the database has no missions table yet).
+content_fingerprint() {
+    has_table "$1" missions || return 0
+    psql_on "$1" -f - <<'SQL'
+-- linuxlab: content fingerprint
+SELECT count(*) || ' ' || encode(sha256(convert_to(coalesce(string_agg(
+           format('%s %s %s %s', m.slug, m.status, m.current_version, v.content_hash),
+           E'\n' ORDER BY m.slug), ''), 'UTF8')), 'hex')
+FROM missions AS m
+JOIN mission_versions AS v ON v.mission_id = m.id AND v.version = m.current_version
+SQL
+}
+
+# "name:superuser" of every role that is not built in, comma separated.
+database_roles() {
+    psql_on "$1" -c "SELECT string_agg(rolname || ':' || rolsuper, ',' ORDER BY rolname) FROM pg_roles WHERE rolname !~ '^pg_'"
+}
+
+# The commit an image says it was built from (empty when it has no such label).
+image_revision() {
+    local revision
+    revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1")
+    [ "$revision" = "<no value>" ] || echo "$revision"
+}
+
+# The image id of the service's running container (empty when it is not running).
+running_image() {
+    local container
+    container=$(compose ps -q "$1")
+    [ -z "$container" ] || docker inspect --format '{{.Image}}' "$container"
+}
+
+# One operation at a time: backup.sh, restore.sh, migrate.sh and content-sync.sh take
+# the same lock, without waiting, and stop when another one holds it. The lock is held on file
 # descriptor 9, which the scripts migrate.sh starts (backup.sh, restore.sh) inherit:
 # flock on that same open file succeeds at once, so they run under their parent's
 # lock instead of waiting for it. Run on their own, they open the file and take it.
@@ -124,7 +203,7 @@ take_lock() {
     if ! { [ -e /dev/fd/9 ] && [ /dev/fd/9 -ef "$LOCK_FILE" ]; }; then
         exec 9>>"$LOCK_FILE" || fail "cannot open the lock file $LOCK_FILE"
     fi
-    flock -n 9 || fail "another backup, restore or migration is running (lock $LOCK_FILE); nothing was done"
+    flock -n 9 || fail "another backup, restore, migration or content sync is running (lock $LOCK_FILE); nothing was done"
 }
 
 # The SHA-256 of FILE, recorded under NAME (the file's final name, without its

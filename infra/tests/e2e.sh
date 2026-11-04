@@ -328,44 +328,117 @@ expect_fails "no database password in any log" grep -qF "$(sed -n 's/^POSTGRES_P
 expect_ok "Caddy access log redacts cookies" grep -q '"Cookie":\["REDACTED"\]' <<<"$logs"
 
 echo "== backups"
-dump=$("$repo/infra/ops/backup.sh" "$release" e2e 2>"$work/backup.log")
-expect_ok "backup.sh wrote a readable dump and Caddy's data" \
-    test -s "$dump" -a -s "$(ls "$work"/backups/caddy-data-*-e2e.tar.gz)"
+package=$("$repo/infra/ops/backup.sh" "$release" e2e 2>"$work/backup.log")
+expect_ok "backup.sh wrote one package and its checksum, nothing else" \
+    test -s "$package" -a -s "$package.sha256" -a "$(find "$work/backups" -maxdepth 1 -name '*-e2e.*' | wc -l)" = 2
 if [ "$(uname -s)" = Linux ]; then
     expect_ok "backups are readable only by their owner" \
-        test "$(stat -c %a "$work/backups")" = 700 -a "$(stat -c %a "$dump")" = 600
+        test "$(stat -c %a "$work/backups")" = 700 -a "$(stat -c %a "$package")" = 600
 else
     echo "skip  backup file modes: not checkable on $(uname -s)"
 fi
 expect_ok "backup.sh reported that nothing was copied off the host" \
     grep -q "BACKUP_COPY_COMMAND not set" "$work/backup.log"
+expect_ok "backup.sh left no partial file or directory" \
+    test -z "$(find "$work/backups" -mindepth 1 -maxdepth 1 -name '*.partial')"
+expect_ok "the package checks with package.py" python3 "$repo/infra/ops/package.py" check "$package"
+expect_ok "it holds the manifest, the dump and Caddy's data, nothing else" \
+    test "$(tar -tf "$package" | sort | tr '\n' ,)" = "caddy/caddy-data.tar.gz,database/postgres.dump,manifest.json,"
+caddy_data_lists() { tar -xOf "$package" caddy/caddy-data.tar.gz | tar -tzf - >/dev/null; }
+expect_ok "Caddy's data in it reads back in full" caddy_data_lists
+# The manifest against the release, the running stack and the database itself.
+psql_value() { compose exec -T postgres psql -X -At -U linuxlab -d linuxlab -c "$1"; }
+facts=$(printf '%s\n' "$(psql_value 'SELECT version_num FROM alembic_version')" \
+    "$(psql_value 'SHOW server_version_num')" \
+    "$(docker inspect --format '{{.Image}}' "$(compose ps -q api)")" \
+    "$(docker inspect --format '{{.Image}}' "$(compose ps -q caddy)")")
+check_manifest() {
+    python3 -c '
+import json, sys, tarfile
+package, release = sys.argv[1:3]
+revision, version_num, api_running, edge_running = sys.stdin.read().split()
+values = dict(line.split("=", 1) for line in open(release).read().splitlines() if "=" in line and not line.startswith("#"))
+m = json.load(tarfile.open(package).extractfile("manifest.json"))
+api, web, pg = m["code"]["api"], m["code"]["web"], m["postgresql"]
+assert m["format_version"] == 1
+assert api["sha"] == values["API_SHA"] == api["image_revision_label"], api
+assert web["sha"] == values["WEB_SHA"] == web["image_revision_label"], web
+assert api["image_id"] == values["API_IMAGE_ID"] == api["running_image_id"] == api_running, api
+assert web["image_id"] == values["EDGE_IMAGE_ID"] == web["running_image_id"] == edge_running, web
+assert m["code"]["content"]["sha"] is None and m["code"]["content"]["missions"] > 0, m["code"]["content"]
+assert pg["alembic_revision"] == revision and pg["server_version_num"] == int(version_num), pg
+assert pg["roles"] == [{"name": "linuxlab", "superuser": True}], pg
+assert m["restore"]["postgresql_major_at_least"] == int(version_num) // 10000
+assert [c["name"] for c in m["components"]] == ["database", "caddy-data"]
+' "$package" "$release" <<<"$facts"
+}
+expect_ok "its manifest names the release's commits, the running images and the database's state" \
+    check_manifest
 users_before=$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')
-expect_ok "restore.sh: restored into a new database and dropped it" \
-    "$repo/infra/ops/restore.sh" "$release" "$dump"
-expect_ok "the database in use was not touched ($users_before users)" \
-    test "$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')" = "$users_before"
-expect_ok "no restore database left" \
-    test "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0
-expect_ok "backup.sh left no partial file" test -z "$(find "$work/backups" -name '*.partial')"
-expect_ok "Caddy's archive reads back in full" tar -tzf "$(ls "$work"/backups/caddy-data-*-e2e.tar.gz)"
-# The checks below use the real pg_restore: infra/tests/backup-cases.sh has the rest.
+restores_matching() {
+    "$repo/infra/ops/restore.sh" "$release" "$package" >"$work/restore.log" 2>&1 \
+        && grep -q "matches the manifest (revision, schema, missions)" "$work/restore.log"
+}
+expect_ok "restore.sh: restored into a new database, matching the manifest, and dropped it" \
+    restores_matching
+in_use_untouched() {
+    test "$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')" = "$users_before" \
+        -a "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0
+}
+expect_ok "the database in use was not touched ($users_before users), no restore database left" in_use_untouched
+
+# The checks below use the real pg_restore and tar: infra/tests/backup-cases.sh and
+# tests/infra/test_backup_package.py have the rest.
 mkdir -p "$work/moved"
-cp "$dump" "$dump.sha256" "$work/moved/"
-expect_ok "restore.sh restores a backup moved to another directory" \
-    "$repo/infra/ops/restore.sh" "$release" "$work/moved/$(basename "$dump")"
-truncated="$work/moved/truncated.dump"
-head -c "$(($(wc -c <"$dump") - 1))" "$dump" >"$truncated"
-(cd "$work/moved" && sha256sum truncated.dump >truncated.dump.sha256)
-expect_fails "restore.sh refuses a dump missing its last byte, even with a matching checksum" \
-    "$repo/infra/ops/restore.sh" "$release" "$truncated"
-rm "$work/moved/$(basename "$dump").sha256"
-expect_fails "restore.sh refuses a dump without its checksum" \
-    "$repo/infra/ops/restore.sh" "$release" "$work/moved/$(basename "$dump")"
-expect_ok "no restore database left after the refusals" \
-    test "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0
-printf 'corrupt' >>"$dump"
-expect_fails "restore.sh refuses a dump that does not match its checksum" \
-    "$repo/infra/ops/restore.sh" "$release" "$dump"
+cp "$package" "$package.sha256" "$work/moved/"
+moved="$work/moved/$(basename "$package")"
+expect_ok "restore.sh restores a package moved to another directory" \
+    "$repo/infra/ops/restore.sh" "$release" "$moved"
+# repack MODE NAME: the package again with its dump changed, and a matching checksum.
+#   truncate-dump: the dump loses its last byte, and the manifest agrees with it
+#   change-dump:   one byte of the dump changes, the manifest stays as it was
+repack() {
+    python3 - "$moved" "$work/moved/$2" "$1" <<'PY'
+import hashlib, io, json, sys, tarfile
+source, target, mode = sys.argv[1:4]
+with tarfile.open(source) as tar:
+    items = [(m.name, tar.extractfile(m).read()) for m in tar.getmembers()]
+data = dict(items)
+dump = data["database/postgres.dump"]
+if mode == "truncate-dump":
+    dump = dump[:-1]
+    manifest = json.loads(data["manifest.json"])
+    for component in manifest["components"]:
+        if component["name"] == "database":
+            component.update(size=len(dump), sha256=hashlib.sha256(dump).hexdigest())
+    data["manifest.json"] = json.dumps(manifest).encode()
+else:
+    dump = dump[:200] + bytes([dump[200] ^ 0xFF]) + dump[201:]
+data["database/postgres.dump"] = dump
+with tarfile.open(target, "x", format=tarfile.PAX_FORMAT) as tar:
+    for name, _ in items:
+        info = tarfile.TarInfo(name)
+        info.size = len(data[name])
+        tar.addfile(info, io.BytesIO(data[name]))
+PY
+    (cd "$work/moved" && sha256sum "$2" >"$2.sha256")
+}
+repack truncate-dump truncated-dump.tar
+expect_fails "restore.sh refuses a package whose dump misses its last byte, manifest and checksum matching" \
+    "$repo/infra/ops/restore.sh" "$release" "$work/moved/truncated-dump.tar"
+repack change-dump changed-dump.tar
+expect_fails "restore.sh refuses a package whose dump changed after the manifest was written" \
+    "$repo/infra/ops/restore.sh" "$release" "$work/moved/changed-dump.tar"
+head -c "$(($(wc -c <"$moved") / 3))" "$moved" >"$work/moved/cut.tar"
+(cd "$work/moved" && sha256sum cut.tar >cut.tar.sha256)
+expect_fails "restore.sh refuses a truncated package, even with a matching checksum" \
+    "$repo/infra/ops/restore.sh" "$release" "$work/moved/cut.tar"
+rm "$moved.sha256"
+expect_fails "restore.sh refuses a package without its checksum" "$repo/infra/ops/restore.sh" "$release" "$moved"
+printf 'corrupt' >>"$package"
+expect_fails "restore.sh refuses a package that does not match its checksum" \
+    "$repo/infra/ops/restore.sh" "$release" "$package"
+expect_ok "after the refusals, the database in use is as it was and no restore database is left" in_use_untouched
 
 echo "== lab checks"
 for _ in $(seq 60); do
