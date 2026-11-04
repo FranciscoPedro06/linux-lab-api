@@ -26,7 +26,10 @@ alembic() {
     compose run --rm --no-deps -T task alembic "$@"
 }
 
-load_release "${1:-}"
+[ $# = 1 ] || fail "usage: migrate.sh RELEASE_FILE"
+load_release "$1"
+# Held until the end; backup.sh and restore.sh, started below, run under it.
+take_lock
 compose up -d --wait postgres >/dev/null
 
 # The migration history is linear: a release has exactly one head (CI runs
@@ -48,7 +51,7 @@ if [ "$current" = "$head" ]; then
 fi
 
 dump=$("$OPS_DIR/backup.sh" "$RELEASE" "pre-migrate-${API_SHA:0:12}") \
-    || note "copying the backup off the host failed; the local backup is checked below"
+    || note "backup.sh reported a failure (see above); a dump it wrote is checked below"
 [ -f "$dump" ] || fail "no backup was written; not migrating"
 "$OPS_DIR/restore.sh" "$RELEASE" "$dump" || fail "the backup did not restore; not migrating"
 

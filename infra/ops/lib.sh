@@ -90,3 +90,54 @@ database_name() {
     name=$(setting DATABASE_NAME)
     echo "${name:-linuxlab}"
 }
+
+# One operation at a time: backup.sh, restore.sh and migrate.sh take the same lock,
+# without waiting, and stop when another one holds it. The lock is held on file
+# descriptor 9, which the scripts migrate.sh starts (backup.sh, restore.sh) inherit:
+# flock on that same open file succeeds at once, so they run under their parent's
+# lock instead of waiting for it. Run on their own, they open the file and take it.
+LOCK_FILE=${LINUXLAB_LOCK_FILE:-/run/linuxlab-ops.lock}
+take_lock() {
+    command -v flock >/dev/null || fail "flock (util-linux) is required"
+    if ! { [ -e /dev/fd/9 ] && [ /dev/fd/9 -ef "$LOCK_FILE" ]; }; then
+        exec 9>>"$LOCK_FILE" || fail "cannot open the lock file $LOCK_FILE"
+    fi
+    flock -n 9 || fail "another backup, restore or migration is running (lock $LOCK_FILE); nothing was done"
+}
+
+# The SHA-256 of FILE, recorded under NAME (the file's final name, without its
+# directory) in NAME.sha256 next to it: `sha256sum --check` works wherever both are.
+#   write_checksum FILE FINAL_PATH  writes FINAL_PATH.sha256.partial
+write_checksum() {
+    local digest
+    digest=$(sha256sum <"$1" | cut -c1-64)
+    printf '%s  %s\n' "$digest" "$(basename -- "$2")" >"$2.sha256.partial"
+}
+
+# Status 0 when FILE.sha256 exists, is a single line naming FILE (by its base name)
+# and matches FILE's content. Says why otherwise.
+verify_checksum() {
+    local file=$1 sums=$1.sha256 line digest
+    [ -f "$sums" ] || { echo "error: no checksum: $sums not found" >&2; return 1; }
+    [ "$(wc -l <"$sums")" = 1 ] || { echo "error: $sums is not a single checksum line" >&2; return 1; }
+    line=$(cat "$sums")
+    if ! [[ $line =~ ^([0-9a-f]{64})\ \ (.+)$ ]] || [ "${BASH_REMATCH[2]}" != "$(basename -- "$file")" ]; then
+        echo "error: $sums does not name $(basename -- "$file")" >&2
+        return 1
+    fi
+    digest=$(sha256sum <"$file" | cut -c1-64)
+    [ "$digest" = "${BASH_REMATCH[1]}" ] || { echo "error: $file does not match its checksum" >&2; return 1; }
+}
+
+# Reads a custom-format dump in full with pg_restore, which fails on a dump that is
+# truncated or damaged anywhere (`pg_restore --list` reads only its table of contents).
+verify_dump() {
+    compose exec -T postgres pg_restore -f /dev/null <"$1"
+}
+
+# Renames PARTIAL to FINAL, its checksum first: a file under its final name always
+# has a checksum, and one without it is refused by restore.sh.
+finish() {
+    mv -- "$2.sha256.partial" "$2.sha256"
+    mv -- "$1" "$2"
+}
