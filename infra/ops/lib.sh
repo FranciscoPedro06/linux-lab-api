@@ -25,6 +25,8 @@ docker() { MSYS_NO_PATHCONV=1 command docker "$@"; }
 
 OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 INFRA_DIR=$(cd "$OPS_DIR/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=age.sh
+source "$OPS_DIR/age.sh"
 ENV_FILE=${LINUXLAB_ENV_FILE:-/etc/linuxlab/production.env}
 PROJECT=${LINUXLAB_PROJECT:-linuxlab-prod}
 
@@ -262,4 +264,106 @@ publish() {
     fi
     rm -f -- "$partial" "$final.sha256.partial"
     sync -- "$(dirname -- "$final")" || fail "could not write the directory of $final to disk"
+}
+
+# Where unencrypted packages exist while backup.sh builds one or restore.sh unpacks
+# one: BACKUP_WORK_DIR, by default /run/linuxlab-backup, on /run's tmpfs (memory,
+# gone at reboot). It must be a directory of this user, mode 0700, and not a link;
+# it is made so when missing, never chosen in its place. Each run works in a
+# directory of its own in it, run.<random>, removed when the run ends (trap). Run
+# directories left by a run that was killed are removed by the next backup or
+# restore, which holds the lock, so none of them can still be in use.
+work_root() {
+    local root
+    root=$(setting BACKUP_WORK_DIR)
+    echo "${root:-/run/linuxlab-backup}"
+}
+
+# prepare_work NEEDED_BYTES: checks the work directory and its free space, removes
+# what killed runs left in it, and sets RUN_DIR to a new run directory. Needs the lock.
+prepare_work() {
+    local root needed=$1 free stale
+    root=$(work_root)
+    [[ $root == /* ]] || fail "BACKUP_WORK_DIR must be an absolute path: $root"
+    if [ ! -e "$root" ]; then
+        mkdir -m 700 -- "$root" || fail "cannot create the work directory $root"
+    fi
+    if [ ! -d "$root" ] || [ -L "$root" ]; then fail "the work directory $root is not a directory"; fi
+    [ "$(stat -c %u "$root")" = "$(id -u)" ] || fail "the work directory $root is not owned by $(id -un)"
+    [ "$(stat -c %a "$root")" = 700 ] || fail "the work directory $root has mode $(stat -c %a "$root"), not 700"
+    stale=$(find "$root" -mindepth 1 -maxdepth 1 -name 'run.*' | wc -l)
+    if [ "$stale" != 0 ]; then
+        find "$root" -mindepth 1 -maxdepth 1 -name 'run.*' -exec rm -rf -- {} +
+        note "removed $stale run director(ies) left in $root by runs that were killed"
+    fi
+    free=$(($(df -Pk -- "$root" | awk 'NR == 2 {print $4}') * 1024))
+    [ "$free" -ge "$needed" ] \
+        || fail "not enough room in the work directory $root: $free bytes free, about $needed needed; nothing was written (BACKUP_WORK_DIR, docs/operations.md#encryption)"
+    RUN_DIR=$(mktemp -d -- "$root/run.XXXXXXXX")
+}
+
+# Restoring a package's dump into a new database, checked against its manifest.
+# RESTORE_TARGET is the database being restored, for drop_restore_target in the
+# caller's EXIT trap; RESTORE_KEEP=true leaves it in place.
+RESTORE_TARGET=''
+RESTORE_KEEP=false
+# shellcheck disable=SC2317 # Run by the callers' EXIT traps.
+drop_restore_target() {
+    if [ -n "$RESTORE_TARGET" ] && [ "$RESTORE_KEEP" != true ]; then
+        psql_on postgres -c "DROP DATABASE IF EXISTS $RESTORE_TARGET" >/dev/null 2>&1 || true
+    fi
+}
+
+# restore_database DUMP EXPECTED: EXPECTED is what `package.py check` printed for the
+# package. Fails (exit 1) on any difference; the caller's trap drops the database.
+restore_database() {
+    local dump=$1 expected_file=$2 current major target exists revision content
+    expected() { sed -n "s/^$1 //p" "$expected_file"; }
+    current=$(database_name)
+    major=$(($(psql_on postgres -c "SHOW server_version_num") / 10000))
+    [ "$major" -ge "$(expected postgresql_major_at_least)" ] \
+        || fail "the package needs PostgreSQL $(expected postgresql_major_at_least) or later, the server is $major"
+    target="restore_$(date -u +%Y%m%d%H%M%S)"
+    [ "$target" != "$current" ] || fail "refusing to restore into the database in use"
+    exists=$(psql_on postgres -c "SELECT count(*) FROM pg_database WHERE datname = '$target'")
+    [ "$exists" = 0 ] || fail "database $target already exists"
+
+    note "creating database $target"
+    psql_on postgres -c "CREATE DATABASE $target TEMPLATE template0"
+    RESTORE_TARGET=$target
+    note "restoring the package's dump"
+    compose exec -T postgres pg_restore -U linuxlab -d "$target" --exit-on-error --no-owner <"$dump" \
+        || fail "restore failed"
+    psql_on "$target" -c "ANALYZE"
+
+    # The restored database against the manifest: what neither the API nor anything
+    # outside the lock changes.
+    compare() {
+        [ "$2" = "$3" ] || fail "the restored database differs from the manifest: $1 is ${2:--}, the manifest says ${3:--}"
+    }
+    revision=$(alembic_revision "$target")
+    compare "the Alembic revision" "${revision:--}" "$(expected alembic_revision)"
+    compare "the schema fingerprint" "$(schema_fingerprint "$target")" "$(expected schema_fingerprint)"
+    content=$(content_fingerprint "$target")
+    compare "the missions" "${content:--}" "$(expected content)"
+    note "the restored database matches the manifest (revision, schema, missions)"
+
+    echo "restored $target:"
+    restore_report "$target" | sed 's/^/  /'
+    echo "in use ($current), for comparison:"
+    restore_report "$current" | sed 's/^/  /'
+}
+
+# Row counts of the tables that exist (an empty database has none).
+restore_report() {
+    psql_on "$1" -c "
+        SELECT name || ' ' || (xpath('/row/n/text()', query_to_xml(
+                   format('SELECT %s AS n FROM %I', expression, name), false, true, '')))[1]::text
+        FROM (VALUES ('alembic_version', 'string_agg(version_num, '','')'),
+                     ('users', 'count(*)'), ('lab_sessions', 'count(*)'),
+                     ('mission_versions', 'count(*)'), ('user_missions', 'count(*)'),
+                     ('validation_runs', 'count(*)'), ('command_history', 'count(*)'))
+             AS t (name, expression)
+        WHERE to_regclass(name) IS NOT NULL"
+    psql_on "$1" -c "SELECT 'tables ' || count(*) FROM pg_tables WHERE schemaname = 'public'"
 }

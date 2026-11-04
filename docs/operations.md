@@ -29,10 +29,10 @@ None of these is made yet, and none is assumed by the configuration:
 
 ## Preparing the host
 
-1. Install Docker Engine from Docker's repository, `python3` (3.10 or later: the operation scripts build and check backup packages with it) and gVisor as in [runtime.md](runtime.md#environment) (same release and SHA-512 as `.github/workflows/runtime.yml`). Record `uname -r`, `docker version` and `runsc --version`.
+1. Install Docker Engine from Docker's repository, `python3` (3.10 or later: the operation scripts build and check backup packages with it), age with `sudo infra/release/install-age.sh` (the release the scripts are tested with, its archive checked against the SHA-256 in `infra/ops/age.sh`; [Backups](#backups)) and gVisor as in [runtime.md](runtime.md#environment) (same release and SHA-512 as `.github/workflows/runtime.yml`). Record `uname -r`, `docker version` and `runsc --version`.
 2. Merge `infra/docker/daemon.json.example` into `/etc/docker/daemon.json` by hand and restart Docker. Check: `docker info --format '{{json .Runtimes}}'` lists `runsc`; `docker run --rm --runtime=runsc --network=none ubuntu:24.04 true` works; `docker info --format '{{.LoggingDriver}}'` is `json-file`.
 3. Create the directories, owned by root: `/etc/linuxlab` (0700), `/var/lib/linuxlab/releases`, `/var/lib/linuxlab/content` (0700, the private checkout), `/var/backups/linuxlab` (0700).
-4. Copy `infra/production.env.example` to `/etc/linuxlab/production.env` (0600), fill it in (it says how to generate each secret), and run `infra/release/check-env.sh /etc/linuxlab/production.env`. Secrets go only in that file: never on a command line, in a shell history or in the repository.
+4. Write `/etc/linuxlab/backup-recipients.txt` (root, 0644 or stricter) with the two public keys backups are encrypted to ([Encryption](#encryption)). Copy `infra/production.env.example` to `/etc/linuxlab/production.env` (0600), fill it in (it says how to generate each secret), and run `infra/release/check-env.sh /etc/linuxlab/production.env`. Secrets go only in that file: never on a command line, in a shell history or in the repository.
 5. Configure the provider's firewall and DNS as decided.
 
 ## Releasing
@@ -50,7 +50,7 @@ None of these is made yet, and none is assumed by the configuration:
 
 For the first deployment and every update. `R` is the release file.
 
-1. `infra/ops/migrate.sh $R`: backs up, restores that backup into a new database to prove it, then migrates. With no pending migration it does nothing. The previous API keeps running meanwhile ([Migrations](#migrations)).
+1. `infra/ops/migrate.sh $R`: backs up, restores that backup into a new database to prove it (before it is encrypted: the host holds no key to decrypt it), then migrates. With no pending migration it does nothing. The previous API keeps running meanwhile ([Migrations](#migrations)).
 2. `infra/ops/content-sync.sh $R /var/lib/linuxlab/content/linux-lab-content <CONTENT_SHA>`, with the content commit recorded in step 2 of Releasing.
 3. `docker compose -p linuxlab-prod -f infra/compose.prod.yml --env-file $R --env-file /etc/linuxlab/production.env up -d --wait`. The API is recreated (terminals close with 1012 and reconnect, a lab replacement in progress gets up to 120 s to finish), then Caddy. For the first deployment, set `ACME_CA` to the Let's Encrypt staging directory and check that a certificate is issued; then set it back and recreate Caddy, which gets a certificate from the production directory.
 4. Acceptance on the real host, before telling testers anything:
@@ -85,7 +85,7 @@ Either way, only root reads the checkout, and the commit synced is the one the m
 
 ## Backups
 
-`backup.sh` writes one package into `BACKUP_DIR` (0700, files 0600): `linuxlab-<time>-<id>-<label>.tar`, an uncompressed tar archive, and its checksum `linuxlab-<time>-<id>-<label>.tar.sha256`. The package holds, as regular files and nothing else:
+`backup.sh` writes one encrypted package into `BACKUP_DIR` (0700, files 0600): `linuxlab-<time>-<id>-<label>.tar.age`, an uncompressed tar archive encrypted with age ([Encryption](#encryption)), and `linuxlab-<time>-<id>-<label>.tar.age.sha256`, the SHA-256 of the encrypted bytes. Nothing unencrypted is ever written to `BACKUP_DIR`. The package, once decrypted, holds, as regular files and nothing else:
 
 | Path | Content | Checked before packaging |
 |---|---|---|
@@ -112,13 +112,13 @@ Left out, on purpose:
 
 Nothing the manifest records changes while `backup.sh` runs: migrations and content syncs take the same lock, and the API changes neither the schema nor the missions.
 
-`<time>` is UTC to the second and `<id>` 64 random bits, new for each run. The components are gathered in a `.partial` directory and the package is written as `<name>.partial`; it gets its final name only once it checks, its checksum first: a package under its final name always has its `.sha256`. The `.sha256` names the file without its directory, so `sha256sum --check` works wherever the pair is copied. When a run fails or is interrupted, its partial files and directory are removed; a `.partial` left by an earlier run (a crash, a reboot) is never a backup, and `backup.sh` reports it and leaves it for the operator.
+`<time>` is UTC to the second and `<id>` 64 random bits, new for each run. The components and the unencrypted package exist only in a run directory of the work directory ([Encryption](#encryption)); the encrypted package is written to `BACKUP_DIR` as `<name>.partial` and gets its final name only once the package has checked and been encrypted, its checksum first: a package under its final name always has its `.sha256`. The `.sha256` names the file without its directory, so `sha256sum --check` works wherever the pair is copied. When a run fails or is interrupted, its partial files and directory are removed; a `.partial` left by an earlier run (a crash, a reboot) is never a backup, and `backup.sh` reports it and leaves it for the operator.
 
 A file never replaces another. Final names are given with a hard link (`ln`, the `link` system call), which fails when the name exists, in one step; if the package's name turns out to be taken after its checksum was published, that checksum is removed again, and only while it is still this run's file. A backup already in `BACKUP_DIR` is never changed, whatever happens to a later run. `BACKUP_DIR` must be on a filesystem with hard links (any Linux filesystem; not FAT or some network mounts), or every backup fails.
 
 Writing to disk: before the names are given, the content of the file and of its checksum is written to disk (`sync` of the two files, an `fsync` of each); after, the directory is (`sync` of the directory), which makes the new names durable. Once `backup.sh` has reported a file, a power loss or crash does not take it back. A crash before that point leaves, at worst, partial files or a checksum without its file, or loses the new names altogether; a final name, once it survives, always points to content already on disk. `restore.sh` refuses a partial file and a dump without its checksum, so a crash costs that backup, never an earlier one, and never makes a damaged file pass for a backup. This relies on the disk honoring flushes (a write cache without power protection that ignores them defeats any `fsync`).
 
-It runs `BACKUP_COPY_COMMAND` on each file to copy it off the host, and reports when that is not set or fails (exit status other than 0). Its exit status is all that is known of the copy: nothing checks that the file arrived intact. The command runs without the lock's file descriptor, so a process it leaves running (an ssh master connection, a daemon) does not keep the lock after `backup.sh` ends. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration.
+It runs `BACKUP_COPY_COMMAND` on each file to copy it off the host, and reports when that is not set or fails (exit status other than 0). Its exit status is all that is known of the copy: nothing checks that the file arrived intact. The command runs without the lock's file descriptor, so a process it leaves running (an ssh master connection, a daemon) does not keep the lock after `backup.sh` ends. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration, with `backup.sh --restore-test`: the package is restored into a new database and compared with its manifest before it is encrypted, and a package that does not restore is not written.
 
 **No backup is removed automatically.** Removal by age is suspended until copies off the host are verified (download and checksum comparison), so that the last good backup on the host is never removed on the strength of a copy command's exit status. Every run reports how many backup files `BACKUP_DIR` holds; the operator removes old ones by hand after checking that a copy of a newer backup is intact off the host. `BACKUP_KEEP_DAYS` is not applied.
 
@@ -136,27 +136,51 @@ This only records the failure on the host. Getting it to the operator (mail, a m
 
 What the backups hold: accounts (email, display name, Argon2id hashes), session token hashes, labs, validation runs, progress, mission versions (with solutions) and the **command history, which stores what students typed, secrets included, with no redaction** ([architecture.md](architecture.md#privacy)). So:
 
-- packages are **not encrypted yet**: until they are, they must not leave the host, and `BACKUP_COPY_COMMAND` stays empty. Off the host they must be encrypted and readable only by the operator, with credentials that are not the host's;
+- packages are encrypted, readable only with the operator's or the recovery key, neither of which is on the host. Copies off the host are not verified yet: until they are, `BACKUP_COPY_COMMAND` stays empty, and the destination's credentials must not be the host's;
 - retention is to be decided with the destination (proposal: 30 days off the host); on the host nothing is removed automatically for now (see above);
 - the history is kept as long as the lab's row, which is removed only with its user: there is no retention job for it yet. Deleting a user's data means deleting the user, and backups keep it until they expire;
 - the history is not a place for secrets, and the web page tells students so; operators must not present it otherwise.
+
+### Encryption
+
+Every package is encrypted with [age](https://age-encryption.org) (`AGE_VERSION` in `infra/ops/age.sh`, installed by `infra/release/install-age.sh`, which refuses an archive whose SHA-256 is not the recorded one; CI installs and tests that release) to every public key of `BACKUP_AGE_RECIPIENTS_FILE`. Any one of the matching private keys decrypts it; age authenticates every chunk, so a key that is not a recipient, a changed byte or a cut file is refused.
+
+**Keys.** Two, at least: the operator's and an offline recovery key, so that losing one does not lose the backups. Each is made away from the host, with `age-keygen -o <file>`, on the operator's machine; the recovery key is kept offline (printed, or on a device kept apart). Only the public keys (`age1…`, from `age-keygen -y <file>`) go to the host, in the recipients file:
+
+```
+# operator, 2026-11
+age1...
+# offline recovery, 2026-11
+age1...
+```
+
+One recipient per line; lines starting with `#` and blank lines are ignored. `backup.sh` and `check-env.sh` refuse a file that is missing, is a link, is writable by its group or others (whoever could add a line could read every later backup), holds a private key (`AGE-SECRET-KEY-`), has a line that is not an X25519 recipient, lists a key twice or has fewer than two. Without the setting no backup is written. Private keys never go to the host's disk, the repository, an image, `production.env`, CI or the backup destination.
+
+**Unencrypted data while a backup runs.** The dump, Caddy's data and the package exist unencrypted in `BACKUP_WORK_DIR`, by default `/run/linuxlab-backup` on `/run`'s tmpfs (memory, gone at reboot), mode 0700, made if missing and refused if it is a link, is not root's or has another mode; never another directory instead. Each run works in a directory of its own there (`run.<random>`), removed as soon as the package is encrypted and again by the run's trap on success, failure, `INT`, `TERM` and `HUP`. A run killed outright (`SIGKILL`, out of memory) leaves its run directory: the next backup or restore, which holds the lock, removes it, and a reboot empties `/run` anyway. Removal is `rm`, not secure erasure. Before dumping, `backup.sh` checks that the work directory has room for twice the database's size (three times with `--restore-test`) plus 64 MiB, and stops otherwise. `/run` is usually a tenth of the memory: if the database outgrows it, point `BACKUP_WORK_DIR` at a tmpfs mounted for this, of the size needed. A directory on disk would work too, but then unencrypted data reaches the disk during each backup and may outlive its removal there; that is a decision to take knowingly, not a fallback.
+
+**Rotation.** A change of the recipients file applies to backups made after it; nothing is decrypted or encrypted again. Each backup needs one of the keys it was encrypted to, so a private key is kept as long as any backup encrypted only to it, and those to its pair, are kept. To add or replace a key: make the new key away from the host; add its public key to the recipients file (keeping the others); run a backup, copy it to the operator's machine and check there that the new key decrypts it (`age --decrypt -i <new key> -o /dev/null <package>`), never on the host; only then remove an old public key from the file, and keep the old private key until the last backup that needs it has expired.
 
 ## Restoring
 
 Test a backup regularly (monthly, and after every change to the database):
 
 ```sh
-infra/ops/restore.sh $R /var/backups/linuxlab/linuxlab-<time>-<id>-scheduled.tar
+install -m 700 -d /run/linuxlab-key && (umask 077; cat >/run/linuxlab-key/operator.key)
+infra/ops/restore.sh $R /var/backups/linuxlab/linuxlab-<time>-<id>-scheduled.tar.age \
+  --identity-file /run/linuxlab-key/operator.key
+rm -rf /run/linuxlab-key
 ```
 
-It restores the package's database into a new database `restore_<time>` on the same PostgreSQL, never into an existing one, prints the row counts next to the database in use, and drops it. Before creating anything it requires the package's `.sha256` next to it and matching, checks the package with `package.py` (layout, manifest, each component's size and SHA-256) while unpacking it into a directory of its own, reads the dump in full, and requires a server of the dump's major version or later; a package that fails any of these is refused. After the restore, the Alembic revision, the schema fingerprint and the missions' fingerprint must be those of the manifest, or the restore fails and the new database is dropped. The only optional argument is `--keep`; any other is refused before anything is done. Only packages are restored: a bare dump of an earlier version of `backup.sh` is refused.
+The private key is needed only for the restore: the operator pastes it into a file on `/run`'s tmpfs (`cat` reads it until Ctrl-D), restores, and removes it; it never goes to the host's disk. `--identity-file` can be given more than once; keys are never read from the environment, and never printed.
+
+It restores the package's database into a new database `restore_<time>` on the same PostgreSQL, never into an existing one, prints the row counts next to the database in use, and drops it. Before creating anything it requires the package's `.sha256` next to it and matching the encrypted bytes, an age file, and age to decrypt all of it into a run directory of the work directory; age writes what it has decrypted before it reaches a damaged chunk and then fails, so its output is used only once it has exited with success, and is removed in any case. Then it checks the package with `package.py` (layout, manifest, each component's size and SHA-256) while unpacking it there, reads the dump in full, and requires a server of the dump's major version or later; a package that fails any of these is refused. Everything decrypted is removed when the restore ends, whatever the reason. After the restore, the Alembic revision, the schema fingerprint and the missions' fingerprint must be those of the manifest, or the restore fails and the new database is dropped. The only optional argument is `--keep`; any other is refused before anything is done. Only encrypted packages are restored: an unencrypted package (`.tar`) or a bare dump of an earlier version of `backup.sh` is refused.
 
 Caddy's data is checked with the package but no script restores it yet: on a new host, it would be extracted from the package (`caddy/caddy-data.tar.gz`) into the new deployment's `caddy-data` volume before Caddy starts.
 
 Emergency, when the database in use cannot be kept (a migration that cannot be fixed forward, corruption):
 
 1. Stop the entry: `docker compose ... stop caddy`.
-2. `infra/ops/restore.sh $R <package> --keep`, and note the database name it prints.
+2. `infra/ops/restore.sh $R <package> --identity-file <key> --keep`, with the key on `/run` as above, and note the database name it prints.
 3. Set `DATABASE_NAME=<that name>` in the environment file and recreate the API with the release that matches the dump's schema: `docker compose ... --env-file <that release> up -d --wait api`.
 4. `infra/ops/check-labs.sh`: labs created after the dump have containers but no row, and the reaper removes them as orphans; labs the dump records as unfinished whose containers are gone are ended by the reaper as `container_lost`. Unidentified containers are reported and left alone.
 5. Start Caddy again. The old database stays untouched until it is decided what to do with it.
