@@ -14,7 +14,13 @@ trap 'rm -rf "$work"' EXIT
 export PATH="$here/stubs:$PATH" STUB_LOG="$work/calls"
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-migrate-cases
 export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
-printf '%s\n' "BACKUP_DIR=$work/backups" >"$LINUXLAB_ENV_FILE"
+# The backup migrate.sh takes is encrypted: two keys of this run, its own work directory.
+age-keygen -o "$work/one.key" 2>/dev/null
+age-keygen -o "$work/two.key" 2>/dev/null
+{ age-keygen -y "$work/one.key"; age-keygen -y "$work/two.key"; } >"$work/recipients.txt"
+mkdir -m 700 "$work/plain"
+printf '%s\n' "BACKUP_DIR=$work/backups" "BACKUP_AGE_RECIPIENTS_FILE=$work/recipients.txt" \
+    "BACKUP_WORK_DIR=$work/plain" >"$LINUXLAB_ENV_FILE"
 release="$work/release.env"
 image_id=sha256:$(printf 'a%.0s' $(seq 64))
 printf '%s\n' API_SHA=0123456789abcdef0123456789abcdef01234567 \

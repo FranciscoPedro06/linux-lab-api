@@ -28,6 +28,7 @@
 #   STUB_ALEMBIC, STUB_SCHEMA, STUB_CONTENT, STUB_TABLES
 #                                    revision, schema and content fingerprints, and
 #                                    whether tables exist (t or f)
+#   STUB_DATABASE_SIZE               pg_database_size in bytes (default 1000000)
 #
 # The synthetic dump stands for pg_dump's custom format: a header line, the data,
 # and a last line with the data's SHA-256. Like the real pg_restore, `--list` reads
@@ -96,6 +97,7 @@ case "$args" in
     *" SHOW server_version_num "*) echo 160015 ;;
     *" SHOW server_version "*) echo 16.15 ;;
     *" pg_roles "*) fact ROLES linuxlab:true ;;
+    *"pg_database_size("*) fact DATABASE_SIZE 1000000 ;;
     *"to_regclass('public."*) fact TABLES t ;;
     *" FROM alembic_version "*) fact ALEMBIC e6b40c7d9a18 ;;
     *" -f - "*)

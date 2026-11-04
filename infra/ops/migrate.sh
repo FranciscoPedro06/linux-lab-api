@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Upgrades the deployment's database to the release's migrations, with the release's
-# API image, after a backup that is checked by restoring it into a new database.
+# API image, after a backup that is checked by restoring it into a new database
+# (backup.sh --restore-test, before the backup is encrypted).
 # Run it before starting the release's API. See docs/operations.md#migrations.
 #
 #   infra/ops/migrate.sh RELEASE_FILE
@@ -50,10 +51,12 @@ if [ "$current" = "$head" ]; then
     exit 0
 fi
 
-dump=$("$OPS_DIR/backup.sh" "$RELEASE" "pre-migrate-${API_SHA:0:12}") \
-    || note "backup.sh reported a failure (see above); a dump it wrote is checked below"
-[ -f "$dump" ] || fail "no backup was written; not migrating"
-"$OPS_DIR/restore.sh" "$RELEASE" "$dump" || fail "the backup did not restore; not migrating"
+# The backup is restored into a new database and compared with its manifest before
+# it is encrypted (--restore-test): the host holds no key that could decrypt it. A
+# backup that does not restore is not written, and then nothing is migrated.
+dump=$("$OPS_DIR/backup.sh" "$RELEASE" "pre-migrate-${API_SHA:0:12}" --restore-test) \
+    || note "backup.sh reported a failure (see above)"
+[ -f "$dump" ] || fail "no restore-tested backup was written; not migrating"
 
 note "migrating"
 alembic upgrade head || fail "alembic upgrade failed; backup before: $dump"

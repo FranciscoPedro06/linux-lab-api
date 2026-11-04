@@ -48,6 +48,11 @@ done
 
 work=$(mktemp -d)
 chmod 700 "$work"
+# Backups are encrypted to two keys made for this run only, removed with $work:
+# "operator" and "recovery" are the recipients, "stranger" is not.
+mkdir -m 700 "$work/keys" "$work/plain"
+for key in operator recovery stranger; do age-keygen -o "$work/keys/$key.key" 2>/dev/null; done
+{ age-keygen -y "$work/keys/operator.key"; age-keygen -y "$work/keys/recovery.key"; } >"$work/keys/recipients.txt"
 random() { docker run --rm --network none --entrypoint python "$api_image" -c "import secrets; print(secrets.token_hex($1))"; }
 invite=$(random 16)
 env_file="$work/e2e.env"
@@ -68,6 +73,8 @@ API_EDGE_IP=172.31.1.3
 E2E_RUNTIME=$runtime
 E2E_ENVIRONMENT=$([ "$runtime" = runsc ] && echo production || echo development)
 BACKUP_DIR=$work/backups
+BACKUP_AGE_RECIPIENTS_FILE=$work/keys/recipients.txt
+BACKUP_WORK_DIR=$work/plain
 EOF
     # Clients are always on 172.31.0.0/24: the public network, or the agent's egress.
     if [ "$entry" = direct ]; then
@@ -329,8 +336,24 @@ expect_ok "Caddy access log redacts cookies" grep -q '"Cookie":\["REDACTED"\]' <
 
 echo "== backups"
 package=$("$repo/infra/ops/backup.sh" "$release" e2e 2>"$work/backup.log")
-expect_ok "backup.sh wrote one package and its checksum, nothing else" \
+expect_ok "backup.sh wrote one encrypted package and its checksum, nothing else" \
     test -s "$package" -a -s "$package.sha256" -a "$(find "$work/backups" -maxdepth 1 -name '*-e2e.*' | wc -l)" = 2
+expect_ok "  named .tar.age, an age file" \
+    test "${package%.tar.age}" != "$package" -a "$(head -c 21 "$package")" = "age-encryption.org/v1"
+expect_ok "  its checksum is of the encrypted bytes" \
+    test "$(cut -c1-64 "$package.sha256")" = "$(sha256sum <"$package" | cut -c1-64)"
+only_encrypted() {
+    local file
+    for file in "$work"/backups/*; do
+        case "$file" in
+            *.tar.age) [ "$(head -c 21 "$file")" = "age-encryption.org/v1" ] || return 1 ;;
+            *.tar.age.sha256) ;;
+            *) return 1 ;;
+        esac
+    done
+}
+expect_ok "nothing unencrypted in BACKUP_DIR (the migrations' backups included)" only_encrypted
+expect_ok "nothing left in the work directory" test -z "$(find "$work/plain" -mindepth 1)"
 if [ "$(uname -s)" = Linux ]; then
     expect_ok "backups are readable only by their owner" \
         test "$(stat -c %a "$work/backups")" = 700 -a "$(stat -c %a "$package")" = 600
@@ -341,10 +364,16 @@ expect_ok "backup.sh reported that nothing was copied off the host" \
     grep -q "BACKUP_COPY_COMMAND not set" "$work/backup.log"
 expect_ok "backup.sh left no partial file or directory" \
     test -z "$(find "$work/backups" -mindepth 1 -maxdepth 1 -name '*.partial')"
-expect_ok "the package checks with package.py" python3 "$repo/infra/ops/package.py" check "$package"
+decrypt_with() { age --decrypt --identity "$work/keys/$1.key" --output "$2" "$package"; }
+expect_ok "the operator's key alone decrypts it" decrypt_with operator "$work/by-operator.tar"
+expect_ok "the recovery key alone decrypts it" decrypt_with recovery "$work/by-recovery.tar"
+expect_ok "both get exactly the same bytes" cmp -s "$work/by-operator.tar" "$work/by-recovery.tar"
+expect_fails "a key that is not a recipient does not" decrypt_with stranger "$work/by-stranger.tar"
+plain="$work/by-operator.tar"
+expect_ok "the package inside checks with package.py" python3 "$repo/infra/ops/package.py" check "$plain"
 expect_ok "it holds the manifest, the dump and Caddy's data, nothing else" \
-    test "$(tar -tf "$package" | sort | tr '\n' ,)" = "caddy/caddy-data.tar.gz,database/postgres.dump,manifest.json,"
-caddy_data_lists() { tar -xOf "$package" caddy/caddy-data.tar.gz | tar -tzf - >/dev/null; }
+    test "$(tar -tf "$plain" | sort | tr '\n' ,)" = "caddy/caddy-data.tar.gz,database/postgres.dump,manifest.json,"
+caddy_data_lists() { tar -xOf "$plain" caddy/caddy-data.tar.gz | tar -tzf - >/dev/null; }
 expect_ok "Caddy's data in it reads back in full" caddy_data_lists
 # The manifest against the release, the running stack and the database itself.
 psql_value() { compose exec -T postgres psql -X -At -U linuxlab -d linuxlab -c "$1"; }
@@ -370,35 +399,51 @@ assert pg["alembic_revision"] == revision and pg["server_version_num"] == int(ve
 assert pg["roles"] == [{"name": "linuxlab", "superuser": True}], pg
 assert m["restore"]["postgresql_major_at_least"] == int(version_num) // 10000
 assert [c["name"] for c in m["components"]] == ["database", "caddy-data"]
-' "$package" "$release" <<<"$facts"
+' "$plain" "$release" <<<"$facts"
 }
 expect_ok "its manifest names the release's commits, the running images and the database's state" \
     check_manifest
+rm -f "$work"/by-*.tar
 users_before=$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')
-restores_matching() {
-    "$repo/infra/ops/restore.sh" "$release" "$package" >"$work/restore.log" 2>&1 \
-        && grep -q "matches the manifest (revision, schema, missions)" "$work/restore.log"
+restore() { "$repo/infra/ops/restore.sh" "$release" "$@"; }
+restores_with() {
+    restore "$package" --identity-file "$work/keys/$1.key" >"$work/restore-$1.log" 2>&1 \
+        && grep -q "matches the manifest (revision, schema, missions)" "$work/restore-$1.log"
 }
-expect_ok "restore.sh: restored into a new database, matching the manifest, and dropped it" \
-    restores_matching
+expect_ok "restore.sh with the operator's key: restored into a new database, matching the manifest, and dropped it" \
+    restores_with operator
+expect_ok "restore.sh with the recovery key: the same" restores_with recovery
+expect_fails "restore.sh with a key that is not a recipient: refused" \
+    restore "$package" --identity-file "$work/keys/stranger.key"
 in_use_untouched() {
     test "$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')" = "$users_before" \
-        -a "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0
+        -a "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0 \
+        -a -z "$(find "$work/plain" -mindepth 1)"
 }
-expect_ok "the database in use was not touched ($users_before users), no restore database left" in_use_untouched
+expect_ok "the database in use was not touched ($users_before users), no restore database or decrypted file left" in_use_untouched
 
-# The checks below use the real pg_restore and tar: infra/tests/backup-cases.sh and
-# tests/infra/test_backup_package.py have the rest.
+# The checks below use the real age, pg_restore and tar: infra/tests/backup-cases.sh
+# and tests/infra/test_backup_package.py have the rest.
 mkdir -p "$work/moved"
 cp "$package" "$package.sha256" "$work/moved/"
 moved="$work/moved/$(basename "$package")"
-expect_ok "restore.sh restores a package moved to another directory" \
-    "$repo/infra/ops/restore.sh" "$release" "$moved"
-# repack MODE NAME: the package again with its dump changed, and a matching checksum.
-#   truncate-dump: the dump loses its last byte, and the manifest agrees with it
-#   change-dump:   one byte of the dump changes, the manifest stays as it was
-repack() {
-    python3 - "$moved" "$work/moved/$2" "$1" <<'PY'
+key=(--identity-file "$work/keys/operator.key")
+expect_ok "restore.sh restores a package moved to another directory" restore "$moved" "${key[@]}"
+# damage MODE NAME: a copy of the package damaged, with a checksum that matches it.
+#   flip, cut:       the encrypted bytes changed or shortened (only age can tell)
+#   truncate-dump:   inside, the dump loses its last byte and the manifest agrees
+#   change-dump:     inside, one byte of the dump changes, the manifest stays
+damage() {
+    local target="$work/moved/$2"
+    case "$1" in
+        flip)
+            cp "$moved" "$target"
+            printf '\377' | dd of="$target" bs=1 seek=$(($(wc -c <"$moved") / 2)) conv=notrunc 2>/dev/null
+            ;;
+        cut) head -c $(($(wc -c <"$moved") - 100)) "$moved" >"$target" ;;
+        *)
+            age --decrypt --identity "$work/keys/operator.key" --output "$work/moved/inner.tar" "$moved"
+            python3 - "$work/moved/inner.tar" "$work/moved/repacked.tar" "$1" <<'PY'
 import hashlib, io, json, sys, tarfile
 source, target, mode = sys.argv[1:4]
 with tarfile.open(source) as tar:
@@ -421,24 +466,32 @@ with tarfile.open(target, "x", format=tarfile.PAX_FORMAT) as tar:
         info.size = len(data[name])
         tar.addfile(info, io.BytesIO(data[name]))
 PY
+            age --encrypt --recipients-file "$work/keys/recipients.txt" --output "$target" "$work/moved/repacked.tar"
+            rm -f "$work/moved/inner.tar" "$work/moved/repacked.tar"
+            ;;
+    esac
     (cd "$work/moved" && sha256sum "$2" >"$2.sha256")
 }
-repack truncate-dump truncated-dump.tar
+damage flip flipped.tar.age
+expect_fails "restore.sh refuses a package whose encrypted bytes changed, checksum matching (age refuses it)" \
+    restore "$work/moved/flipped.tar.age" "${key[@]}"
+damage cut cut.tar.age
+expect_fails "restore.sh refuses a package whose encrypted bytes were cut, checksum matching (age refuses it)" \
+    restore "$work/moved/cut.tar.age" "${key[@]}"
+damage truncate-dump truncated-dump.tar.age
 expect_fails "restore.sh refuses a package whose dump misses its last byte, manifest and checksum matching" \
-    "$repo/infra/ops/restore.sh" "$release" "$work/moved/truncated-dump.tar"
-repack change-dump changed-dump.tar
+    restore "$work/moved/truncated-dump.tar.age" "${key[@]}"
+damage change-dump changed-dump.tar.age
 expect_fails "restore.sh refuses a package whose dump changed after the manifest was written" \
-    "$repo/infra/ops/restore.sh" "$release" "$work/moved/changed-dump.tar"
-head -c "$(($(wc -c <"$moved") / 3))" "$moved" >"$work/moved/cut.tar"
-(cd "$work/moved" && sha256sum cut.tar >cut.tar.sha256)
-expect_fails "restore.sh refuses a truncated package, even with a matching checksum" \
-    "$repo/infra/ops/restore.sh" "$release" "$work/moved/cut.tar"
+    restore "$work/moved/changed-dump.tar.age" "${key[@]}"
 rm "$moved.sha256"
-expect_fails "restore.sh refuses a package without its checksum" "$repo/infra/ops/restore.sh" "$release" "$moved"
+expect_fails "restore.sh refuses a package without its checksum" restore "$moved" "${key[@]}"
 printf 'corrupt' >>"$package"
-expect_fails "restore.sh refuses a package that does not match its checksum" \
-    "$repo/infra/ops/restore.sh" "$release" "$package"
-expect_ok "after the refusals, the database in use is as it was and no restore database is left" in_use_untouched
+expect_fails "restore.sh refuses a package that does not match its checksum" restore "$package" "${key[@]}"
+expect_ok "after the refusals, the database in use is as it was, no restore database or decrypted file is left" \
+    in_use_untouched
+no_private_key_in_logs() { ! grep -rq AGE-SECRET-KEY "$work"/*.log; }
+expect_ok "no private key in any log of the backups and restores" no_private_key_in_logs
 
 echo "== lab checks"
 for _ in $(seq 60); do
