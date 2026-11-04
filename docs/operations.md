@@ -8,7 +8,7 @@ How to install, update, check, back up and recover the production stack describe
 | `infra/release/check-env.sh` | Checks the environment file, without printing values |
 | `infra/ops/migrate.sh` | Backup, restore test of that backup, then `alembic upgrade head` |
 | `infra/ops/content-sync.sh` | Syncs mission content from a checkout of the private repository at a given commit |
-| `infra/ops/backup.sh` | Database dump and Caddy's data, checked, copied off the host, old ones removed |
+| `infra/ops/backup.sh` | Database dump and Caddy's data, read back in full, copied off the host; removes nothing |
 | `infra/ops/restore.sh` | Restores a dump into a new database; drops it afterwards unless `--keep` |
 | `infra/ops/check-labs.sh` | Compares lab containers with the database, checks disk, memory and the API's log; changes nothing |
 | `infra/tests/e2e.sh` | The end-to-end checks on a disposable project ([deployment.md](deployment.md#checking-a-release)) |
@@ -87,21 +87,29 @@ Either way, only root reads the checkout, and the commit synced is the one the m
 
 `backup.sh` writes, into `BACKUP_DIR` (0700, files 0600):
 
-- `linuxlab-<time>-<label>.dump`: `pg_dump --format=custom` of the database, checked with `pg_restore --list`, with a `.sha256`;
-- `caddy-data-<time>-<label>.tar.gz`: Caddy's data volume (certificates and their private keys), with a `.sha256`.
+- `linuxlab-<time>-<label>.dump`: `pg_dump --format=custom` of the database, read back in full with `pg_restore -f /dev/null` (`pg_restore --list` reads only the table of contents and accepts a truncated dump), with a `.sha256`;
+- `caddy-data-<time>-<label>.tar.gz`: Caddy's data volume (certificates and their private keys), checked with `gzip -t` and listed to its end with `tar -tzf`, with a `.sha256`.
 
-It runs `BACKUP_COPY_COMMAND` on each file to copy it off the host, and reports when that is not set or fails (exit status 1). Local files older than `BACKUP_KEEP_DAYS` are removed. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration.
+Each file is written as `<name>.partial` and gets its final name only after that check, its checksum written first: a file under its final name always has its `.sha256`. The `.sha256` names the file without its directory, so `sha256sum --check` works wherever the pair is copied. When a run fails or is interrupted, its partial files are removed; a `.partial` left by an earlier run (a crash, a reboot) is never a backup, and `backup.sh` reports it and leaves it for the operator.
 
-Cron on the host, as root:
+It runs `BACKUP_COPY_COMMAND` on each file to copy it off the host, and reports when that is not set or fails (exit status other than 0). Its exit status is all that is known of the copy: nothing checks that the file arrived intact. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration.
+
+**No backup is removed automatically.** Removal by age is suspended until copies off the host are verified (download and checksum comparison), so that the last good backup on the host is never removed on the strength of a copy command's exit status. Every run reports how many backup files `BACKUP_DIR` holds; the operator removes old ones by hand after checking that a copy of a newer backup is intact off the host. `BACKUP_KEEP_DAYS` is not applied.
+
+`backup.sh`, `restore.sh` and `migrate.sh` take the same lock (`flock` on `/run/linuxlab-ops.lock`, `LINUXLAB_LOCK_FILE` overrides it) without waiting: while one runs, the others stop at once with exit status 1 and change nothing. `migrate.sh` holds the lock for its whole run, and the `backup.sh` and `restore.sh` it starts run under it (they inherit it). `flock` comes with util-linux on the host.
+
+Cron on the host, as root. A failure, including a backup refused because another operation held the lock, goes to the host's syslog through `logger`:
 
 ```
-15 3 * * *  root  /var/lib/linuxlab/src/linux-lab-api/infra/ops/backup.sh <release file> >>/var/log/linuxlab-backup.log 2>&1
+15 3 * * *  root  /var/lib/linuxlab/src/linux-lab-api/infra/ops/backup.sh <release file> >>/var/log/linuxlab-backup.log 2>&1 || logger -p user.err -t linuxlab "backup failed, see /var/log/linuxlab-backup.log"
 ```
+
+This only records the failure on the host. Getting it to the operator (mail, a monitoring service) is part of provisioning the host and is not set up by this repository.
 
 What the backups hold: accounts (email, display name, Argon2id hashes), session token hashes, labs, validation runs, progress, mission versions (with solutions) and the **command history, which stores what students typed, secrets included, with no redaction** ([architecture.md](architecture.md#privacy)). So:
 
 - backups are encrypted at the destination and readable only by the operator; their credentials are not the host's;
-- retention is short and explicit: 14 days on the host; off the host to be decided with the destination (proposal: 30 days);
+- retention is to be decided with the destination (proposal: 30 days off the host); on the host nothing is removed automatically for now (see above);
 - the history is kept as long as the lab's row, which is removed only with its user: there is no retention job for it yet. Deleting a user's data means deleting the user, and backups keep it until they expire;
 - the history is not a place for secrets, and the web page tells students so; operators must not present it otherwise.
 
@@ -113,7 +121,7 @@ Test a backup regularly (monthly, and after every change to the database):
 infra/ops/restore.sh $R /var/backups/linuxlab/linuxlab-<time>-scheduled.dump
 ```
 
-It restores into a new database `restore_<time>` on the same PostgreSQL, never into an existing one, prints the row counts next to the database in use, and drops it.
+It restores into a new database `restore_<time>` on the same PostgreSQL, never into an existing one, prints the row counts next to the database in use, and drops it. Before creating anything it requires the dump's `.sha256` next to it and matching, and reads the dump in full; a dump without its checksum, or one that fails either check, is refused. The only optional argument is `--keep`; any other is refused before anything is done.
 
 Emergency, when the database in use cannot be kept (a migration that cannot be fixed forward, corruption):
 

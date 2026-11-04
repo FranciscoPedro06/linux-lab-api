@@ -68,7 +68,6 @@ API_EDGE_IP=172.31.1.3
 E2E_RUNTIME=$runtime
 E2E_ENVIRONMENT=$([ "$runtime" = runsc ] && echo production || echo development)
 BACKUP_DIR=$work/backups
-BACKUP_KEEP_DAYS=1
 EOF
     # Clients are always on 172.31.0.0/24: the public network, or the agent's egress.
     if [ "$entry" = direct ]; then
@@ -175,7 +174,7 @@ expect_ok "deployment compose ($entry): published ports, one API process trustin
 
 echo "== start, with the operation scripts"
 overrides=("${deployment_files[@]:1}" "${test_files[@]}")
-export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project
+export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project LINUXLAB_LOCK_FILE=$work/ops.lock
 LINUXLAB_OVERRIDES=$(IFS=:; echo "${overrides[*]}")
 export LINUXLAB_OVERRIDES
 # The synthetic missions, committed in a throwaway repository like the private one.
@@ -346,6 +345,23 @@ expect_ok "restore.sh: restored into a new database and dropped it" \
 expect_ok "the database in use was not touched ($users_before users)" \
     test "$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')" = "$users_before"
 expect_ok "no restore database left" \
+    test "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0
+expect_ok "backup.sh left no partial file" test -z "$(find "$work/backups" -name '*.partial')"
+expect_ok "Caddy's archive reads back in full" tar -tzf "$(ls "$work"/backups/caddy-data-*-e2e.tar.gz)"
+# The checks below use the real pg_restore: infra/tests/backup-cases.sh has the rest.
+mkdir -p "$work/moved"
+cp "$dump" "$dump.sha256" "$work/moved/"
+expect_ok "restore.sh restores a backup moved to another directory" \
+    "$repo/infra/ops/restore.sh" "$release" "$work/moved/$(basename "$dump")"
+truncated="$work/moved/truncated.dump"
+head -c "$(($(wc -c <"$dump") - 1))" "$dump" >"$truncated"
+(cd "$work/moved" && sha256sum truncated.dump >truncated.dump.sha256)
+expect_fails "restore.sh refuses a dump missing its last byte, even with a matching checksum" \
+    "$repo/infra/ops/restore.sh" "$release" "$truncated"
+rm "$work/moved/$(basename "$dump").sha256"
+expect_fails "restore.sh refuses a dump without its checksum" \
+    "$repo/infra/ops/restore.sh" "$release" "$work/moved/$(basename "$dump")"
+expect_ok "no restore database left after the refusals" \
     test "$(compose exec -T postgres psql -At -U linuxlab -d postgres -c "SELECT count(*) FROM pg_database WHERE datname LIKE 'restore_%'")" = 0
 printf 'corrupt' >>"$dump"
 expect_fails "restore.sh refuses a dump that does not match its checksum" \

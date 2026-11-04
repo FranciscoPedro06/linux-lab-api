@@ -7,17 +7,26 @@
 #
 # Without --keep the new database is dropped afterwards: a restore test. With
 # --keep it stays, named restore_<time>, for an emergency switch (DATABASE_NAME).
+# Any other argument is refused before anything is done.
+#
+# The dump must have its checksum file next to it (DUMP.sha256, as backup.sh writes
+# it), and must read back in full, before any database is created.
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(dirname "$0")/lib.sh"
 
-load_release "${1:-}"
-dump=${2:?usage: restore.sh RELEASE_FILE DUMP [--keep]}
-keep=${3:-}
-[ -f "$dump" ] || fail "dump not found: $dump"
-if [ -f "$dump.sha256" ]; then
-    (cd "$(dirname "$dump")" && sha256sum --check --status "$(basename "$dump").sha256") \
-        || fail "$dump does not match its checksum"
+usage="usage: restore.sh RELEASE_FILE DUMP [--keep]"
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then fail "$usage"; fi
+keep=false
+if [ $# = 3 ]; then
+    [ "$3" = --keep ] || fail "unknown argument: $3 ($usage)"
+    keep=true
 fi
+dump=$2
+load_release "$1"
+take_lock
+[ -f "$dump" ] || fail "dump not found: $dump"
+verify_checksum "$dump" || fail "refusing $dump: its checksum is missing or does not match"
+verify_dump "$dump" || fail "refusing $dump: it cannot be read back in full"
 
 current=$(database_name)
 target="restore_$(date -u +%Y%m%d%H%M%S)"
@@ -29,6 +38,9 @@ note "creating database $target"
 psql_on postgres -c "CREATE DATABASE $target TEMPLATE template0"
 # Whatever fails from here on, the new database does not stay behind.
 trap 'psql_on postgres -c "DROP DATABASE IF EXISTS $target" >/dev/null 2>&1 || true' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 note "restoring $dump"
 compose exec -T postgres pg_restore -U linuxlab -d "$target" --exit-on-error --no-owner <"$dump" \
     || fail "restore failed"
@@ -52,7 +64,7 @@ report "$target" | sed 's/^/  /'
 echo "in use ($current), for comparison:"
 report "$current" | sed 's/^/  /'
 
-if [ "$keep" = --keep ]; then
+if [ "$keep" = true ]; then
     trap - EXIT
     echo "kept $target. Labs recorded as unfinished in it may no longer exist, and labs"
     echo "created since the dump are not in it: see docs/operations.md#restoring."

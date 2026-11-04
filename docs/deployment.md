@@ -152,7 +152,7 @@ Caddy writes a JSON access log to standard output, with `Cookie`, `Set-Cookie`, 
 - logs: rotation, no invite code or database password in any log, cookies redacted;
 - every lab container of the run removed by the API.
 
-`--runtime runc` runs the labs under runc with `ENVIRONMENT=development`, for hosts without gVisor such as Docker Desktop; CI runs it under runsc (`Runtime` workflow). `--entry ngrok` runs the same checks through the entry below, with a stand-in for the agent.
+`--runtime runc` runs the labs under runc with `ENVIRONMENT=development`, for hosts without gVisor such as Docker Desktop; CI runs it under runsc (`Runtime` workflow). The operation scripts it runs need `flock` (util-linux); a shell without it, such as Git Bash on Windows, cannot run them. `--entry ngrok` runs the same checks through the entry below, with a stand-in for the agent.
 
 ## Entry through ngrok
 
