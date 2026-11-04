@@ -60,6 +60,18 @@ fi
 mode=$(stat -c %a "$file" 2>/dev/null || echo unknown)
 [ "$mode" = 600 ] || [ "$mode" = 400 ] || problem "$file has mode $mode, expected 600"
 
+# Backups are encrypted with age to the public keys of BACKUP_AGE_RECIPIENTS_FILE
+# (infra/ops/age.sh says what a valid file is); no backup is written without them.
+# shellcheck source-path=SCRIPTDIR source=../ops/age.sh
+source "$(dirname "$0")/../ops/age.sh"
+check_age 2>/dev/null || problem "age is missing or is not $AGE_VERSION (infra/release/install-age.sh)"
+recipients=$(value BACKUP_AGE_RECIPIENTS_FILE)
+if [ -z "$recipients" ]; then
+    problem "BACKUP_AGE_RECIPIENTS_FILE is not set: backups would not be written"
+elif ! reason=$(age_recipients "$recipients" 2>&1 >/dev/null); then
+    problem "${reason#error: }"
+fi
+
 if [ "$failures" -gt 0 ]; then
     echo "$failures problems in $file" >&2
     exit 1
