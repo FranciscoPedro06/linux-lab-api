@@ -87,16 +87,22 @@ Either way, only root reads the checkout, and the commit synced is the one the m
 
 `backup.sh` writes, into `BACKUP_DIR` (0700, files 0600):
 
-- `linuxlab-<time>-<label>.dump`: `pg_dump --format=custom` of the database, read back in full with `pg_restore -f /dev/null` (`pg_restore --list` reads only the table of contents and accepts a truncated dump), with a `.sha256`;
-- `caddy-data-<time>-<label>.tar.gz`: Caddy's data volume (certificates and their private keys), checked with `gzip -t` and listed to its end with `tar -tzf`, with a `.sha256`.
+- `linuxlab-<time>-<id>-<label>.dump`: `pg_dump --format=custom` of the database, read back in full with `pg_restore -f /dev/null` (`pg_restore --list` reads only the table of contents and accepts a truncated dump), with a `.sha256`;
+- `caddy-data-<time>-<id>-<label>.tar.gz`: Caddy's data volume (certificates and their private keys), checked with `gzip -t` and listed to its end with `tar -tzf`, with a `.sha256`.
 
-Each file is written as `<name>.partial` and gets its final name only after that check, its checksum written first: a file under its final name always has its `.sha256`. The `.sha256` names the file without its directory, so `sha256sum --check` works wherever the pair is copied. When a run fails or is interrupted, its partial files are removed; a `.partial` left by an earlier run (a crash, a reboot) is never a backup, and `backup.sh` reports it and leaves it for the operator.
+`<time>` is UTC to the second and `<id>` 64 random bits, new for each run. Each file is written as `<name>.partial` and gets its final name only after that check, its checksum first: a file under its final name always has its `.sha256`. The `.sha256` names the file without its directory, so `sha256sum --check` works wherever the pair is copied. When a run fails or is interrupted, its partial files are removed; a `.partial` left by an earlier run (a crash, a reboot) is never a backup, and `backup.sh` reports it and leaves it for the operator.
 
-It runs `BACKUP_COPY_COMMAND` on each file to copy it off the host, and reports when that is not set or fails (exit status other than 0). Its exit status is all that is known of the copy: nothing checks that the file arrived intact. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration.
+A file never replaces another. Final names are given with a hard link (`ln`, the `link` system call), which fails when the name exists, in one step; if the dump's name turns out to be taken after its checksum was published, that checksum is removed again, and only while it is still this run's file. A backup already in `BACKUP_DIR` is never changed, whatever happens to a later run. `BACKUP_DIR` must be on a filesystem with hard links (any Linux filesystem; not FAT or some network mounts), or every backup fails.
+
+Writing to disk: before the names are given, the content of the file and of its checksum is written to disk (`sync` of the two files, an `fsync` of each); after, the directory is (`sync` of the directory), which makes the new names durable. Once `backup.sh` has reported a file, a power loss or crash does not take it back. A crash before that point leaves, at worst, partial files or a checksum without its file, or loses the new names altogether; a final name, once it survives, always points to content already on disk. `restore.sh` refuses a partial file and a dump without its checksum, so a crash costs that backup, never an earlier one, and never makes a damaged file pass for a backup. This relies on the disk honoring flushes (a write cache without power protection that ignores them defeats any `fsync`).
+
+It runs `BACKUP_COPY_COMMAND` on each file to copy it off the host, and reports when that is not set or fails (exit status other than 0). Its exit status is all that is known of the copy: nothing checks that the file arrived intact. The command runs without the lock's file descriptor, so a process it leaves running (an ssh master connection, a daemon) does not keep the lock after `backup.sh` ends. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration.
 
 **No backup is removed automatically.** Removal by age is suspended until copies off the host are verified (download and checksum comparison), so that the last good backup on the host is never removed on the strength of a copy command's exit status. Every run reports how many backup files `BACKUP_DIR` holds; the operator removes old ones by hand after checking that a copy of a newer backup is intact off the host. `BACKUP_KEEP_DAYS` is not applied.
 
-`backup.sh`, `restore.sh` and `migrate.sh` take the same lock (`flock` on `/run/linuxlab-ops.lock`, `LINUXLAB_LOCK_FILE` overrides it) without waiting: while one runs, the others stop at once with exit status 1 and change nothing. `migrate.sh` holds the lock for its whole run, and the `backup.sh` and `restore.sh` it starts run under it (they inherit it). `flock` comes with util-linux on the host.
+`backup.sh`, `restore.sh` and `migrate.sh` take the same lock (`flock` on `/run/linuxlab-ops.lock`) without waiting: while one runs, the others stop at once with exit status 1 and change nothing. `migrate.sh` holds the lock for its whole run, and the `backup.sh` and `restore.sh` it starts run under it (they inherit it). `flock` comes with util-linux on the host.
+
+The lock file of the production project (`linuxlab-prod`) is fixed: no setting changes it. The tests run the scripts on projects of their own, with their own containers and database, and use two variables that only those projects accept: `LINUXLAB_TEST_LOCK_FILE` (a lock file in the test's directory) and `LINUXLAB_TEST_BACKUP_RUN` (a fixed `<time>-<id>`, to make two runs collide). With the production project, either one makes every operation script stop before doing anything. Neither belongs in the environment file or a cron line.
 
 Cron on the host, as root. A failure, including a backup refused because another operation held the lock, goes to the host's syslog through `logger`:
 
@@ -118,7 +124,7 @@ What the backups hold: accounts (email, display name, Argon2id hashes), session 
 Test a backup regularly (monthly, and after every change to the database):
 
 ```sh
-infra/ops/restore.sh $R /var/backups/linuxlab/linuxlab-<time>-scheduled.dump
+infra/ops/restore.sh $R /var/backups/linuxlab/linuxlab-<time>-<id>-scheduled.dump
 ```
 
 It restores into a new database `restore_<time>` on the same PostgreSQL, never into an existing one, prints the row counts next to the database in use, and drops it. Before creating anything it requires the dump's `.sha256` next to it and matching, and reads the dump in full; a dump without its checksum, or one that fails either check, is refused. The only optional argument is `--keep`; any other is refused before anything is done.

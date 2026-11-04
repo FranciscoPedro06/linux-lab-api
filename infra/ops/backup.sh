@@ -12,10 +12,13 @@
 #                         "rclone copy --config /root/.config/rclone/rclone.conf linuxlab-backups:"
 #                         Unset: backups stay on this host only, which is reported.
 #
-# Every file is written as NAME.partial and gets its final name only once it has been
-# read back in full and has a checksum (NAME.sha256, naming the file without its
-# directory). Partial files of this run are removed when it ends, whatever the
-# reason; those of an earlier run that did not finish are reported and left alone.
+# Names are linuxlab-<time>-<id>-<label>.dump and caddy-data-<time>-<id>-<label>.tar.gz,
+# with a random id per run. Every file is written as NAME.partial and gets its final
+# name only once it has been read back in full and has a checksum (NAME.sha256,
+# naming the file without its directory), written to disk, by a hard link that never
+# replaces an existing file. Partial files of this run are removed when it ends,
+# whatever the reason; those of an earlier run that did not finish are reported and
+# left alone.
 #
 # Exit status other than 0 if any step failed, so it can be run from cron and alert.
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -34,11 +37,14 @@ take_lock
 umask 077
 mkdir -p "$dir"
 chmod 700 "$dir"
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-dump="$dir/linuxlab-$stamp-$label.dump"
-caddy="$dir/caddy-data-$stamp-$label.tar.gz"
+# Names unique per run: the time to the second and 64 random bits. publish() still
+# refuses to replace any existing file, should two runs ever share a name.
+run=${TEST_BACKUP_RUN:-$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')}
+[[ $run =~ ^[0-9A-Za-z]+-[0-9a-f]+$ ]] || fail "unexpected backup run name: $run"
+dump="$dir/linuxlab-$run-$label.dump"
+caddy="$dir/caddy-data-$run-$label.tar.gz"
 
-# This run's partial files; removed when it ends (renamed ones are gone by then).
+# This run's partial files; removed when it ends (published ones are gone by then).
 partials=()
 # shellcheck disable=SC2317 # Run by the EXIT trap.
 remove_partials() {
@@ -58,7 +64,7 @@ compose exec -T postgres pg_dump -U linuxlab -d "$database" --format=custom >"$d
     || fail "pg_dump failed; no backup written"
 verify_dump "$dump.partial" || fail "the dump cannot be read back in full; no backup written"
 write_checksum "$dump.partial" "$dump"
-finish "$dump.partial" "$dump"
+publish "$dump.partial" "$dump"
 note "database: $dump ($(du -h "$dump" | cut -f1))"
 
 note "archiving Caddy's data volume"
@@ -75,7 +81,7 @@ if docker volume inspect "$volume" >/dev/null 2>&1; then
     [ -n "$entries" ] \
         || fail "Caddy's data archive cannot be read back in full; the database backup $dump is kept"
     write_checksum "$caddy.partial" "$caddy"
-    finish "$caddy.partial" "$caddy"
+    publish "$caddy.partial" "$caddy"
     note "caddy data: $caddy"
 else
     note "no volume $volume; Caddy data not archived"
@@ -85,8 +91,11 @@ fi
 status=0
 if [ -n "$copy" ]; then
     for file in "$dump" "$dump.sha256" ${caddy:+"$caddy" "$caddy.sha256"}; do
-        # The command comes from the root-owned environment file.
-        if ! sh -c "$copy \"\$1\"" copy "$file"; then
+        # The command comes from the root-owned environment file. It runs without
+        # the lock's descriptor (9>&-): a process it leaves behind (an ssh master
+        # connection, a daemon) cannot hold the lock after this script ends, while
+        # this script keeps holding it until then.
+        if ! sh -c "$copy \"\$1\"" copy "$file" 9>&-; then
             note "copy off the host FAILED for $file"
             status=1
         fi

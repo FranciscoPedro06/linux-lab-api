@@ -161,7 +161,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check the deployment scripts
-        run: shellcheck -x infra/release/*.sh infra/ops/*.sh infra/tests/*.sh infra/tests/stubs/docker
+        run: shellcheck -x infra/release/*.sh infra/ops/*.sh infra/tests/*.sh infra/tests/stubs/docker infra/tests/stubs/sync
       - name: Check the decisions of migrate.sh (docker replaced by a stub)
         run: infra/tests/migrate-cases.sh
       - name: Check backup.sh, restore.sh and their lock (docker replaced by a stub)

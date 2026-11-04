@@ -20,7 +20,7 @@ cleanup() {
 trap cleanup EXIT
 export PATH="$here/stubs:$PATH" STUB_LOG="$work/calls"
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-backup-cases
-export LINUXLAB_LOCK_FILE="$work/ops.lock"
+export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
 backups="$work/backups"
 release="$work/release.env"
 printf '%s\n' API_SHA=0123456789abcdef0123456789abcdef01234567 \
@@ -56,6 +56,7 @@ check() {
     fi
 }
 
+not() { ! "$@"; }
 failed() { [ "$rc" != 0 ]; }
 succeeded() { [ "$rc" = 0 ]; }
 called() { grep -q -- "$1" "$STUB_LOG"; }
@@ -99,8 +100,14 @@ check "an intact dump is accepted" succeeded
 check "  stdout is the path of the new dump" test -f "$(cat "$work/out")" -a "$(wc -l <"$work/out")" = 1
 check "  the dump has a checksum" one 'linuxlab-*.dump.sha256'
 check "  the checksum names the file, not a path" \
-    grep -Eq '^[0-9a-f]{64}  linuxlab-[0-9TZ]+-scheduled\.dump$' "$(files 'linuxlab-*.dump.sha256')"
+    grep -Eq '^[0-9a-f]{64}  linuxlab-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}-scheduled\.dump$' "$(files 'linuxlab-*.dump.sha256')"
 check "  no partial file is left" no_partials
+check "  the content was written to disk before the name existed" \
+    grep -Eq '^sync .*/linuxlab-[^ ]+\.dump\.partial \(final absent\)$' "$STUB_LOG"
+check "  and the directory after it existed" \
+    grep -Eq "^sync $backups \(final files: [1-9][0-9]*\)$" "$STUB_LOG"
+check "  in that order" test "$(grep -n -m1 'dump.partial (final absent)' "$STUB_LOG" | cut -d: -f1)" \
+    -lt "$(grep -n -m1 "^sync $backups (final files" "$STUB_LOG" | cut -d: -f1)"
 
 for mode in truncated corrupt fail; do
     reset
@@ -118,7 +125,7 @@ STUB_CADDY=valid backup
 check "an intact Caddy archive is accepted" succeeded
 check "  the archive and its checksum are kept" one 'caddy-data-*.tar.gz'
 check "  its checksum names the file" \
-    grep -Eq '^[0-9a-f]{64}  caddy-data-[0-9TZ]+-scheduled\.tar\.gz$' "$(files 'caddy-data-*.sha256')"
+    grep -Eq '^[0-9a-f]{64}  caddy-data-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}-scheduled\.tar\.gz$' "$(files 'caddy-data-*.sha256')"
 check "  the archive lists" tar -tzf "$(files 'caddy-data-*.tar.gz')"
 for mode in truncated corrupt flipped fail; do
     reset
@@ -186,6 +193,77 @@ rc=0
 wait "$pid" || rc=$?
 check "an interrupted backup fails" failed
 check "  and leaves neither a dump nor a partial file" none 'linuxlab-*'
+
+reset
+STUB_HOLD="$work/hold" STUB_HOLD_ON=pg_dump "$ops/backup.sh" "$release" >/dev/null 2>&1 &
+pid=$!
+wait_for "$work/hold.started"
+kill -KILL "$pid"
+wait "$pid" 2>/dev/null || true
+touch "$work/hold.release"
+sleep 0.5
+check "a backup killed outright (no trap runs) leaves only a partial file" \
+    test "$(files 'linuxlab-*' | grep -vc '\.partial$')" = 0 -a -n "$(files '*.partial')"
+restore "$(files '*.dump.partial' | head -n 1)"
+check "  which restore.sh refuses" failed
+check "  before any database is created" not_called "CREATE DATABASE"
+
+echo "== backup.sh: names are never reused or replaced"
+reset
+backup
+first=$(cat "$work/out")
+backup
+second=$(cat "$work/out")
+check "two backups run back to back, same label: two names" \
+    test -n "$first" -a -n "$second" -a "$first" != "$second"
+check "  both kept" test "$(files 'linuxlab-*.dump' | wc -l)" = 2
+
+# sums FILE...: their names and SHA-256, to compare before and after.
+sums() { sha256sum "$@" 2>&1; }
+
+reset
+fixed=20260101T031500Z-0123456789abcdef
+LINUXLAB_TEST_BACKUP_RUN=$fixed STUB_CADDY=valid backup
+check "a backup under a given name" succeeded
+mapfile -t earlier < <(files "*-$fixed-*")
+before=$(sums "${earlier[@]}")
+: >"$STUB_LOG"
+LINUXLAB_TEST_BACKUP_RUN=$fixed STUB_CADDY=valid backup
+check "a second run under the same name fails" failed
+check "  and says it replaces nothing" grep -q "never replaced" "$work/err"
+check "  every file of the earlier backup is unchanged" test "$(sums "${earlier[@]}")" = "$before"
+check "  no file was added" test "$(files '*' | wc -l)" = 4
+check "  no partial file is left" no_partials
+restore "$backups/linuxlab-$fixed-scheduled.dump"
+check "  the earlier backup still restores" succeeded
+
+# A failure between the two links: the checksum's name is free, the dump's is taken.
+reset
+taken="$backups/linuxlab-$fixed-scheduled.dump"
+echo "a file that happens to have the dump's name" >"$taken"
+before=$(sums "$taken")
+LINUXLAB_TEST_BACKUP_RUN=$fixed backup
+check "a run whose dump name is taken after its checksum was published fails" failed
+check "  the existing file is unchanged" test "$(sums "$taken")" = "$before"
+check "  the checksum it had just published is withdrawn" test ! -e "$taken.sha256"
+check "  no partial file is left" no_partials
+check "  nothing is printed as a backup" test ! -s "$work/out"
+
+# The same, next to a valid backup: that backup is untouched and still restores.
+reset
+fixture "$backups/linuxlab-20260101T000000Z-aaaaaaaaaaaaaaaa-scheduled.dump"
+mapfile -t valid < <(files 'linuxlab-*')
+before=$(sums "${valid[@]}")
+echo "taken" >"$taken"
+LINUXLAB_TEST_BACKUP_RUN=$fixed backup
+check "a failed publication leaves an earlier valid backup as it was" test "$(sums "${valid[@]}")" = "$before"
+restore "$backups/linuxlab-20260101T000000Z-aaaaaaaaaaaaaaaa-scheduled.dump"
+check "  and it still restores" succeeded
+
+reset
+run env LINUXLAB_TEST_BACKUP_RUN='../../etc-x' "$ops/backup.sh" "$release"
+check "a run name with a path in it is refused" failed
+check "  before any dump" not_called pg_dump
 
 echo "== restore.sh: checksums"
 reset
@@ -316,12 +394,106 @@ release_held
 check "  the migration itself completes" test "$held_rc" = 0
 
 reset
-flock -n "$LINUXLAB_LOCK_FILE" -c "touch '$work/hold.started'; while [ ! -e '$work/hold.release' ]; do sleep 0.1; done" &
+flock -n "$LINUXLAB_TEST_LOCK_FILE" -c "touch '$work/hold.started'; while [ ! -e '$work/hold.release' ]; do sleep 0.1; done" &
 held=$!
 wait_for "$work/hold.started"
 run env STUB_HEADS="$HEAD" STUB_CURRENT='c4e1a7b39d52\n' STUB_AFTER="$HEAD" "$ops/migrate.sh" "$release"
 check "migrate.sh is refused while another process holds the lock" failed
 check "  before reading or changing the database" not_called alembic
+release_held
+
+echo "== the copy command does not get the lock"
+# Stands for a copy command that leaves a process behind (an ssh master connection,
+# a daemon): the first call starts a background process, then waits to be released.
+cat >"$work/copy.sh" <<'EOF'
+#!/usr/bin/env bash
+if [ ! -e "$COPY_DIR/copy.started" ]; then
+    sleep 60 &
+    echo $! >"$COPY_DIR/copy.background"
+    touch "$COPY_DIR/copy.started"
+    while [ ! -e "$COPY_DIR/copy.release" ]; do sleep 0.1; done
+fi
+EOF
+chmod +x "$work/copy.sh"
+reset "BACKUP_COPY_COMMAND=$work/copy.sh"
+rm -f "$work/copy.started" "$work/copy.release" "$work/copy.background"
+COPY_DIR=$work timeout 120 "$ops/backup.sh" "$release" >"$work/held.out" 2>"$work/held.err" &
+held=$!
+wait_for "$work/copy.started"
+fixture "$backups/x.dump"
+restore "$backups/x.dump"
+check "while the copy command runs, the backup still holds the lock" failed
+check "  restore.sh was refused without creating a database" not_called "CREATE DATABASE"
+touch "$work/copy.release"
+held_rc=0
+wait "$held" || held_rc=$?
+check "the backup ends" test "$held_rc" = 0
+background=$(cat "$work/copy.background")
+check "  the copy command's background process is still running" kill -0 "$background"
+holds_lock() {
+    local fd
+    for fd in /proc/"$1"/fd/*; do
+        [ "$fd" -ef "$LINUXLAB_TEST_LOCK_FILE" ] && return 0
+    done
+    return 1
+}
+check "  and has no descriptor on the lock file" not holds_lock "$background"
+restore "$backups/x.dump"
+check "  another operation gets the lock as soon as the backup ends" succeeded
+kill "$background" 2>/dev/null || true
+
+echo "== the production project's lock is fixed"
+reset
+run env LINUXLAB_PROJECT=linuxlab-prod LINUXLAB_TEST_LOCK_FILE="$work/other.lock" "$ops/backup.sh" "$release"
+check "LINUXLAB_TEST_LOCK_FILE is refused with the production project" failed
+check "  and says so" grep -q "LINUXLAB_TEST_LOCK_FILE is for test projects only" "$work/err"
+check "  before any call" test ! -s "$STUB_LOG"
+fixture "$backups/x.dump"
+for command in "restore.sh $backups/x.dump" "migrate.sh"; do
+    : >"$STUB_LOG"
+    # shellcheck disable=SC2086 # Split on purpose: the script and its arguments.
+    set -- $command
+    run env LINUXLAB_PROJECT=linuxlab-prod LINUXLAB_TEST_LOCK_FILE="$work/other.lock" \
+        "$ops/$1" "$release" "${@:2}"
+    check "  $1 refuses it too, before any call" test "$rc" != 0 -a ! -s "$STUB_LOG"
+    check "  and says so" grep -q "LINUXLAB_TEST_LOCK_FILE is for test projects only" "$work/err"
+done
+: >"$STUB_LOG"
+run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod LINUXLAB_TEST_BACKUP_RUN=$fixed \
+    "$ops/backup.sh" "$release"
+check "LINUXLAB_TEST_BACKUP_RUN is refused with the production project" failed
+check "  before any call" test ! -s "$STUB_LOG"
+
+# The production project uses /run/linuxlab-ops.lock. As root (a container), hold it
+# from another process and check that a production backup is refused because of it;
+# otherwise (CI's user) the backup cannot even open it, and says which file it tried.
+reset
+canonical=/run/linuxlab-ops.lock
+if [ -w /run ]; then
+    rm -f "$work"/hold.*
+    flock -n "$canonical" -c "touch '$work/hold.started'; while [ ! -e '$work/hold.release' ]; do sleep 0.1; done" &
+    held=$!
+    wait_for "$work/hold.started"
+    run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
+    check "the production project takes $canonical: refused while another process holds it" failed
+    check "  and names it" grep -q "another backup, restore or migration is running (lock $canonical)" "$work/err"
+    release_held
+else
+    run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
+    check "the production project uses $canonical (not writable here: refused, naming it)" \
+        grep -q "cannot open the lock file $canonical" "$work/err"
+fi
+check "  without dumping" not_called pg_dump
+
+# A test project with the lock held: the old variable name changes nothing.
+reset
+rm -f "$work"/hold.*
+flock -n "$LINUXLAB_TEST_LOCK_FILE" -c "touch '$work/hold.started'; while [ ! -e '$work/hold.release' ]; do sleep 0.1; done" &
+held=$!
+wait_for "$work/hold.started"
+run env LINUXLAB_LOCK_FILE="$work/other.lock" "$ops/backup.sh" "$release"
+check "LINUXLAB_LOCK_FILE (no longer read) does not move the lock" failed
+check "  without dumping" not_called pg_dump
 release_held
 
 reset

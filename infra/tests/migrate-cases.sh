@@ -13,7 +13,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 export PATH="$here/stubs:$PATH" STUB_LOG="$work/calls"
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-migrate-cases
-export LINUXLAB_LOCK_FILE="$work/ops.lock"
+export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
 printf '%s\n' "BACKUP_DIR=$work/backups" >"$LINUXLAB_ENV_FILE"
 release="$work/release.env"
 printf '%s\n' API_SHA=0123456789abcdef0123456789abcdef01234567 \
