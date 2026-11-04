@@ -172,8 +172,15 @@ jobs:
           sudo /usr/local/bin/runsc install
           sudo systemctl restart docker
 
+      # The release of infra/ops/age.sh, its archive checked against the recorded SHA-256.
+      - name: Install age
+        run: |
+          api/infra/release/install-age.sh "$RUNNER_TEMP/age"
+          echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+
       - name: Show versions
         run: |
+          age --version
           runsc --version
           docker version --format 'Docker Engine {{.Server.Version}}'
           docker compose version

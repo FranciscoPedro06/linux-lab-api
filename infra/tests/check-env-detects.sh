@@ -20,9 +20,16 @@ write() {
     shift
     (umask 077; printf '%s\n' "$@" >"$work/$name")
 }
+# Two recipients of keys made for this run only, in its directory.
+age-keygen -o "$work/operator.key" 2>/dev/null
+age-keygen -o "$work/recovery.key" 2>/dev/null
+operator=$(age-keygen -y "$work/operator.key")
+recovery=$(age-keygen -y "$work/recovery.key")
+write recipients.txt "# operator" "$operator" "" "# offline recovery" "$recovery"
 good=(SITE_ADDRESS=lab.test.invalid PUBLIC_ORIGIN=https://lab.test.invalid
     POSTGRES_PASSWORD=0123456789abcdef0123456789abcdef SIGNUP_INVITE_CODE=synthetic-invite-0123456789
-    DOCKER_SOCKET_GID="$gid" LAB_DEPLOYMENT=prod LAB_CAPACITY=4)
+    DOCKER_SOCKET_GID="$gid" LAB_DEPLOYMENT=prod LAB_CAPACITY=4
+    "BACKUP_AGE_RECIPIENTS_FILE=$work/recipients.txt")
 
 expect() {
     local outcome=$1 name=$2
@@ -35,7 +42,7 @@ expect() {
         cat "$work/out" >&2
         failures=$((failures + 1))
     fi
-    if grep -q -e 0123456789abcdef -e synthetic-invite -e synthetic-token "$work/out"; then
+    if grep -q -e 0123456789abcdef -e synthetic-invite -e synthetic-token -e age1 -e AGE-SECRET-KEY "$work/out"; then
         echo "FAIL  $name: printed a value" >&2
         failures=$((failures + 1))
     fi
@@ -66,5 +73,42 @@ write mismatch.env "${good[@]}" NGROK_URL=https://other.test.invalid
 expect refused "ngrok entry, NGROK_URL is not the site" "$work/mismatch.env" "$work/ngrok.env"
 chmod 644 "$work/ngrok.env"
 expect refused "ngrok entry, token file readable by others" "$work/tunnel.env" "$work/ngrok.env"
+
+# Backup encryption: the recipients file and age itself.
+recipients() {
+    local name=$1
+    shift
+    write "$name" "$@"
+    write "$name.env" "${good[@]}" "BACKUP_AGE_RECIPIENTS_FILE=$work/$name"
+}
+write no-recipients.env "${good[@]}" BACKUP_AGE_RECIPIENTS_FILE=
+expect refused "no recipients file set" "$work/no-recipients.env"
+write missing-recipients.env "${good[@]}" "BACKUP_AGE_RECIPIENTS_FILE=$work/nowhere.txt"
+expect refused "recipients file missing" "$work/missing-recipients.env"
+recipients one.txt "$operator"
+expect refused "one recipient only" "$work/one.txt.env"
+recipients twice.txt "$operator" "# again" "$operator"
+expect refused "a recipient listed twice" "$work/twice.txt.env"
+recipients invalid.txt "$operator" "$recovery" "age1notakey"
+expect refused "a line that is not a recipient" "$work/invalid.txt.env"
+recipients secret.txt "$operator" "$recovery" "$(grep AGE-SECRET-KEY "$work/operator.key")"
+expect refused "a private key among the recipients" "$work/secret.txt.env"
+recipients writable.txt "$operator" "$recovery"
+chmod 664 "$work/writable.txt"
+expect refused "recipients file writable by its group" "$work/writable.txt.env"
+no_age=$(mktemp -d)
+for program in dirname stat sed tail head grep sort uniq wc cat tr cut; do
+    ln -s "$(command -v "$program")" "$no_age/$program"
+done
+bash=$(command -v bash)
+if PATH=$no_age "$bash" "$check" "$work/good.env" >"$work/out" 2>&1; then status=accepted; else status=refused; fi
+if [ "$status" = refused ] && grep -q "age is missing" "$work/out"; then
+    echo "ok    age not installed: refused"
+else
+    echo "FAIL  age not installed: $status" >&2
+    cat "$work/out" >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$no_age"
 
 [ "$failures" -eq 0 ]

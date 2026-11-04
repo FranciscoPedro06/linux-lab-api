@@ -162,6 +162,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check the deployment scripts
         run: shellcheck -x infra/release/*.sh infra/ops/*.sh infra/tests/*.sh infra/tests/stubs/docker infra/tests/stubs/sync
+      # The release of infra/ops/age.sh, its archive checked against the recorded SHA-256.
+      - name: Install age
+        run: |
+          infra/release/install-age.sh "$RUNNER_TEMP/age"
+          echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
       - name: Check the decisions of migrate.sh (docker replaced by a stub)
         run: infra/tests/migrate-cases.sh
       - name: Check backup.sh, restore.sh and their lock (docker replaced by a stub)
