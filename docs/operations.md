@@ -145,7 +145,7 @@ What the backups hold: accounts (email, display name, Argon2id hashes), session 
 
 Every package is encrypted with [age](https://age-encryption.org) (`AGE_VERSION` in `infra/ops/age.sh`, installed by `infra/release/install-age.sh`, which refuses an archive whose SHA-256 is not the recorded one; CI installs and tests that release) to every public key of `BACKUP_AGE_RECIPIENTS_FILE`. Any one of the matching private keys decrypts it; age authenticates every chunk, so a key that is not a recipient, a changed byte or a cut file is refused.
 
-**Keys.** Two, at least: the operator's and an offline recovery key, so that losing one does not lose the backups. Each is made away from the host, with `age-keygen -o <file>`, on the operator's machine; the recovery key is kept offline (printed, or on a device kept apart). Only the public keys (`age1…`, from `age-keygen -y <file>`) go to the host, in the recipients file:
+**Keys.** Two, at least: the operator's and an offline recovery key, so that losing one does not lose the backups. Each is made away from the host, with `age-keygen -o <file>`, on the operator's machine; the recovery key is kept offline (printed, or on a device kept apart). Only the public keys (`age1...`, from `age-keygen -y <file>`) go to the host, in the recipients file:
 
 ```
 # operator, 2026-11
