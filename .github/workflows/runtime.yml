@@ -16,6 +16,9 @@ on:
       - "lab-image/**"
       - "infra/**"
       - "Dockerfile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
       - ".github/workflows/runtime.yml"
   workflow_dispatch:
 
