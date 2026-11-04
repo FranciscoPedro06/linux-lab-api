@@ -1,16 +1,56 @@
 #!/usr/bin/env bash
-# Stand-in for the docker CLI in infra/tests/migrate-cases.sh. Records every call in
-# $STUB_LOG and answers the calls infra/ops/migrate.sh makes (directly and through
-# backup.sh and restore.sh) as the case under test says:
+# Stand-in for the docker CLI in infra/tests/migrate-cases.sh and
+# infra/tests/backup-cases.sh. Records every call in $STUB_LOG and answers the calls
+# infra/ops/migrate.sh, backup.sh and restore.sh make as the case under test says:
 #
 #   STUB_HEADS, STUB_HEADS_RC        output and status of `alembic heads`
 #   STUB_CURRENT, STUB_CURRENT_RC    output and status of `alembic current` before
 #                                    the upgrade; STUB_AFTER for after it
 #   STUB_UPGRADE_RC                  status of `alembic upgrade head`
+#   STUB_DUMP                        what pg_dump writes: valid (default), truncated
+#                                    (the end is missing), corrupt (a byte changed),
+#                                    fail (part of a dump, then status 1)
+#   STUB_RESTORE_RC                  status of pg_restore into a database
+#   STUB_CADDY                       unset: no Caddy volume. valid, truncated (half of
+#                                    the archive), corrupt (gzip of something that is
+#                                    not a tar archive), flipped (bytes changed in the
+#                                    middle) or fail: what archiving it gives
+#   STUB_HOLD, STUB_HOLD_ON          the call whose arguments contain STUB_HOLD_ON
+#                                    creates $STUB_HOLD.started and waits for
+#                                    $STUB_HOLD.release (at most 60 s) before answering
+#
+# The synthetic dump stands for pg_dump's custom format: a header line, the data,
+# and a last line with the data's SHA-256. Like the real pg_restore, `--list` reads
+# only the header, and a full read (-f /dev/null, or into a database) fails unless
+# the whole dump is there and intact.
 set -uo pipefail
 
 echo "$*" >>"$STUB_LOG"
 args=" $* "
+
+if [ -n "${STUB_HOLD_ON:-}" ] && [[ $args == *"$STUB_HOLD_ON"* ]]; then
+    touch "$STUB_HOLD.started"
+    for _ in $(seq 600); do
+        [ -e "$STUB_HOLD.release" ] && break
+        sleep 0.1
+    done
+fi
+
+data='rows of every table'
+sum() { printf '%s' "$1" | sha256sum | cut -c1-64; }
+
+# Reads a synthetic dump on standard input in full; status 1 unless it is intact.
+read_dump() {
+    local input header body last
+    input=$(cat)
+    header=$(sed -n 1p <<<"$input")
+    last=$(tail -n 1 <<<"$input")
+    body=$(sed '1d;$d' <<<"$input")
+    if [ "$header" != PGDMP-STUB ] || [ "$last" != "END $(sum "$body")" ]; then
+        echo "pg_restore: error: could not read input file: end of file" >&2
+        return 1
+    fi
+}
 
 case "$args" in
     *" image inspect "*) echo sha256:stub ;;
@@ -32,9 +72,54 @@ case "$args" in
         echo "alembic upgrade diagnostics" >&2
         exit "${STUB_UPGRADE_RC:-0}"
         ;;
-    *" pg_dump "*) echo "synthetic dump" ;;
+    *" pg_dump "*)
+        case "${STUB_DUMP:-valid}" in
+            valid) printf 'PGDMP-STUB\n%s\nEND %s\n' "$data" "$(sum "$data")" ;;
+            truncated) printf 'PGDMP-STUB\n%s\n' "$data" ;;
+            corrupt) printf 'PGDMP-STUB\n%s\nEND %s\n' "${data/rows/rowz}" "$(sum "$data")" ;;
+            fail)
+                printf 'PGDMP-STUB\n'
+                echo "pg_dump: error: connection lost" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *" pg_restore "*"--list "*)
+        [ "$(head -n 1)" = PGDMP-STUB ] || exit 1
+        cat >/dev/null
+        ;;
+    *" pg_restore "*"-f /dev/null "*) read_dump || exit 1 ;;
+    *" pg_restore "*"-d "*)
+        read_dump || exit 1
+        exit "${STUB_RESTORE_RC:-0}"
+        ;;
     *" pg_database "*) echo 0 ;;
-    *" volume inspect "*) exit 1 ;;
+    *" volume inspect "*) [ -n "${STUB_CADDY:-}" ] || exit 1 ;;
+    *" -czf - "*)
+        tree=$(mktemp -d)
+        mkdir -p "$tree/caddy/certificates"
+        echo "certificate and key" >"$tree/caddy/certificates/site.key"
+        case "${STUB_CADDY:-valid}" in
+            valid) tar -czf - -C "$tree" . ;;
+            truncated)
+                tar -czf "$tree.tgz" -C "$tree" .
+                head -c $(($(wc -c <"$tree.tgz") / 2)) "$tree.tgz"
+                rm -f "$tree.tgz"
+                ;;
+            corrupt) echo "not a tar archive" | gzip -c ;;
+            flipped)
+                # A real archive with bytes changed in the middle.
+                head -c 4096 /dev/urandom >"$tree/caddy/certificates/site.crt"
+                tar -czf "$tree.tgz" -C "$tree" .
+                size=$(wc -c <"$tree.tgz")
+                printf '\377\377\377\377' | dd of="$tree.tgz" bs=1 seek=$((size / 2)) conv=notrunc 2>/dev/null
+                cat "$tree.tgz"
+                rm -f "$tree.tgz"
+                ;;
+            fail) rm -rf "$tree"; exit 1 ;;
+        esac
+        rm -rf "$tree"
+        ;;
     *) ;;
 esac
 exit 0
