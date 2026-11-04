@@ -9,6 +9,13 @@
 #   LINUXLAB_OVERRIDES   extra Compose files, separated by ":" (an entry other than
 #                        the default one, or the end-to-end test's override)
 #
+# Only for a project other than linuxlab-prod (the tests' own projects), and refused
+# with linuxlab-prod before anything is done:
+#
+#   LINUXLAB_TEST_LOCK_FILE    lock file instead of /run/linuxlab-ops.lock
+#   LINUXLAB_TEST_BACKUP_RUN   the "<time>-<id>" part of backup names, instead of a
+#                              new one per run (to make two runs collide)
+#
 # Nothing here prints a secret.
 
 set -euo pipefail
@@ -29,6 +36,21 @@ fail() {
 note() {
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >&2
 }
+
+# The production project always uses the fixed lock file, so that no setting can
+# give two operations on it different locks. Tests run on projects of their own,
+# which do not share the production containers, volumes or database.
+PRODUCTION_PROJECT=linuxlab-prod
+LOCK_FILE=/run/linuxlab-ops.lock
+TEST_BACKUP_RUN=''
+if [ "$PROJECT" = "$PRODUCTION_PROJECT" ]; then
+    for name in LINUXLAB_TEST_LOCK_FILE LINUXLAB_TEST_BACKUP_RUN; do
+        [ -z "${!name:-}" ] || fail "$name is for test projects only; refusing it with project $PROJECT"
+    done
+else
+    LOCK_FILE=${LINUXLAB_TEST_LOCK_FILE:-$LOCK_FILE}
+    TEST_BACKUP_RUN=${LINUXLAB_TEST_BACKUP_RUN:-}
+fi
 
 # Git Bash on Windows passes paths to docker in Windows form; elsewhere unchanged.
 host_path() {
@@ -96,7 +118,7 @@ database_name() {
 # descriptor 9, which the scripts migrate.sh starts (backup.sh, restore.sh) inherit:
 # flock on that same open file succeeds at once, so they run under their parent's
 # lock instead of waiting for it. Run on their own, they open the file and take it.
-LOCK_FILE=${LINUXLAB_LOCK_FILE:-/run/linuxlab-ops.lock}
+# The lock file is /run/linuxlab-ops.lock (see LOCK_FILE above).
 take_lock() {
     command -v flock >/dev/null || fail "flock (util-linux) is required"
     if ! { [ -e /dev/fd/9 ] && [ /dev/fd/9 -ef "$LOCK_FILE" ]; }; then
@@ -135,9 +157,30 @@ verify_dump() {
     compose exec -T postgres pg_restore -f /dev/null <"$1"
 }
 
-# Renames PARTIAL to FINAL, its checksum first: a file under its final name always
-# has a checksum, and one without it is refused by restore.sh.
-finish() {
-    mv -- "$2.sha256.partial" "$2.sha256"
-    mv -- "$1" "$2"
+# Gives PARTIAL and FINAL.sha256.partial their final names, FINAL and FINAL.sha256,
+# without ever replacing an existing file, and so that both survive a crash once
+# this returns:
+#   - their content is written to disk first (sync of the two files);
+#   - each name is a hard link (link(2)), which fails if the name exists, in one
+#     step, with no window between a check and the rename; the checksum first, so
+#     that a file under its final name always has one;
+#   - if the second link fails, the checksum just linked is removed, and only if
+#     it is still this run's file (same inode as its partial);
+#   - then the partial names are removed and the directory is written to disk
+#     (sync of the directory), which makes the new names durable.
+# Fails (exit 1) if a final name exists or any step fails; nothing that existed
+# before is changed.
+publish() {
+    local partial=$1 final=$2
+    sync -- "$partial" "$final.sha256.partial" || fail "could not write $partial to disk"
+    ln -T -- "$final.sha256.partial" "$final.sha256" \
+        || fail "could not publish $final.sha256 (an existing file is never replaced)"
+    if ! ln -T -- "$partial" "$final"; then
+        if [ "$final.sha256" -ef "$final.sha256.partial" ]; then
+            rm -f -- "$final.sha256"
+        fi
+        fail "could not publish $final (an existing file is never replaced)"
+    fi
+    rm -f -- "$partial" "$final.sha256.partial"
+    sync -- "$(dirname -- "$final")" || fail "could not write the directory of $final to disk"
 }

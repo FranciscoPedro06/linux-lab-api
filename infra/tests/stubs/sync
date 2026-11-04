@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Wraps the real sync in infra/tests/backup-cases.sh and migrate-cases.sh: records
+# each call in $STUB_LOG, with what exists at that moment, then runs sync itself.
+#   sync <file>.partial ...  "(final absent)" or "(final present)": whether the
+#                            file's final name (without .partial) exists yet
+#   sync <directory>         "(final files: N)": files in it not named .partial
+set -uo pipefail
+
+for arg in "$@"; do
+    case "$arg" in
+        --) ;;
+        *.partial)
+            if [ -e "${arg%.partial}" ]; then state=present; else state=absent; fi
+            echo "sync $arg (final $state)" >>"$STUB_LOG"
+            ;;
+        *)
+            if [ -d "$arg" ]; then
+                echo "sync $arg (final files: $(find "$arg" -maxdepth 1 -type f ! -name '*.partial' | wc -l))" >>"$STUB_LOG"
+            else
+                echo "sync $arg" >>"$STUB_LOG"
+            fi
+            ;;
+    esac
+done
+PATH=/usr/bin:/bin exec sync "$@"

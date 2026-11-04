@@ -174,7 +174,7 @@ expect_ok "deployment compose ($entry): published ports, one API process trustin
 
 echo "== start, with the operation scripts"
 overrides=("${deployment_files[@]:1}" "${test_files[@]}")
-export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project LINUXLAB_LOCK_FILE=$work/ops.lock
+export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project LINUXLAB_TEST_LOCK_FILE=$work/ops.lock
 LINUXLAB_OVERRIDES=$(IFS=:; echo "${overrides[*]}")
 export LINUXLAB_OVERRIDES
 # The synthetic missions, committed in a throwaway repository like the private one.
