@@ -72,6 +72,33 @@ elif ! reason=$(age_recipients "$recipients" 2>&1 >/dev/null); then
     problem "${reason#error: }"
 fi
 
+# Copies off the host (infra/ops/remote.sh): with BACKUP_REMOTE, rclone of the tested
+# release and a private configuration file. The file is checked, never read or shown.
+# shellcheck source-path=SCRIPTDIR source=../ops/remote.sh
+source "$(dirname "$0")/../ops/remote.sh"
+[ -z "$(value BACKUP_COPY_COMMAND)" ] \
+    || problem "BACKUP_COPY_COMMAND is no longer supported: use BACKUP_REMOTE and BACKUP_RCLONE_CONFIG"
+remote=$(value BACKUP_REMOTE)
+if [ -n "$remote" ]; then
+    check_rclone 2>/dev/null || problem "rclone is missing or is not $RCLONE_VERSION (infra/release/install-rclone.sh)"
+    if ! reason=$(check_remote_settings "$remote" "$(value BACKUP_RCLONE_CONFIG)" 2>&1); then
+        problem "${reason#error: }"
+    fi
+    retries=$(value BACKUP_RETRIES)
+    delay=$(value BACKUP_RETRY_DELAY)
+    if ! reason=$(check_retry_settings "${retries:-5}" "${delay:-30}" 2>&1); then
+        problem "${reason#error: }"
+    fi
+else
+    echo "note  BACKUP_REMOTE is not set: backups stay on this host only (check-labs.sh reports it)" >&2
+    [ -z "$(value BACKUP_LOCAL_RETENTION_DAYS)" ] \
+        || problem "BACKUP_LOCAL_RETENTION_DAYS is set without BACKUP_REMOTE: no backup could be confirmed off the host before removal"
+fi
+max_age=$(value BACKUP_MAX_AGE_HOURS)
+[ -z "$max_age" ] || [[ $max_age =~ ^[1-9][0-9]{0,4}$ ]] || problem "BACKUP_MAX_AGE_HOURS is not a whole number of hours"
+days=$(value BACKUP_LOCAL_RETENTION_DAYS)
+[ -z "$days" ] || [[ $days =~ ^[1-9][0-9]{0,3}$ ]] || problem "BACKUP_LOCAL_RETENTION_DAYS is not a whole number of days from 1 to 9999"
+
 if [ "$failures" -gt 0 ]; then
     echo "$failures problems in $file" >&2
     exit 1

@@ -27,6 +27,8 @@ OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 INFRA_DIR=$(cd "$OPS_DIR/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=age.sh
 source "$OPS_DIR/age.sh"
+# shellcheck source-path=SCRIPTDIR source=remote.sh
+source "$OPS_DIR/remote.sh"
 ENV_FILE=${LINUXLAB_ENV_FILE:-/etc/linuxlab/production.env}
 PROJECT=${LINUXLAB_PROJECT:-linuxlab-prod}
 
@@ -194,8 +196,9 @@ running_image() {
     [ -z "$container" ] || docker inspect --format '{{.Image}}' "$container"
 }
 
-# One operation at a time: backup.sh, restore.sh, migrate.sh and content-sync.sh take
-# the same lock, without waiting, and stop when another one holds it. The lock is held on file
+# One operation at a time: backup.sh, restore.sh, migrate.sh, content-sync.sh,
+# sync-backups.sh and prune-backups.sh take the same lock, without waiting, and stop
+# when another one holds it. The lock is held on file
 # descriptor 9, which the scripts migrate.sh starts (backup.sh, restore.sh) inherit:
 # flock on that same open file succeeds at once, so they run under their parent's
 # lock instead of waiting for it. Run on their own, they open the file and take it.
@@ -205,7 +208,7 @@ take_lock() {
     if ! { [ -e /dev/fd/9 ] && [ /dev/fd/9 -ef "$LOCK_FILE" ]; }; then
         exec 9>>"$LOCK_FILE" || fail "cannot open the lock file $LOCK_FILE"
     fi
-    flock -n 9 || fail "another backup, restore, migration or content sync is running (lock $LOCK_FILE); nothing was done"
+    flock -n 9 || fail "another operation (backup, restore, migration, content sync, sync or prune of backups) is running (lock $LOCK_FILE); nothing was done"
 }
 
 # The SHA-256 of FILE, recorded under NAME (the file's final name, without its

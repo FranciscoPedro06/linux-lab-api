@@ -178,9 +178,19 @@ jobs:
           api/infra/release/install-age.sh "$RUNNER_TEMP/age"
           echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
 
+      # The release of infra/ops/remote.sh, and MinIO with mc for the copies off the host.
+      - name: Install rclone, and MinIO for the tests
+        run: |
+          api/infra/release/install-rclone.sh "$RUNNER_TEMP/rclone"
+          api/infra/tests/install-minio.sh "$RUNNER_TEMP/minio"
+          echo "$RUNNER_TEMP/rclone" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/minio" >> "$GITHUB_PATH"
+
       - name: Show versions
         run: |
           age --version
+          rclone version | head -n 1
+          minio --version | head -n 1
           runsc --version
           docker version --format 'Docker Engine {{.Server.Version}}'
           docker compose version

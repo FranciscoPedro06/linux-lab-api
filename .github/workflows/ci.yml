@@ -167,6 +167,14 @@ jobs:
         run: |
           infra/release/install-age.sh "$RUNNER_TEMP/age"
           echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+      # The release of infra/ops/remote.sh, its archive checked against the recorded
+      # SHA-256; and MinIO with mc, pinned the same way, for the tests only.
+      - name: Install rclone, and MinIO for the tests
+        run: |
+          infra/release/install-rclone.sh "$RUNNER_TEMP/rclone"
+          infra/tests/install-minio.sh "$RUNNER_TEMP/minio"
+          echo "$RUNNER_TEMP/rclone" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/minio" >> "$GITHUB_PATH"
       # Owners, modes, links and filesystems, all real: as this user (its files on
       # ext4), as root (production), and as root in a container (overlayfs). A ramfs
       # and a 1 MiB tmpfs are mounted for the work directory's cases.
@@ -186,6 +194,8 @@ jobs:
         run: infra/tests/migrate-cases.sh
       - name: Check backup.sh, restore.sh and their lock (docker replaced by a stub)
         run: infra/tests/backup-cases.sh
+      - name: Check the copies off the host against a real S3 API (MinIO, rclone)
+        run: infra/tests/remote-cases.sh
       - run: docker build --target prod --tag linuxlab-api:ci .
       - run: docker build --tag linuxlab/lab-base:ci lab-image
       - name: Check what the images contain (no mission content, tests or secrets)

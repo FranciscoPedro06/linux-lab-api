@@ -8,7 +8,10 @@ How to install, update, check, back up and recover the production stack describe
 | `infra/release/check-env.sh` | Checks the environment file, without printing values |
 | `infra/ops/migrate.sh` | Backup, restore test of that backup, then `alembic upgrade head` |
 | `infra/ops/content-sync.sh` | Syncs mission content from a checkout of the private repository at a given commit |
-| `infra/ops/backup.sh` | One package: database dump, Caddy's data and a manifest, each read back in full; copied off the host; removes nothing |
+| `infra/ops/backup.sh` | One package: database dump, Caddy's data and a manifest, each read back in full; encrypted; copied off the host and read back there; removes nothing |
+| `infra/ops/sync-backups.sh` | Copies off the host the backups that have no receipt yet, without a new dump |
+| `infra/ops/prune-backups.sh` | Removes old local backups whose copy off the host it reads back first; disabled unless configured |
+| `infra/ops/backup-status.sh` | Reports the copies off the host: latest receipt, its age, pending backups, failures; changes nothing |
 | `infra/ops/restore.sh` | Restores a package's database into a new database and compares it with the manifest; drops it afterwards unless `--keep` |
 | `infra/ops/check-labs.sh` | Compares lab containers with the database, checks disk, memory and the API's log; changes nothing |
 | `infra/tests/e2e.sh` | The end-to-end checks on a disposable project ([deployment.md](deployment.md#checking-a-release)) |
@@ -23,7 +26,8 @@ None of these is made yet, and none is assumed by the configuration:
 | Domain and DNS | An `A` record for the site. No `AAAA` record until IPv6 has been checked on the host ([deployment.md](deployment.md#client-addresses)) |
 | SSH access | Keys only, no password or root login, from known addresses where the provider allows it |
 | Firewall | The provider's firewall: 80 and 443 open, SSH restricted, everything else closed. Docker's published ports bypass a host firewall such as ufw, so the host firewall alone is not enough |
-| Backup destination | Somewhere off the host, encrypted, with its own credentials ([Backups](#backups)) |
+| Backup destination | S3-compatible storage off the host, reached with rclone: provider, bucket, a credential limited to create and read under one prefix, versioning or Object Lock, lifecycle rules ([Copies off the host](#copies-off-the-host)) |
+| Local retention | Days a backup stays on the host once its copy off the host is confirmed; none until decided ([Local retention](#local-retention)) |
 | Access to the private content | How the host gets a checkout of `linux-lab-content` ([Syncing mission content](#syncing-mission-content)). The beta must not open before this is decided and tested |
 | `LAB_CAPACITY` | Sized to the chosen VM |
 
@@ -118,11 +122,11 @@ A file never replaces another. Final names are given with a hard link (`ln`, the
 
 Writing to disk: before the names are given, the content of the file and of its checksum is written to disk (`sync` of the two files, an `fsync` of each); after, the directory is (`sync` of the directory), which makes the new names durable. Once `backup.sh` has reported a file, a power loss or crash does not take it back. A crash before that point leaves, at worst, partial files or a checksum without its file, or loses the new names altogether; a final name, once it survives, always points to content already on disk. `restore.sh` refuses a partial file and a dump without its checksum, so a crash costs that backup, never an earlier one, and never makes a damaged file pass for a backup. This relies on the disk honoring flushes (a write cache without power protection that ignores them defeats any `fsync`).
 
-It runs `BACKUP_COPY_COMMAND` on each file to copy it off the host, and reports when that is not set or fails (exit status other than 0). Its exit status is all that is known of the copy: nothing checks that the file arrived intact. The command runs without the lock's file descriptor, so a process it leaves running (an ssh master connection, a daemon) does not keep the lock after `backup.sh` ends. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration, with `backup.sh --restore-test`: the package is restored into a new database and compared with its manifest before it is encrypted, and a package that does not restore is not written.
+When `BACKUP_REMOTE` is set, `backup.sh` then copies the package, its checksum and a receipt off the host and reads each back in full ([Copies off the host](#copies-off-the-host)); a copy that cannot be confirmed leaves the backup on the host, pending, and the exit status is 1. Without `BACKUP_REMOTE` it says that the backup exists on this host only. `BACKUP_COPY_COMMAND`, an arbitrary command of earlier versions, is refused: no script runs a configurable command. `migrate.sh` takes a backup labeled `pre-migrate-<api commit>` before every migration, with `backup.sh --restore-test`: the package is restored into a new database and compared with its manifest before it is encrypted, and a package that does not restore is not written.
 
-**No backup is removed automatically.** Removal by age is suspended until copies off the host are verified (download and checksum comparison), so that the last good backup on the host is never removed on the strength of a copy command's exit status. Every run reports how many backup files `BACKUP_DIR` holds; the operator removes old ones by hand after checking that a copy of a newer backup is intact off the host. `BACKUP_KEEP_DAYS` is not applied.
+**`backup.sh` removes no backup.** Old backups are removed from the host only by `prune-backups.sh`, which is disabled until `BACKUP_LOCAL_RETENTION_DAYS` is set, and then removes a backup only after reading its copy off the host back in full ([Local retention](#local-retention)). `BACKUP_KEEP_DAYS` is not applied.
 
-`backup.sh`, `restore.sh`, `migrate.sh` and `content-sync.sh` take the same lock (`flock` on `/run/linuxlab-ops.lock`) without waiting: while one runs, the others stop at once with exit status 1 and change nothing. `migrate.sh` holds the lock for its whole run, and the `backup.sh` and `restore.sh` it starts run under it (they inherit it). `flock` comes with util-linux on the host.
+`backup.sh`, `restore.sh`, `migrate.sh`, `content-sync.sh`, `sync-backups.sh` and `prune-backups.sh` take the same lock (`flock` on `/run/linuxlab-ops.lock`) without waiting: while one runs, the others stop at once with exit status 1 and change nothing. `migrate.sh` holds the lock for its whole run, and the `backup.sh` and `restore.sh` it starts run under it (they inherit it). `flock` comes with util-linux on the host.
 
 The lock file of the production project (`linuxlab-prod`) is fixed: no setting changes it. The tests run the scripts on projects of their own, with their own containers and database, and use two variables that only those projects accept: `LINUXLAB_TEST_LOCK_FILE` (a lock file in the test's directory) and `LINUXLAB_TEST_BACKUP_RUN` (a fixed `<time>-<id>`, to make two runs collide). With the production project, either one makes every operation script stop before doing anything. Neither belongs in the environment file or a cron line.
 
@@ -132,12 +136,18 @@ Cron on the host, as root. A failure, including a backup refused because another
 15 3 * * *  root  /var/lib/linuxlab/src/linux-lab-api/infra/ops/backup.sh <release file> >>/var/log/linuxlab-backup.log 2>&1 || logger -p user.err -t linuxlab "backup failed, see /var/log/linuxlab-backup.log"
 ```
 
-This only records the failure on the host. Getting it to the operator (mail, a monitoring service) is part of provisioning the host and is not set up by this repository.
+A backup whose copy off the host failed is pending; a second line retries pending backups later in the day, without a new dump (an example, not installed by anything here):
+
+```
+15 9 * * *  root  /var/lib/linuxlab/src/linux-lab-api/infra/ops/sync-backups.sh >>/var/log/linuxlab-backup.log 2>&1 || logger -p user.err -t linuxlab "backup sync failed, see /var/log/linuxlab-backup.log"
+```
+
+This only records the failure on the host, in its syslog. Getting it to the operator (mail, a monitoring service) is part of provisioning the host and is not set up by this repository: no notification channel exists yet.
 
 What the backups hold: accounts (email, display name, Argon2id hashes), session token hashes, labs, validation runs, progress, mission versions (with solutions) and the **command history, which stores what students typed, secrets included, with no redaction** ([architecture.md](architecture.md#privacy)). So:
 
-- packages are encrypted, readable only with the operator's or the recovery key, neither of which is on the host. Copies off the host are not verified yet: until they are, `BACKUP_COPY_COMMAND` stays empty, and the destination's credentials must not be the host's;
-- retention is to be decided with the destination (proposal: 30 days off the host); on the host nothing is removed automatically for now (see above);
+- packages are encrypted, readable only with the operator's or the recovery key, neither of which is on the host; only encrypted packages, their checksums and receipts leave the host. The host's credential for the destination can create and read objects under its prefix, never delete them;
+- retention off the host is the destination's (versioning, Object Lock, lifecycle rules), to be decided with it; on the host nothing is removed until `BACKUP_LOCAL_RETENTION_DAYS` is decided and set;
 - the history is kept as long as the lab's row, which is removed only with its user: there is no retention job for it yet. Deleting a user's data means deleting the user, and backups keep it until they expire;
 - the history is not a place for secrets, and the web page tells students so; operators must not present it otherwise.
 
@@ -160,6 +170,88 @@ One recipient per line; lines starting with `#` and blank lines are ignored. `ba
 
 **Rotation.** A change of the recipients file applies to backups made after it; nothing is decrypted or encrypted again. Each backup needs one of the keys it was encrypted to, so a private key is kept as long as any backup encrypted only to it, and those to its pair, are kept. To add or replace a key: make the new key away from the host; add its public key to the recipients file (keeping the others); run a backup, copy it to the operator's machine and check there that the new key decrypts it (`age --decrypt -i <new key> -o /dev/null <package>`), never on the host; only then remove an old public key from the file, and keep the old private key until the last backup that needs it has expired.
 
+### Copies off the host
+
+With `BACKUP_REMOTE` set, every backup is copied to S3-compatible storage with [rclone](https://rclone.org) (`RCLONE_VERSION` in `infra/ops/remote.sh`, installed by `infra/release/install-rclone.sh`, which refuses an archive whose SHA-256 is not the recorded one; CI installs and tests that release). The scripts call `rclone` itself, with each argument separate, never through a shell and never with a configurable command, and without the lock's file descriptor, so that nothing rclone leaves running keeps the lock.
+
+Settings:
+
+| Setting | Meaning |
+|---|---|
+| `BACKUP_REMOTE` | `remote:bucket/prefix`: a remote of the rclone configuration, then the bucket and the prefix. Letters, digits, `.`, `_`, `-` and `/` only, no `..`; anything else is refused before a backup starts |
+| `BACKUP_RCLONE_CONFIG` | rclone's configuration file, with the credential. Checked as identity files are ([Restoring](#restoring)): a regular file, not a link, root's, mode 0600 or 0400, in directories only root can change. No script reads it except rclone, or prints it |
+| `BACKUP_RETRIES`, `BACKUP_RETRY_DELAY` | Attempts at a copy (default 5) and seconds before the second (default 30), doubled before each one after |
+| `BACKUP_MAX_AGE_HOURS` | Age of the latest confirmed copy after which `check-labs.sh` and `backup-status.sh` report it (default 26) |
+| `BACKUP_LOCAL_RETENTION_DAYS` | [Local retention](#local-retention); empty: disabled |
+
+The remote is of type `s3` (any S3-compatible provider). The configuration names the endpoint and the credential, for example (placeholders, not an account):
+
+```
+[offsite]
+type = s3
+provider = Other
+access_key_id = <key id>
+secret_access_key = <secret>
+endpoint = https://<provider endpoint>
+```
+
+**The credential.** The host needs to create objects under the prefix and to read them back, since every copy is checked by reading it: it cannot be write-only. It needs nothing else, and is given nothing else: no listing, no deletion, no bucket administration (the scripts pass `--s3-no-check-bucket`, so rclone never tries to create the bucket). As an S3 policy, with the bucket and prefix of `BACKUP_REMOTE`:
+
+```json
+{"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+  "Action": ["s3:PutObject", "s3:GetObject"],
+  "Resource": ["arn:aws:s3:::<bucket>/<prefix>/*"]}]}
+```
+
+Without the right to list, S3 answers a read of a missing object with "access denied", as for an object that cannot be read: the scripts treat both as "not there or not readable" and upload, and the upload is what decides.
+
+**What is copied, and how it is confirmed.** For a backup `linuxlab-<...>.tar.age`, three objects under the prefix, in this order, each confirmed before the next:
+
+1. the package; 2. its `.sha256`; 3. its receipt, `linuxlab-<...>.tar.age.receipt.json`.
+
+Each object is first read: if it is there with the same bytes (an earlier attempt), it is not uploaded again; if it is there with other bytes, nothing is overwritten, the copy is a conflict, it is not retried, and a person must look. Otherwise it is uploaded (`rclone copyto` with `If-None-Match: *`, a conditional write the server refuses when the object exists, in one request: `--s3-upload-cutoff 5G`, so a file over 5 GiB is not copied and reported instead) and then read back in full (`rclone cat`, streamed through SHA-256 and a byte count, with `pipefail`): the copy is confirmed only when the bytes read and their SHA-256 are those of the file on the host. Neither rclone's exit status, nor the size a `HEAD` request gives, nor an ETag, nor the object's existence counts. A read that fails, or is cut, is not a confirmation.
+
+The receipt is written once the package and its checksum are confirmed, uploaded and read back the same way, and only then published next to the backup on the host, as backups are (written to disk, given its name by a hard link that never replaces a file). It holds no credential, key or manifest content:
+
+```json
+{
+  "format_version": 1,
+  "backup_id": "20261104T031500Z-0123456789abcdef-scheduled",
+  "object": "linuxlab-20261104T031500Z-0123456789abcdef-scheduled.tar.age",
+  "size": 104857,
+  "sha256": "<SHA-256 of the package>",
+  "checksum_object": "linuxlab-20261104T031500Z-0123456789abcdef-scheduled.tar.age.sha256",
+  "checksum_sha256": "<SHA-256 of the checksum file>",
+  "destination": "offsite:linuxlab-backups/host",
+  "rclone_version": "v1.75.2",
+  "verified_at": "2026-11-04T03:15:20Z",
+  "status": "verified"
+}
+```
+
+A backup without a receipt on the host is **pending**: not confirmed off the host, for any purpose. A copy that cannot be confirmed (no connection, a timeout, an upload or a read cut, an object missing after its upload) is retried `BACKUP_RETRIES` times; after the last attempt, or at once on a conflict, `<backup>.push-failed` records when and why, the backup stays on the host unchanged, and the exit status is 1. Nothing on the host is ever removed or changed by a failed copy.
+
+`sync-backups.sh` copies the pending backups of `BACKUP_DIR` the same way, without a dump or any call to Docker. Running it again is safe: a backup with a receipt is skipped, objects already there and identical are recognised and not uploaded again, the receipt left off the host by an interrupted run is used when it matches, and a conflicting object stays a conflict.
+
+`backup-status.sh` reports, from the host's files only: the latest receipt and its age, pending backups, failed copies, receipts that cannot be read or do not match their backup, and the free space of `BACKUP_DIR`; `check-labs.sh` reports the same ([Checking labs](#checking-labs)). A receipt says that a copy was confirmed when it was written, not that it is still there.
+
+**What depends on the destination.** These are not guarantees of rclone or of these scripts, and must be checked with the chosen provider:
+
+- refusing a conditional write (`If-None-Match: *`) on an existing object. AWS S3 and MinIO do (tested here with MinIO); a provider that ignores the header would let a second upload replace an object, which the read that follows would then report as a conflict, after the fact;
+- that an interrupted upload leaves no object (true of a single-request upload on S3 and MinIO);
+- keeping what was written: the host cannot delete, but anyone holding another credential of the bucket can. Versioning, or Object Lock in compliance mode with a retention period, protects the copies from deletion and replacement; lifecycle rules remove them after the retention the operator decides. None of these is set up by this repository; the retention off the host and the bucket's credentials (other than the host's) are the operator's.
+
+No script deletes anything off the host.
+
+### Local retention
+
+`prune-backups.sh` removes backups from `BACKUP_DIR` once they are older than `BACKUP_LOCAL_RETENTION_DAYS` days (by the time in their name) and confirmed off the host now. It is disabled until that setting is given; no number of days is assumed. A backup is removed (its package and checksum; the receipt stays, as the record of where the backup is) only if:
+
+- it has a receipt on the host, and is not the newest backup that has one: the latest confirmed backup always stays on the host, however old;
+- its package, checksum and receipt are each read back in full from the destination, during this run, and match the files on the host. A receipt on the host alone is not enough: the copy may have been lost since.
+
+A pending backup is never removed. Every candidate is confirmed before any is removed: one that cannot be read back (the destination unreachable, an object missing, changed or cut) suspends the whole run, nothing is removed, and the exit status is 1. With `BACKUP_REMOTE` unset it refuses to run.
+
 ## Restoring
 
 Test a backup regularly (monthly, and after every change to the database):
@@ -174,6 +266,13 @@ rm -rf /run/linuxlab-key
 The private key is needed only for the restore: the operator pastes it into a file on `/run`'s tmpfs (`cat` reads it until Ctrl-D), restores, and removes it; it never goes to the host's disk. Before age reads any key file, `restore.sh` requires it to be a regular file, not a link, owned by the user running it (root), with no permission at all for its group or others (0600 or 0400), in a directory nobody else can change, checked as for the recipients file: the commands above make it so. `--identity-file` can be given more than once; keys are never read from the environment, and never printed.
 
 It restores the package's database into a new database `restore_<time>` on the same PostgreSQL, never into an existing one, prints the row counts next to the database in use, and drops it. Before creating anything it requires the package's `.sha256` next to it and matching the encrypted bytes, an age file, and age to decrypt all of it into a run directory of the work directory; age writes what it has decrypted before it reaches a damaged chunk and then fails, so its output is used only once it has exited with success, and is removed in any case. Then it checks the package with `package.py` (layout, manifest, each component's size and SHA-256) while unpacking it there, reads the dump in full, and requires a server of the dump's major version or later; a package that fails any of these is refused. Everything decrypted is removed when the restore ends, whatever the reason. After the restore, the Alembic revision, the schema fingerprint and the missions' fingerprint must be those of the manifest, or the restore fails and the new database is dropped. The only optional argument is `--keep`; any other is refused before anything is done. Only encrypted packages are restored: an unencrypted package (`.tar`) or a bare dump of an earlier version of `backup.sh` is refused.
+
+From the copy off the host, when the files on the host are gone: fetch the package and its checksum with any credential that can read the prefix (the host's can), into one directory, and restore from there; `restore.sh` checks the checksum as above. `infra/tests/e2e.sh` does this against MinIO on every run:
+
+```sh
+rclone --config /etc/linuxlab/rclone.conf --s3-no-check-bucket cat --no-traverse offsite:<bucket>/<prefix>/<name>.tar.age >/var/backups/linuxlab/recovered/<name>.tar.age
+rclone --config /etc/linuxlab/rclone.conf --s3-no-check-bucket cat --no-traverse offsite:<bucket>/<prefix>/<name>.tar.age.sha256 >/var/backups/linuxlab/recovered/<name>.tar.age.sha256
+```
 
 Caddy's data is checked with the package but no script restores it yet: on a new host, it would be extracted from the package (`caddy/caddy-data.tar.gz`) into the new deployment's `caddy-data` volume before Caddy starts.
 
@@ -200,6 +299,7 @@ This is not a rollback without loss: **everything written after the dump is gone
 | Terminating or failed for more than 3 minutes | Removal is not completing | Look at the API's log (`lab removal failed`) and at Docker |
 | API not healthy, reconciliation errors in the last hour | The reaper may not be running | Look at the API's log |
 | Disk over 85 %, less than 512 MB of memory available | No room for another lab | Lower `LAB_CAPACITY` or free space |
+| Backups: `BACKUP_REMOTE` not set, no valid receipt, the latest confirmed copy older than `BACKUP_MAX_AGE_HOURS`, backups without a receipt, a failed copy, a receipt that does not match its backup | Backups are not (all) confirmed off the host | The operator: `backup-status.sh`, the backup log, `sync-backups.sh` ([Copies off the host](#copies-off-the-host)) |
 
 It never removes or changes anything, and exits 1 when something needs attention. Cron, every 10 minutes:
 
