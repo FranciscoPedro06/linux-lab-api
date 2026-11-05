@@ -117,10 +117,20 @@ remote_fetch() {
 # remote_put FILE NAME: uploads FILE as NAME. The write is conditional (If-None-Match:
 # *): the server refuses it when NAME exists, so nothing there is ever replaced. On a
 # backend that ignores the condition, see docs/operations.md#copies-off-the-host.
-# One PUT request whatever the size (--s3-upload-cutoff at S3's limit for one
-# request, 5 GiB): the condition is tested on that request only, not on multipart
-# uploads, and an interrupted PUT leaves no object.
-REMOTE_MAX_BYTES=$((5 * 1024 * 1024 * 1024))
+# Always one PUT request (--s3-upload-cutoff 5G, above REMOTE_MAX_BYTES): the
+# condition is tested on that request only, not on multipart uploads, and an
+# interrupted PUT leaves no object. No multipart upload is ever made.
+#
+# REMOTE_MAX_BYTES: the largest file uploaded, 5,000,000,000 bytes, within what one
+# PUT request may carry on S3 and the providers that follow it (5 GB; some count
+# it in decimal units). A larger file is refused before any upload.
+REMOTE_MAX_BYTES=5000000000
+
+# remote_size_allowed BYTES: status 0 when a file of BYTES bytes may be uploaded.
+remote_size_allowed() {
+    [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -le "$REMOTE_MAX_BYTES" ]
+}
+
 remote_put() {
     rclone_run copyto --no-check-dest --s3-upload-cutoff 5G --header-upload "If-None-Match: *" \
         -- "$1" "$REMOTE/$2"
@@ -138,8 +148,8 @@ local_hash() {
 # overwritten and is not retried; a person must look.
 put_verified() {
     local file=$1 name=$2 expected found
-    if [ "$(stat -c %s -- "$file")" -gt "$REMOTE_MAX_BYTES" ]; then
-        note "$name: larger than 5 GiB, the most one upload request takes; not uploaded (docs/operations.md#copies-off-the-host)"
+    if ! remote_size_allowed "$(stat -c %s -- "$file")"; then
+        note "$name: larger than $REMOTE_MAX_BYTES bytes, the most one upload request takes; not uploaded (docs/operations.md#copies-off-the-host)"
         return 2
     fi
     expected=$(local_hash "$file")
