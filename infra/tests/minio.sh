@@ -30,6 +30,8 @@ minio_start() {
         curl -fsS "http://127.0.0.1:$MINIO_PORT/minio/health/ready" >/dev/null 2>&1 && break
         sleep 0.2
     done
+    curl -fsS "http://127.0.0.1:$MINIO_PORT/minio/health/ready" >/dev/null \
+        || { echo "error: MinIO did not start (see $dir/minio.log)" >&2; return 1; }
     mc alias set admin "http://127.0.0.1:$MINIO_PORT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null
     mc mb admin/backups >/dev/null
     printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":["arn:aws:s3:::backups/host/*"]}]}' \
