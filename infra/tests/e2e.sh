@@ -540,9 +540,11 @@ table_sums() {
                    E'\n', '', tablename), false, true, '')))[1]::text
         FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
 }
+# The schema as pg_dump writes it, without the random key of its \restrict and
+# \unrestrict lines (new in each dump).
 schema_of() {
     compose exec -T postgres pg_dump -U linuxlab -d "$1" --schema-only --no-owner \
-        | grep -v -e '^\restrict ' -e '^\unrestrict '
+        | sed '/^.restrict /d; /^.unrestrict /d'
 }
 table_sums linuxlab >"$work/original.sums"
 schema_of linuxlab >"$work/original.schema"
@@ -584,8 +586,9 @@ target=$(sed -n 's/^restored \(restore_[0-9]*\):$/\1/p' "$work/recovery-restore.
 expect_ok "restore.sh: restored into a new database, matching the manifest" \
     test "$restored_ok" = 0 -a -n "$target"
 if [ -n "$target" ]; then
-    expect_ok "  its schema is the original's" \
-        cmp -s "$work/original.schema" <(schema_of "$target")
+    schema_of "$target" >"$work/restored.schema"
+    expect_ok "  its schema is the original's" cmp -s "$work/original.schema" "$work/restored.schema"
+    diff "$work/original.schema" "$work/restored.schema" | head -n 20 || true
     expect_ok "  every table's content is the original's ($(wc -l <"$work/original.sums") tables)" \
         cmp -s "$work/original.sums" <(table_sums "$target")
     compose exec -T postgres psql -X -q -U linuxlab -d postgres -c "DROP DATABASE $target" >/dev/null

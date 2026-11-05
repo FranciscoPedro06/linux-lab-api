@@ -105,6 +105,16 @@ relay() { echo "$*" >"$work/relay.mode"; }
 relay pass
 python3 "$work/relay.py" "$relay_port" "$MINIO_PORT" "$work/relay.mode" &
 pids+=($!)
+# Until the relay listens: MinIO's health, through it.
+for _ in $(seq 100); do
+    curl -fsS "http://127.0.0.1:$relay_port/minio/health/ready" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+curl -fsS "http://127.0.0.1:$relay_port/minio/health/ready" >/dev/null \
+    || { echo "error: the relay to MinIO does not answer" >&2; exit 1; }
+# Before the first case runs a script.
+: >"$work/out"
+: >"$work/err"
 
 # The host's rclone configuration: this credential, through the relay. Private, as
 # remote.sh requires.
