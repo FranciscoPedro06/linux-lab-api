@@ -175,7 +175,7 @@ check() {
         echo "FAIL  $check_name" >&2
         sed 's/^/      out: /' "$work/out" >&2
         sed 's/^/      err: /' "$work/err" >&2
-        tail -n 5 "$STUB_LOG" | sed "s/^/      call: /" >&2
+        tail -n 5 "$STUB_LOG" 2>/dev/null | sed "s/^/      call: /" >&2 || true
         failures=$((failures + 1))
     fi
 }
@@ -234,6 +234,49 @@ check "  nor replace an object with a conditional write (If-None-Match: *)" \
     not host_rclone copyto --no-check-dest --header-upload "If-None-Match: *" "$work/other.txt" "$remote/probe.txt"
 check "  which keeps its content" test "$(object probe.txt)" = probe
 drop probe.txt
+
+echo "== the size limit of one upload request (simulated sizes, no large file)"
+# remote.sh's own functions, in a shell of their own: stat answers the size given in
+# SIZE for the small file used, and rclone is a function that records its calls and
+# fails, so that nothing is uploaded either way.
+echo "small" >"$work/sized.tar.age"
+sized() {
+    SIZE=$1 bash -c '
+        set -euo pipefail
+        source "$1/age.sh"
+        source "$1/remote.sh"
+        note() { echo "$*" >&2; }
+        stat() { echo "$SIZE"; }
+        calls="$2.calls"
+        rclone() { echo "rclone $*" >>"$calls"; return 1; }
+        REMOTE=offsite:backups/host REMOTE_CONFIG=/dev/null
+        rc=0
+        put_verified "$2" sized.tar.age || rc=$?
+        exit "$rc"' _ "$ops" "$work/sized.tar.age"
+}
+limit_says() { bash -c 'source "$1/remote.sh"; remote_size_allowed "$2"' _ "$ops" "$1"; }
+check "remote_size_allowed: 5000000000 bytes are allowed" limit_says 5000000000
+check "  5000000001 bytes are not" not limit_says 5000000001
+check "  0 bytes are allowed" limit_says 0
+check "  a size that is not a number is not" not limit_says 12x
+check "  nor an empty one" not limit_says ""
+# run_sized SIZE: sized, with status and output as run gives them (run needs a program).
+run_sized() {
+    rc=0
+    sized "$1" >"$work/out" 2>"$work/err" || rc=$?
+}
+rm -f "$work/sized.tar.age.calls"
+run_sized 5000000001
+check "put_verified, 5000000001 bytes: refused (status 2, not retried)" test "$rc" = 2
+check "  before any call to rclone (no read, no upload)" test ! -e "$work/sized.tar.age.calls"
+check "  and says why" err_says "larger than 5000000000 bytes"
+rm -f "$work/sized.tar.age.calls"
+run_sized 5000000000
+check "put_verified, 5000000000 bytes: goes on to the upload (status 1 here: the stand-in rclone fails)" \
+    test "$rc" = 1
+check "  rclone was called for the upload, as one request" \
+    grep -q -- "copyto --no-check-dest --s3-upload-cutoff 5G" "$work/sized.tar.age.calls"
+rm -f "$work/sized.tar.age" "$work/sized.tar.age.calls"
 
 echo "== backup.sh: a backup confirmed off the host"
 reset
