@@ -13,6 +13,10 @@
 # --runtime runc is for hosts without gVisor (Docker Desktop); it also runs the API
 # with ENVIRONMENT=development, which is what allows runc. Everything is removed at
 # the end unless --keep. Never run it with the production project name.
+#
+# Needs age and rclone (infra/release/install-age.sh, install-rclone.sh), minio and
+# mc (infra/tests/install-minio.sh) on the PATH: backups are copied to a MinIO
+# server of the run, and one is recovered from it.
 set -euo pipefail
 # Git Bash on Windows rewrites arguments that look like paths: container paths
 # must reach docker as written, and host paths go through host_path.
@@ -24,7 +28,7 @@ while [ $# -gt 0 ]; do
         --entry) entry=$2; shift 2 ;;
         --runtime) runtime=$2; shift 2 ;;
         --keep) keep=true; shift ;;
-        -*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -*) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) release=$1; shift ;;
     esac
 done
@@ -54,6 +58,14 @@ mkdir -m 700 "$work/keys"
 # Unencrypted packages exist only in memory (infra/ops/lib.sh): /dev/shm is a tmpfs.
 memory=$(mktemp -d /dev/shm/linuxlab-e2e.XXXXXX)
 for key in operator recovery stranger; do age-keygen -o "$work/keys/$key.key" 2>/dev/null; done
+# Copies off the host go to a MinIO server of this run (infra/tests/minio.sh), with
+# the credential a host gets: PutObject and GetObject under backups/host/ only.
+# shellcheck source-path=SCRIPTDIR source=minio.sh
+source "$here/minio.sh"
+minio_start "$work/minio"
+mkdir -m 700 "$work/conf"
+rclone_config="$work/conf/rclone.conf"
+minio_rclone_config "$rclone_config" "$MINIO_PORT"
 { age-keygen -y "$work/keys/operator.key"; age-keygen -y "$work/keys/recovery.key"; } >"$work/keys/recipients.txt"
 random() { docker run --rm --network none --entrypoint python "$api_image" -c "import secrets; print(secrets.token_hex($1))"; }
 invite=$(random 16)
@@ -77,6 +89,10 @@ E2E_ENVIRONMENT=$([ "$runtime" = runsc ] && echo production || echo development)
 BACKUP_DIR=$work/backups
 BACKUP_AGE_RECIPIENTS_FILE=$work/keys/recipients.txt
 BACKUP_WORK_DIR=$memory/work
+BACKUP_REMOTE=offsite:backups/host
+BACKUP_RCLONE_CONFIG=$rclone_config
+BACKUP_RETRIES=2
+BACKUP_RETRY_DELAY=1
 EOF
     # Clients are always on 172.31.0.0/24: the public network, or the agent's egress.
     if [ "$entry" = direct ]; then
@@ -116,6 +132,7 @@ cleanup() {
         echo "kept project $project; env file $env_file"
     fi
     rm -rf "$memory"
+    kill "$MINIO_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -339,8 +356,9 @@ expect_ok "Caddy access log redacts cookies" grep -q '"Cookie":\["REDACTED"\]' <
 
 echo "== backups"
 package=$("$repo/infra/ops/backup.sh" "$release" e2e 2>"$work/backup.log")
-expect_ok "backup.sh wrote one encrypted package and its checksum, nothing else" \
-    test -s "$package" -a -s "$package.sha256" -a "$(find "$work/backups" -maxdepth 1 -name '*-e2e.*' | wc -l)" = 2
+expect_ok "backup.sh wrote one encrypted package, its checksum and its receipt, nothing else" \
+    test -s "$package" -a -s "$package.sha256" -a -s "$package.receipt.json" \
+    -a "$(find "$work/backups" -maxdepth 1 -name '*-e2e.*' | wc -l)" = 3
 expect_ok "  named .tar.age, an age file" \
     test "${package%.tar.age}" != "$package" -a "$(head -c 21 "$package")" = "age-encryption.org/v1"
 expect_ok "  its checksum is of the encrypted bytes" \
@@ -350,7 +368,7 @@ only_encrypted() {
     for file in "$work"/backups/*; do
         case "$file" in
             *.tar.age) [ "$(head -c 21 "$file")" = "age-encryption.org/v1" ] || return 1 ;;
-            *.tar.age.sha256) ;;
+            *.tar.age.sha256 | *.tar.age.receipt.json) ;;
             *) return 1 ;;
         esac
     done
@@ -363,8 +381,18 @@ if [ "$(uname -s)" = Linux ]; then
 else
     echo "skip  backup file modes: not checkable on $(uname -s)"
 fi
-expect_ok "backup.sh reported that nothing was copied off the host" \
-    grep -q "BACKUP_COPY_COMMAND not set" "$work/backup.log"
+expect_ok "backup.sh confirmed it off the host: uploaded to MinIO and read back in full" \
+    grep -q "$(basename "$package"): confirmed off the host" "$work/backup.log"
+expect_ok "  the package in MinIO has the same bytes" \
+    test "$(mc cat "admin/backups/host/$(basename "$package")" | sha256sum | cut -c1-64)" = "$(sha256sum <"$package" | cut -c1-64)"
+without_receipt() {
+    local file
+    for file in "$work"/backups/*.tar.age; do
+        [ -e "$file.receipt.json" ] || echo "$file"
+    done
+}
+expect_ok "  every backup of the run has its receipt (the migrations' included)" \
+    test -z "$(without_receipt)"
 expect_ok "backup.sh left no partial file or directory" \
     test -z "$(find "$work/backups" -mindepth 1 -maxdepth 1 -name '*.partial')"
 decrypt_with() { age --decrypt --identity "$work/keys/$1.key" --output "$2" "$package"; }
@@ -489,12 +517,86 @@ expect_fails "restore.sh refuses a package whose dump changed after the manifest
     restore "$work/moved/changed-dump.tar.age" "${key[@]}"
 rm "$moved.sha256"
 expect_fails "restore.sh refuses a package without its checksum" restore "$moved" "${key[@]}"
-printf 'corrupt' >>"$package"
-expect_fails "restore.sh refuses a package that does not match its checksum" restore "$package" "${key[@]}"
+cp "$package" "$work/moved/corrupt.tar.age"
+(cd "$work/moved" && sha256sum corrupt.tar.age >corrupt.tar.age.sha256)
+printf 'corrupt' >>"$work/moved/corrupt.tar.age"
+expect_fails "restore.sh refuses a package that does not match its checksum" restore "$work/moved/corrupt.tar.age" "${key[@]}"
 expect_ok "after the refusals, the database in use is as it was, no restore database or decrypted file is left" \
     in_use_untouched
 no_private_key_in_logs() { ! grep -rq AGE-SECRET-KEY "$work"/*.log; }
 expect_ok "no private key in any log of the backups and restores" no_private_key_in_logs
+
+echo "== recovery from the copy off the host (MinIO)"
+# A backup confirmed in MinIO; every file of it removed here; then only what MinIO
+# holds: downloaded with the host's credential, its checksum checked, decrypted with
+# the recovery key, the package checked, restored into a new database and compared,
+# table by table, with the database it was taken from. The API is stopped meanwhile,
+# so that the database does not change between the backup and the comparison.
+compose stop api >/dev/null
+table_sums() {
+    compose exec -T postgres psql -X -At -U linuxlab -d "$1" -c "
+        SELECT tablename || ' ' || (xpath('/row/h/text()', query_to_xml(format(
+                   'SELECT md5(coalesce(string_agg(x::text, %L ORDER BY x::text), %L)) AS h FROM public.%I x',
+                   E'\n', '', tablename), false, true, '')))[1]::text
+        FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+}
+schema_of() {
+    compose exec -T postgres pg_dump -U linuxlab -d "$1" --schema-only --no-owner \
+        | grep -v -e '^\restrict ' -e '^\unrestrict '
+}
+table_sums linuxlab >"$work/original.sums"
+schema_of linuxlab >"$work/original.schema"
+recovered=$("$repo/infra/ops/backup.sh" "$release" recovery 2>"$work/recovery-backup.log")
+name=$(basename "$recovered")
+expect_ok "backup.sh: confirmed in MinIO, receipt here" \
+    test -n "$recovered" -a -f "$recovered.receipt.json"
+mc cat "admin/backups/host/$name.receipt.json" >"$work/remote-receipt.json"
+expect_ok "  the receipt in MinIO is the one here" cmp -s "$work/remote-receipt.json" "$recovered.receipt.json"
+rm -f -- "$recovered" "$recovered.sha256" "$recovered.receipt.json"
+expect_ok "  every file of it removed here" test -z "$(find "$work/backups" -name "$name*")"
+mkdir -m 700 "$work/recovered"
+fetch() {
+    rclone --config "$rclone_config" --s3-no-check-bucket cat --no-traverse "offsite:backups/host/$1" >"$work/recovered/$1"
+}
+fetch_all() { fetch "$name" && fetch "$name.sha256" && fetch "$name.receipt.json"; }
+expect_ok "downloaded from MinIO with the host's credential: package, checksum, receipt" fetch_all
+checksum_matches() { (cd "$work/recovered" && sha256sum --check --status "$name.sha256"); }
+expect_ok "  the checksum matches the downloaded package" checksum_matches
+receipt_says() {
+    python3 -c '
+import hashlib, json, os, sys
+receipt, package = sys.argv[1:3]
+r = json.load(open(receipt))
+data = open(package, "rb").read()
+assert r["status"] == "verified" and r["object"] == os.path.basename(package)
+assert r["size"] == len(data) and r["sha256"] == hashlib.sha256(data).hexdigest()
+' "$work/recovered/$name.receipt.json" "$work/recovered/$name"
+}
+expect_ok "  and its size and SHA-256 are the receipt's" receipt_says
+expect_ok "decrypted with the recovery key" \
+    age --decrypt --identity "$work/keys/recovery.key" --output "$work/recovered/package.tar" "$work/recovered/$name"
+expect_ok "  the package checks with package.py" \
+    python3 "$repo/infra/ops/package.py" check "$work/recovered/package.tar"
+rm -f "$work/recovered/package.tar"
+"$repo/infra/ops/restore.sh" "$release" "$work/recovered/$name" --identity-file "$work/keys/recovery.key" --keep \
+    >"$work/recovery-restore.log" 2>&1 && restored_ok=0 || restored_ok=$?
+target=$(sed -n 's/^restored \(restore_[0-9]*\):$/\1/p' "$work/recovery-restore.log")
+expect_ok "restore.sh: restored into a new database, matching the manifest" \
+    test "$restored_ok" = 0 -a -n "$target"
+if [ -n "$target" ]; then
+    expect_ok "  its schema is the original's" \
+        cmp -s "$work/original.schema" <(schema_of "$target")
+    expect_ok "  every table's content is the original's ($(wc -l <"$work/original.sums") tables)" \
+        cmp -s "$work/original.sums" <(table_sums "$target")
+    compose exec -T postgres psql -X -q -U linuxlab -d postgres -c "DROP DATABASE $target" >/dev/null
+fi
+expect_ok "nothing decrypted left anywhere" \
+    test -z "$(find "$work/recovered" "$memory/work" -name '*.tar' -o -name 'run.*' | head -n 1)"
+compose start api >/dev/null
+for _ in $(seq 60); do
+    [ "$(docker inspect --format '{{.State.Health.Status}}' "$(compose ps -q api)")" = healthy ] && break
+    sleep 1
+done
 
 echo "== lab checks"
 for _ in $(seq 60); do

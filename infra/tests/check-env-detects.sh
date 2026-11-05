@@ -118,4 +118,46 @@ else
 fi
 rm -rf "$no_age"
 
+# Copies off the host: BACKUP_REMOTE and its rclone configuration, a synthetic one
+# (no credential of any real account). rclone of the tested release must be on the
+# PATH (infra/release/install-rclone.sh) for the cases that set BACKUP_REMOTE.
+mkdir -m 700 "$work/rclone"
+(umask 077; printf '%s\n' "[offsite]" "type = s3" "provider = Minio" \
+    "access_key_id = synthetic-token" "secret_access_key = synthetic-token" \
+    "endpoint = http://127.0.0.1:9" >"$work/rclone/rclone.conf")
+remote=("BACKUP_REMOTE=offsite:backups/host" "BACKUP_RCLONE_CONFIG=$work/rclone/rclone.conf")
+write remote.env "${good[@]}" "${remote[@]}"
+expect accepted "copies off the host, complete" "$work/remote.env"
+write remote-tuned.env "${good[@]}" "${remote[@]}" BACKUP_RETRIES=3 BACKUP_RETRY_DELAY=10 \
+    BACKUP_MAX_AGE_HOURS=30 BACKUP_LOCAL_RETENTION_DAYS=9
+expect accepted "copies off the host, every setting given" "$work/remote-tuned.env"
+for bad in "BACKUP_REMOTE=offsite:backups/host dir" "BACKUP_REMOTE=offsite:../up" \
+    "BACKUP_REMOTE=offsite:b/\$(id)""BACKUP_REMOTE=-offsite:b" "BACKUP_RCLONE_CONFIG=" \
+    "BACKUP_RCLONE_CONFIG=$work/nowhere.conf" BACKUP_RETRIES=0 BACKUP_RETRY_DELAY=soon \
+    BACKUP_MAX_AGE_HOURS=0 BACKUP_LOCAL_RETENTION_DAYS=seven "BACKUP_COPY_COMMAND=cp -t /x"; do
+    write bad-remote.env "${good[@]}" "${remote[@]}" "$bad"
+    expect refused "copies off the host, ${bad%%=*} '${bad#*=}'" "$work/bad-remote.env"
+done
+write retention-alone.env "${good[@]}" BACKUP_LOCAL_RETENTION_DAYS=9
+expect refused "local retention without BACKUP_REMOTE" "$work/retention-alone.env"
+chmod 644 "$work/rclone/rclone.conf"
+expect refused "rclone configuration readable by others" "$work/remote.env"
+chmod 600 "$work/rclone/rclone.conf"
+ln -s "$work/rclone/rclone.conf" "$work/rclone/link.conf"
+write remote-link.env "${good[@]}" "BACKUP_REMOTE=offsite:backups/host" "BACKUP_RCLONE_CONFIG=$work/rclone/link.conf"
+expect refused "rclone configuration that is a link" "$work/remote-link.env"
+no_rclone=$(mktemp -d)
+for program in dirname stat sed tail head grep sort uniq wc cat tr cut id readlink age; do
+    ln -s "$(command -v "$program")" "$no_rclone/$program"
+done
+if PATH=$no_rclone "$bash" "$check" "$work/remote.env" >"$work/out" 2>&1; then status=accepted; else status=refused; fi
+if [ "$status" = refused ] && grep -q "rclone is missing" "$work/out"; then
+    echo "ok    rclone not installed, BACKUP_REMOTE set: refused"
+else
+    echo "FAIL  rclone not installed: $status" >&2
+    cat "$work/out" >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$no_rclone"
+
 [ "$failures" -eq 0 ]

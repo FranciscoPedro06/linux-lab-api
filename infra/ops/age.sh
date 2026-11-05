@@ -58,20 +58,25 @@ secure_file() {
     done
 }
 
-# age_identity FILE: status 0 when FILE can hold a private key for restore.sh: a
-# secure_file, and no permission at all for its group or others. Never reads it.
-age_identity() {
+# private_file FILE WHAT: status 0 when FILE can hold a secret: a secure_file, no
+# permission at all for its group or others (0600 or 0400), readable. Never reads it.
+private_file() {
     local mode
-    secure_file "$1" "identity file" || return 1
+    secure_file "$1" "$2" || return 1
     mode=$(stat -c %a -- "$1")
     if (((8#$mode & 8#077) != 0)); then
-        echo "error: identity file $1 has mode $mode: its group or others have access; 0600 or 0400" >&2
+        echo "error: $2 $1 has mode $mode: its group or others have access; 0600 or 0400" >&2
         return 1
     fi
     if [ ! -r "$1" ]; then
-        echo "error: identity file $1 is not readable" >&2
+        echo "error: $2 $1 is not readable" >&2
         return 1
     fi
+}
+
+# age_identity FILE: status 0 when FILE can hold a private key for restore.sh.
+age_identity() {
+    private_file "$1" "identity file"
 }
 
 # Status 0 when `age` is on the PATH and is the tested release; says why otherwise.

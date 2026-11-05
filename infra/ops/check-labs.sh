@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compares this deployment's lab containers with the labs PostgreSQL records, and
-# reports what the reaper has not settled, plus disk, memory and errors logged by
-# the API. It never removes or changes anything: the reaper does that, and a
+# reports what the reaper has not settled, plus disk, memory, errors logged by the
+# API and the state of the backups' copies off the host (as backup-status.sh). It never removes or changes anything: the reaper does that, and a
 # container that is not plainly this deployment's is left for a person to look at.
 # See docs/operations.md#checking-labs.
 #
@@ -107,6 +107,13 @@ for path in "$docker_root" "$(setting BACKUP_DIR)"; do
     used=$(df -P "$path" | awk 'NR == 2 {sub("%", "", $5); print $5}')
     [ "$used" -lt "$DISK_WARN_PERCENT" ] || report "disk of $path is $used% full"
 done
+backup_dir=$(setting BACKUP_DIR)
+while IFS= read -r line; do
+    case "$line" in
+        "ATTENTION  "*) report "${line#ATTENTION  }" ;;
+        ?*) echo "$line" ;;
+    esac
+done < <(backup_findings "${backup_dir:-/var/backups/linuxlab}")
 available=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || true)
 if [ -n "$available" ]; then
     # Each lab may take 512 MB.

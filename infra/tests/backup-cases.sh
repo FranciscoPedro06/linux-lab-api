@@ -431,33 +431,23 @@ check "  no package" none 'linuxlab-*.tar*'
 check "  the test database is dropped" called "DROP DATABASE IF EXISTS restore_"
 check "  nothing is left in the work directory" work_empty
 
-echo "== backup.sh: copies off the host and retention"
-reset "BACKUP_COPY_COMMAND=false"
-fixture "$backups/linuxlab-20260101T031500Z-0123456789abcdef-scheduled.tar.age"
-touch -d '30 days ago' "$backups"/linuxlab-20260101T031500Z-*
-backup
-check "a failed copy off the host is a failure" failed
-check "  the failure is reported" err_says "FAILED"
-check "  the old backup and its checksum are still there" \
-    test "$(files 'linuxlab-20260101T031500Z-*' | wc -l)" = 2
-check "  the new package is kept too" test "$(files 'linuxlab-*.tar.age' | wc -l)" = 2
-
+echo "== backup.sh: without a destination off the host, and no removal"
 reset "BACKUP_COPY_COMMAND=cp -t $work/offsite"
-mkdir -p "$work/offsite"
-fixture "$backups/linuxlab-20260101T031500Z-0123456789abcdef-scheduled.tar.age"
-touch -d '30 days ago' "$backups"/linuxlab-20260101T031500Z-*
 backup
-check "a successful copy is a success" succeeded
-check "  the encrypted package and its checksum, and only they, were copied" \
-    test "$(find "$work/offsite" -type f | sed 's/.*\.tar\.age/X/' | sort -u | tr '\n' ,)" = "X,X.sha256,"
-check "  an old backup is not removed on the copy command's word alone" \
-    test "$(files 'linuxlab-20260101T031500Z-*' | wc -l)" = 2
-check "  the removal is reported as suspended" err_says "suspended"
+check "BACKUP_COPY_COMMAND is refused: no configurable copy command" failed
+check "  and says what replaces it" err_says "BACKUP_REMOTE"
+check "  before any dump" not_called "pg_dump -U"
+check "  no package" none 'linuxlab-*.tar*'
 
 reset
+fixture "$backups/linuxlab-20260101T031500Z-0123456789abcdef-scheduled.tar.age"
+touch -d '30 days ago' "$backups"/linuxlab-20260101T031500Z-*
 backup
-check "without BACKUP_COPY_COMMAND the backup succeeds" succeeded
-check "  and says it is on this host only" err_says "BACKUP_COPY_COMMAND not set"
+check "without BACKUP_REMOTE the backup succeeds" succeeded
+check "  and says it is on this host only" err_says "BACKUP_REMOTE not set: this backup exists on this host only"
+check "  an old backup is not removed by backup.sh" \
+    test "$(files 'linuxlab-20260101T031500Z-*' | wc -l)" = 2
+check "  no receipt is written (no copy was confirmed)" none '*.receipt.json'
 
 echo "== backup.sh: partial files, interruptions and arguments"
 reset
@@ -804,7 +794,7 @@ check "  and says another operation is running" err_says "another"
 check "  without creating any database" not_called "CREATE DATABASE"
 run "$ops/content-sync.sh" "$release" "$work/no-checkout" "$(printf '0%.0s' $(seq 40))"
 check "content-sync.sh is refused while a backup runs" failed
-check "  because of the lock" err_says "another backup, restore, migration or content sync"
+check "  because of the lock" err_says "another operation (backup, restore, migration, content sync"
 check "  without syncing" not_called "content sync"
 release_held
 check "  the backup itself completes" test "$held_rc" = 0
@@ -839,47 +829,6 @@ run env STUB_HEADS="$HEAD" STUB_CURRENT='c4e1a7b39d52\n' STUB_AFTER="$HEAD" "$op
 check "migrate.sh is refused while another process holds the lock" failed
 check "  before reading or changing the database" not_called alembic
 release_held
-
-echo "== the copy command does not get the lock"
-# Stands for a copy command that leaves a process behind (an ssh master connection,
-# a daemon): the first call starts a background process, then waits to be released.
-cat >"$work/copy.sh" <<'EOF'
-#!/usr/bin/env bash
-if [ ! -e "$COPY_DIR/copy.started" ]; then
-    sleep 60 &
-    echo $! >"$COPY_DIR/copy.background"
-    touch "$COPY_DIR/copy.started"
-    while [ ! -e "$COPY_DIR/copy.release" ]; do sleep 0.1; done
-fi
-EOF
-chmod +x "$work/copy.sh"
-reset "BACKUP_COPY_COMMAND=$work/copy.sh"
-rm -f "$work/copy.started" "$work/copy.release" "$work/copy.background"
-COPY_DIR=$work timeout 120 "$ops/backup.sh" "$release" >"$work/held.out" 2>"$work/held.err" &
-held=$!
-wait_for "$work/copy.started"
-fixture "$backups/x.tar.age"
-restore "$backups/x.tar.age"
-check "while the copy command runs, the backup still holds the lock" failed
-check "  restore.sh was refused without creating a database" not_called "CREATE DATABASE"
-check "  and the package was already encrypted: nothing in the work directory" work_empty
-touch "$work/copy.release"
-held_rc=0
-wait "$held" || held_rc=$?
-check "the backup ends" test "$held_rc" = 0
-background=$(cat "$work/copy.background")
-check "  the copy command's background process is still running" kill -0 "$background"
-holds_lock() {
-    local fd
-    for fd in /proc/"$1"/fd/*; do
-        [ "$fd" -ef "$LINUXLAB_TEST_LOCK_FILE" ] && return 0
-    done
-    return 1
-}
-check "  and has no descriptor on the lock file" not holds_lock "$background"
-restore "$backups/x.tar.age"
-check "  another operation gets the lock as soon as the backup ends" succeeded
-kill "$background" 2>/dev/null || true
 
 echo "== the production project's lock is fixed"
 reset
@@ -916,7 +865,7 @@ if [ -w /run ]; then
     wait_for "$work/hold.started"
     run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
     check "the production project takes $canonical: refused while another process holds it" failed
-    check "  and names it" err_says "another backup, restore, migration or content sync is running (lock $canonical)"
+    check "  and names it" err_says "is running (lock $canonical)"
     release_held
 else
     run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"

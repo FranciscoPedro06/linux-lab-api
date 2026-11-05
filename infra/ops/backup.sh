@@ -2,9 +2,9 @@
 # Backs up the deployment into one encrypted package: the database (pg_dump, custom
 # format), Caddy's data volume (certificates and their keys) and a manifest of what was
 # captured and from what, each component read back in full first, the whole package
-# encrypted with age to every recipient of BACKUP_AGE_RECIPIENTS_FILE. Copies it off
-# the host when BACKUP_COPY_COMMAND is set. Removes no backup: see
-# docs/operations.md#backups.
+# encrypted with age to every recipient of BACKUP_AGE_RECIPIENTS_FILE. When
+# BACKUP_REMOTE is set, copies it off the host and reads the copy back in full
+# (infra/ops/remote.sh). Removes no backup: see docs/operations.md#backups.
 #
 #   infra/ops/backup.sh RELEASE_FILE [LABEL] [--restore-test]
 #
@@ -18,8 +18,19 @@
 #                               at least two (infra/ops/age.sh); required
 #   BACKUP_WORK_DIR             where the unencrypted package exists while it is built
 #                               (default /run/linuxlab-backup, a tmpfs; see lib.sh)
-#   BACKUP_COPY_COMMAND         run with each new file as its last argument.
+#   BACKUP_REMOTE               rclone "remote:bucket/prefix" the backup is copied to.
 #                               Unset: backups stay on this host only, which is reported.
+#   BACKUP_RCLONE_CONFIG        rclone's configuration file, with the credential: 0600
+#                               or 0400, this user's (required with BACKUP_REMOTE)
+#   BACKUP_RETRIES              attempts at the copy (default 5)
+#   BACKUP_RETRY_DELAY          seconds before the second attempt, doubled before each
+#                               one after (default 30)
+#
+# The copy off the host: the package, its checksum, then a receipt, each uploaded
+# without replacing anything there and read back in full (bytes and SHA-256); then
+# the receipt here, linuxlab-<...>.tar.age.receipt.json. A copy that cannot be
+# confirmed is retried; if it still cannot, the backup stays here, pending, the exit
+# status is 1, and infra/ops/sync-backups.sh retries it later without a new dump.
 #
 # Writes linuxlab-<time>-<id>-<label>.tar.age, the package (infra/ops/package.py)
 # encrypted, and linuxlab-<time>-<id>-<label>.tar.age.sha256, the SHA-256 of those
@@ -50,7 +61,11 @@ label=${positional[1]:-scheduled}
 [[ $label =~ ^[a-z0-9-]+$ ]] || fail "label must be lowercase letters, digits and dashes"
 dir=$(setting BACKUP_DIR)
 dir=${dir:-/var/backups/linuxlab}
-copy=$(setting BACKUP_COPY_COMMAND)
+[ -z "$(setting BACKUP_COPY_COMMAND)" ] \
+    || fail "BACKUP_COPY_COMMAND is no longer supported: set BACKUP_REMOTE and BACKUP_RCLONE_CONFIG (docs/operations.md#copies-off-the-host)"
+remote_status=0
+remote_init || remote_status=$?
+[ "$remote_status" != 1 ] || exit 1
 recipients_file=$(setting BACKUP_AGE_RECIPIENTS_FILE)
 database=$(database_name)
 web_sha=$(release_value WEB_SHA)
@@ -77,7 +92,7 @@ encrypted="$dir/linuxlab-$run-$label.tar.age"
 # This run's partial files in BACKUP_DIR (encrypted) and its run directory in
 # BACKUP_WORK_DIR (unencrypted); both removed when it ends. A restore test's database
 # is dropped too.
-partials=("$encrypted.partial" "$encrypted.sha256.partial")
+partials=("$encrypted.partial" "$encrypted.sha256.partial" "$encrypted.receipt.json.partial" "$encrypted.push-failed.partial")
 RUN_DIR=''
 # shellcheck disable=SC2317 # Run by the EXIT trap.
 cleanup() {
@@ -198,27 +213,18 @@ write_checksum "$encrypted.partial" "$encrypted"
 publish "$encrypted.partial" "$encrypted"
 note "encrypted package: $encrypted ($(du -h "$encrypted" | cut -f1))"
 
+# Off the host, when BACKUP_REMOTE is set: the package, its checksum and a receipt,
+# each uploaded without replacing anything and read back in full (infra/ops/remote.sh).
+# A failure keeps the backup here, pending, for infra/ops/sync-backups.sh.
 status=0
-if [ -n "$copy" ]; then
-    for file in "$encrypted" "$encrypted.sha256"; do
-        # The command comes from the root-owned environment file. It runs without
-        # the lock's descriptor (9>&-): a process it leaves behind (an ssh master
-        # connection, a daemon) cannot hold the lock after this script ends, while
-        # this script keeps holding it until then.
-        if ! sh -c "$copy \"\$1\"" copy "$file" 9>&-; then
-            note "copy off the host FAILED for $file"
-            status=1
-        fi
-    done
-    [ "$status" = 0 ] && note "copy command succeeded for every file (the copies are not verified)"
+if [ "$remote_status" = 0 ]; then
+    push_backup "$encrypted" || status=1
 else
-    note "BACKUP_COPY_COMMAND not set: this backup exists on this host only"
+    note "BACKUP_REMOTE not set: this backup exists on this host only"
 fi
 
-# A copy command's exit status does not prove a copy exists off the host, so no
-# backup is removed here until copies are verified there.
-note "automatic removal of old backups is suspended: $(find "$dir" -maxdepth 1 -type f \
-    \( -name 'linuxlab-*.tar.age' -o -name 'linuxlab-*.tar' -o -name 'linuxlab-*.dump' -o -name 'caddy-data-*.tar.gz' \) | wc -l) backup file(s) in $dir"
+# No backup is ever removed here: infra/ops/prune-backups.sh removes old ones, only
+# when it is enabled and only once their copies off the host are read back again.
 # The only output on standard output: the new encrypted package, for infra/ops/migrate.sh.
 echo "$encrypted"
 exit "$status"
