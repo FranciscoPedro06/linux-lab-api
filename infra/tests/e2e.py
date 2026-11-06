@@ -10,6 +10,8 @@ exits 1 if any failed.
     python e2e.py site
     python e2e.py flow EMAIL OTHER_EMAIL
     python e2e.py restart EMAIL
+    python e2e.py returning EMAIL MISSION
+    python e2e.py end EMAIL
 """
 
 import contextlib
@@ -364,6 +366,47 @@ def restart(email: str) -> None:
     finish()
 
 
+def returning(email: str, mission: str) -> None:
+    """An account of before a recovery: logs in with its password, finds the mission it
+    completed there, and can still start a lab of it (infra/tests/disaster.sh)."""
+    site = Site()
+    status, _ = site.json("POST", "/api/auth/login", {"email": email, "password": PASSWORD})
+    expect(status == 200, f"{email} logs in with the password set before the loss", status)
+    status, modules = site.json("GET", "/api/modules")
+    cards = {
+        card["slug"]: card
+        for module in (modules if status == 200 else [])
+        for card in module["missions"]
+    }
+    progress = cards.get(mission, {}).get("progress", {})
+    expect(progress.get("status") == "completed", f"{mission} still completed", progress)
+    status, lab = site.json("POST", "/api/labs", {"mission_slug": mission})
+    expect(status == 201 and lab.get("status") == "ready", "a lab of it starts", (status, lab))
+    if status == 201:
+        terminal = open_shell(site, lab["id"])
+        expect(b"ok" in run_in_shell(terminal, "echo ok"), "its terminal answers")
+        site.json("DELETE", f"/api/labs/{lab['id']}", {})
+    site.request("POST", "/api/auth/logout", {})
+    finish()
+
+
+def end(email: str) -> None:
+    """Ends the user's active lab, if there is one (infra/tests/disaster.sh, after a
+    session that stopped part way)."""
+    site = Site()
+    status, _ = site.json("POST", "/api/auth/login", {"email": email, "password": PASSWORD})
+    if status == 401:
+        print(f"no account {email}")
+        return
+    expect(status == 200, f"logged in as {email}", status)
+    status, lab = site.json("GET", "/api/labs/current")
+    if status == 200 and isinstance(lab, dict):
+        status, ended = site.json("DELETE", f"/api/labs/{lab['id']}", {})
+        expect(status == 200, f"lab {lab['id']} ended", (status, ended))
+    site.request("POST", "/api/auth/logout", {})
+    finish()
+
+
 if __name__ == "__main__":
     command, *arguments = sys.argv[1:]
     commands = {
@@ -372,6 +415,8 @@ if __name__ == "__main__":
         "site": site_checks,
         "flow": flow,
         "restart": restart,
+        "returning": returning,
+        "end": end,
     }
     with OPEN:
         commands[command](*arguments)
