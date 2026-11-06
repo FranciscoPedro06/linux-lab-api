@@ -2,17 +2,18 @@
 
     recovery.py manifest PACKAGE
     recovery.py certificate CADDY_DATA_ARCHIVE SITE
-    recovery.py site ADDRESS PORT SITE CERTIFICATES
+    recovery.py site ADDRESS HTTPS_PORT HTTP_PORT SITE CERTIFICATES
 
 `manifest` prints, one "key value" per line, the facts of a package's manifest the
 recovery uses (the package is checked by package.py first). `certificate` prints the
 SHA-256 of the certificates Caddy keeps for SITE in its data archive, comma separated
-(status 1 when it keeps none). `site` connects to ADDRESS:PORT with SITE as the TLS
-server name, as a browser of SITE would, and checks what Caddy answers: the
-certificate it presents is one of CERTIFICATES (SHA-256, comma separated; "-" when
-the package held none, then the certificate is not checked), the frontend's entry
-page with the site's headers, the API's health and its routes; one line per check,
-status 1 if any failed. It changes nothing: GET requests only, without a session.
+(status 1 when it keeps none). `site` checks what Caddy answers on ADDRESS, as a
+browser of SITE would: on HTTP_PORT, a permanent redirect to the same path on
+https://SITE; on HTTPS_PORT, with SITE as the TLS server name, a certificate that is
+one of CERTIFICATES (SHA-256, comma separated; "-" when the package held none, then
+the certificate is not checked), the frontend's entry page with the site's headers,
+the API's health and its routes; one line per check, status 1 if any failed. It
+changes nothing: GET requests only, without a session.
 
 Standard library only, Python 3.10 or later: it runs on the host, not in an image.
 """
@@ -116,7 +117,19 @@ class Site:
             connection.close()
 
 
-def site(address: str, port: str, name: str, certificates: str) -> int:
+def redirect(address: str, port: int, name: str, path: str) -> tuple[int, str]:
+    """Status and Location of a plain HTTP GET of PATH on ADDRESS:PORT as NAME."""
+    connection = http.client.HTTPConnection(address, port, timeout=30)
+    try:
+        connection.request("GET", path, headers={"host": name})
+        response = connection.getresponse()
+        response.read()
+        return response.status, response.getheader("location", "")
+    finally:
+        connection.close()
+
+
+def site(address: str, https_port: str, http_port: str, name: str, certificates: str) -> int:
     failures = 0
 
     def check(condition: bool, what: str, seen: object = "") -> None:
@@ -127,7 +140,17 @@ def site(address: str, port: str, name: str, certificates: str) -> int:
             print(f"FAIL  {what}: {seen!r}"[:300])
             failures += 1
 
-    target = Site(address, int(port), name)
+    try:
+        status, location = redirect(address, int(http_port), name, "/api/health")
+        check(
+            status in (301, 308) and location == f"https://{name}/api/health",
+            "HTTP on the published port 80 redirects to HTTPS, same path",
+            (status, location),
+        )
+    except (OSError, http.client.HTTPException) as error:
+        print(f"FAIL  HTTP through {address}:{http_port} as {name}: {error}")
+        failures += 1
+    target = Site(address, int(https_port), name)
     try:
         served = target.certificate()
         if certificates == "-":
@@ -156,7 +179,7 @@ def site(address: str, port: str, name: str, certificates: str) -> int:
         status, _, body = target.get("/openapi.json")
         check(b"openapi" not in body.lower(), "no API documentation through Caddy", status)
     except (OSError, ssl.SSLError, http.client.HTTPException, ValueError) as error:
-        print(f"FAIL  the site through {address}:{port} as {name}: {error}")
+        print(f"FAIL  the site through {address}:{https_port} as {name}: {error}")
         failures += 1
     return 1 if failures else 0
 
@@ -167,8 +190,8 @@ def main(argv: list[str]) -> int:
             return manifest(Path(package))
         case ["certificate", archive, name]:
             return certificate(Path(archive), name)
-        case ["site", address, port, name, certificates]:
-            return site(address, port, name, certificates)
+        case ["site", address, https_port, http_port, name, certificates]:
+            return site(address, https_port, http_port, name, certificates)
     print(__doc__.split("\n\n")[1], file=sys.stderr)
     return 2
 
