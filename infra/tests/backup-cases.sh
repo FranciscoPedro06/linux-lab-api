@@ -414,6 +414,28 @@ STUB_TABLES=f backup
 package=$(cat "$work/out")
 check "a database never migrated: no Alembic revision and no missions" \
     test "$(json "$package" '[m["postgresql"]["alembic_revision"], m["code"]["content"]["fingerprint"]]')" = "[null, null]"
+check "  and no content commit, because there is no content_syncs table" \
+    test "$(json "$package" '[m["code"]["content"]["sha"], "no content_syncs table" in m["code"]["content"]["source"]]')" = "[null, true]"
+content_sha=89abcdef0123456789abcdef0123456789abcdef
+fingerprint_d=$(printf 'd%.0s' $(seq 64))
+reset
+STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 5 $fingerprint_d" backup
+package=$(cat "$work/out")
+check "the commit of the last recorded content sync, while the missions are what it left" \
+    test "$(json "$package" '[m["code"]["content"]["sha"], m["code"]["content"]["synced_at"], m["code"]["content"]["source"].startswith("content_syncs")]')" \
+    = "[\"$content_sha\", \"2026-11-05T10:00:00Z\", true]"
+check "  package.py check prints it" \
+    test "$(decrypt "$package" one && python3 "$ops/package.py" check "$work/decrypted.tar" | sed -n 's/^content_sha //p')" = "$content_sha"
+reset
+STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 4 $fingerprint_d" backup
+package=$(cat "$work/out")
+check "no content commit when the missions changed after the last recorded sync" \
+    test "$(json "$package" '[m["code"]["content"]["sha"], m["code"]["content"]["synced_at"], "differ from what the last recorded" in m["code"]["content"]["source"]]')" = "[null, null, true]"
+reset
+STUB_LAST_SYNC="- 2026-11-05T10:00:00Z 5 $fingerprint_d" backup
+package=$(cat "$work/out")
+check "no content commit when the last sync named none" \
+    test "$(json "$package" '[m["code"]["content"]["sha"], "without a commit" in m["code"]["content"]["source"]]')" = "[null, true]"
 
 echo "== backup.sh --restore-test"
 reset

@@ -85,6 +85,29 @@ class Mission(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ContentSync(Base):
+    """One successful sync: the commit it synced, when known, and the missions after it.
+
+    Rows are never updated (trigger in the migration that creates the table).
+    """
+
+    __tablename__ = "content_syncs"
+    __table_args__ = (
+        CheckConstraint("source_commit ~ '^[0-9a-f]{40}$'", name="source_commit_format"),
+        CheckConstraint("missions >= 0", name="missions_not_negative"),
+        CheckConstraint("fingerprint ~ '^[0-9a-f]{64}$'", name="fingerprint_format"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # The commit of linux-lab-content whose content/ was synced; none when the caller
+    # did not name one.
+    source_commit: Mapped[str | None] = mapped_column(Text)
+    missions: Mapped[int] = mapped_column(Integer)
+    # As infra/ops/lib.sh computes it (content_fingerprint), right after the sync.
+    fingerprint: Mapped[str] = mapped_column(Text)
+
+
 class MissionVersion(Base):
     __tablename__ = "mission_versions"
     __table_args__ = (

@@ -132,6 +132,23 @@ pg_dump_version=$(compose exec -T postgres pg_dump --version)
 revision=$(alembic_revision "$database")
 schema=$(schema_fingerprint "$database")
 content=$(content_fingerprint "$database")
+# The content's commit: that of the last recorded sync, and only while the missions
+# are still what that sync left (package.py says why when there is none).
+content_sha='' content_synced_at='' content_reason=no-table
+if has_table "$database" content_syncs; then
+    content_reason=no-sync
+    last_sync=$(last_content_sync "$database")
+    if [ -n "$last_sync" ]; then
+        read -r last_commit last_at last_missions last_fingerprint <<<"$last_sync"
+        if [ "$last_commit" = - ]; then
+            content_reason=no-commit
+        elif [ "$last_missions $last_fingerprint" != "$content" ]; then
+            content_reason=changed
+        else
+            content_sha=$last_commit content_synced_at=$last_at content_reason=recorded
+        fi
+    fi
+fi
 
 # The dump, Caddy's data and the package exist together in the work directory: twice
 # the database's size, plus room for Caddy's data and the restore test's unpacking.
@@ -179,7 +196,9 @@ python3 "$OPS_DIR/package.py" build "$plain" "${components[@]}" \
     --fact "database=$database" --fact "server_version=$server_version" \
     --fact "server_version_num=$server_version_num" --fact "pg_dump_version=$pg_dump_version" \
     --fact "alembic_revision=$revision" --fact "schema_fingerprint=$schema" \
-    --fact "content=$content" --fact "roles=$roles" --fact "caddy_data=$caddy_data" \
+    --fact "content=$content" --fact "content_sha=$content_sha" \
+    --fact "content_synced_at=$content_synced_at" --fact "content_sha_reason=$content_reason" \
+    --fact "roles=$roles" --fact "caddy_data=$caddy_data" \
     || fail "the package could not be written; no backup written"
 rm -rf -- "$stage"
 # Read back as restore.sh will: layout, manifest, each component's size and SHA-256.

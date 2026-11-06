@@ -10,24 +10,39 @@ other sync by an advisory lock taken before the current state is read:
   content hash differs from that of its current version;
 - modules and missions missing from content/ are archived, never deleted, and keep
   their versions;
-- an error anywhere rolls the whole sync back.
+- an error anywhere rolls the whole sync back;
+- each sync that succeeds adds a row to content_syncs, in the same transaction: the
+  commit it synced when the caller names one, and the missions' fingerprint after it.
 
-Running it again on the same content changes nothing.
+Running it again on the same content changes no module, mission or version.
 """
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from linuxlab.content import loader
 from linuxlab.content.loader import Content
-from linuxlab.content.models import Mission, MissionVersion, Module
+from linuxlab.content.models import ContentSync, Mission, MissionVersion, Module
 
 SYNC_LOCK = 0x6D69_7373  # "miss"
 ARCHIVED = "archived"
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+
+# The missions' fingerprint: the same query as content_fingerprint in infra/ops/lib.sh,
+# which a backup compares with the last row of content_syncs (a test keeps the two
+# equal). Slug, status, current version and that version's content_hash.
+FINGERPRINT = text(
+    "SELECT count(*), encode(sha256(convert_to(coalesce(string_agg("
+    "format('%s %s %s %s', m.slug, m.status, m.current_version, v.content_hash),"
+    " E'\\n' ORDER BY m.slug), ''), 'UTF8')), 'hex')"
+    " FROM missions AS m"
+    " JOIN mission_versions AS v ON v.mission_id = m.id AND v.version = m.current_version"
+)
 
 
 class EmptyContent(Exception):
@@ -54,8 +69,16 @@ async def sync_content(
     content: Content,
     *,
     allow_empty: bool = False,
+    source_commit: str | None = None,
 ) -> SyncReport:
-    """Make the database match `content`. With empty content, refuses unless `allow_empty`."""
+    """Make the database match `content`. With empty content, refuses unless `allow_empty`.
+
+    `source_commit` is the commit of linux-lab-content that `content` was read from,
+    recorded with the sync; the caller vouches for it (infra/ops/content-sync.sh checks
+    that the checkout is at that commit, with nothing changed).
+    """
+    if source_commit is not None and not COMMIT.match(source_commit):
+        raise ValueError("source_commit must be a full commit SHA (40 lowercase hex digits)")
     if content.empty and not allow_empty:
         raise EmptyContent
     report = SyncReport()
@@ -65,6 +88,8 @@ async def sync_content(
         await db.execute(select(func.pg_advisory_xact_lock(SYNC_LOCK)))
         module_ids = await _sync_modules(db, content, report)
         await _sync_missions(db, content, module_ids, report)
+        missions, fingerprint = (await db.execute(FINGERPRINT)).one()
+        db.add(ContentSync(source_commit=source_commit, missions=missions, fingerprint=fingerprint))
     return report
 
 

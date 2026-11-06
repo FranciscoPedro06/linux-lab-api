@@ -65,6 +65,7 @@ TABLES = {
     "validation_runs",
     "user_missions",
     "command_history",
+    "content_syncs",
 }
 
 
