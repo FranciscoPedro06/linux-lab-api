@@ -415,12 +415,15 @@ psql_value() { compose exec -T postgres psql -X -At -U linuxlab -d linuxlab -c "
 facts=$(printf '%s\n' "$(psql_value 'SELECT version_num FROM alembic_version')" \
     "$(psql_value 'SHOW server_version_num')" \
     "$(docker inspect --format '{{.Image}}' "$(compose ps -q api)")" \
-    "$(docker inspect --format '{{.Image}}' "$(compose ps -q caddy)")")
+    "$(docker inspect --format '{{.Image}}' "$(compose ps -q caddy)")" \
+    "$(psql_value 'SELECT source_commit FROM content_syncs ORDER BY id DESC LIMIT 1')")
+# The content's provenance: the commit content-sync.sh synced above ($content_sha,
+# the throwaway repository's, not any other HEAD), as content_syncs recorded it.
 check_manifest() {
     python3 -c '
 import json, sys, tarfile
-package, release = sys.argv[1:3]
-revision, version_num, api_running, edge_running = sys.stdin.read().split()
+package, release, synced = sys.argv[1:4]
+revision, version_num, api_running, edge_running, recorded = sys.stdin.read().split()
 values = dict(line.split("=", 1) for line in open(release).read().splitlines() if "=" in line and not line.startswith("#"))
 m = json.load(tarfile.open(package).extractfile("manifest.json"))
 api, web, pg = m["code"]["api"], m["code"]["web"], m["postgresql"]
@@ -429,15 +432,36 @@ assert api["sha"] == values["API_SHA"] == api["image_revision_label"], api
 assert web["sha"] == values["WEB_SHA"] == web["image_revision_label"], web
 assert api["image_id"] == values["API_IMAGE_ID"] == api["running_image_id"] == api_running, api
 assert web["image_id"] == values["EDGE_IMAGE_ID"] == web["running_image_id"] == edge_running, web
-assert m["code"]["content"]["sha"] is None and m["code"]["content"]["missions"] > 0, m["code"]["content"]
+content = m["code"]["content"]
+assert synced == recorded == content["sha"], (synced, recorded, content)
+assert content["synced_at"] and content["source"].startswith("content_syncs"), content
+assert content["missions"] > 0, content
 assert pg["alembic_revision"] == revision and pg["server_version_num"] == int(version_num), pg
 assert pg["roles"] == [{"name": "linuxlab", "superuser": True}], pg
 assert m["restore"]["postgresql_major_at_least"] == int(version_num) // 10000
 assert [c["name"] for c in m["components"]] == ["database", "caddy-data"]
-' "$plain" "$release" <<<"$facts"
+' "$plain" "$release" "$content_sha" <<<"$facts"
 }
-expect_ok "its manifest names the release's commits, the running images and the database's state" \
+expect_ok "its manifest names the release's commits, the running images, the database's state and the content commit synced ($content_sha)" \
     check_manifest
+# The backup migrate.sh took before the first migration: a database without
+# content_syncs yet, so no content commit, and the manifest says why.
+first_backup=$(find "$work/backups" -maxdepth 1 -name 'linuxlab-*-pre-migrate-*.tar.age' | sort | head -n 1)
+historic_content() {
+    age --decrypt --identity "$work/keys/operator.key" --output "$memory/first.tar" "$first_backup" || return 1
+    python3 - "$memory/first.tar" <<'PY'
+
+import json, sys, tarfile
+m = json.load(tarfile.open(sys.argv[1]).extractfile("manifest.json"))
+content = m["code"]["content"]
+assert content["sha"] is None and content["synced_at"] is None, content
+assert "no content_syncs table" in content["source"], content
+PY
+    local status=$?
+    rm -f "$memory/first.tar"
+    return "$status"
+}
+expect_ok "the backup taken before any migration has no content commit, and says why" historic_content
 rm -f "$work"/by-*.tar
 users_before=$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SELECT count(*) FROM users')
 restore() { "$repo/infra/ops/restore.sh" "$release" "$@"; }
