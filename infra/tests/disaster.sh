@@ -278,6 +278,13 @@ expect_ok "MinIO holds A's $backups_a backups, each a package, a checksum and a 
     test "$backups_a" = 3 -a "$(mc ls admin/backups/host/ | wc -l)" = 9
 
 memory_note "A up, backed up"
+# What must outlive A: MinIO and its objects, recorded with their SHA-256.
+objects() { mc ls admin/backups/host/ | awk '{print $NF}' | sort; }
+object_sums() {
+    local name
+    for name in $(objects); do echo "$name $(mc cat "admin/backups/host/$name" | sha256sum | cut -c1-64)"; done
+}
+object_sums >"$work/objects-before"
 echo "== A is lost"
 images_a=("$(value API_IMAGE)" "$(value LAB_IMAGE)" "$(value EDGE_IMAGE)")
 ids_a=("$(value API_IMAGE_ID)" "$(value LAB_IMAGE_ID)" "$(value EDGE_IMAGE_ID)")
@@ -286,22 +293,50 @@ for id in $(docker ps -aq --filter "label=linuxlab.deployment=$deployment"); do 
 # A's images, by the tags and ids its release file recorded: built for this run only.
 docker image rm "${images_a[@]}" >/dev/null 2>&1 || true
 for id in "${ids_a[@]}"; do docker image rm "$id" >/dev/null 2>&1 || true; done
-rm -rf "$origin_dir" "$work/client-a" "$work/root-a.crt" "$memory/work" "$work/ops.lock" "$work/no-swaps"
+# A's settings, backups, receipts, host credential and content checkout. The keys and
+# the recovery credential stay: they are what the operator brings to the new host.
+rm -rf "$origin_dir" "$work/client-a" "$work/root-a.crt" "$memory/work" "$work/ops.lock" "$work/no-swaps" \
+    "$work/conf/host.conf" "$content"
 rm -f "$release"
 unset LINUXLAB_ENV_FILE LINUXLAB_PROJECT LINUXLAB_TEST_LOCK_FILE LINUXLAB_OVERRIDES LINUXLAB_TEST_SWAPS
-gone_a() {
-    local id
-    for id in "${ids_a[@]}"; do
-        if docker image inspect "$id" >/dev/null 2>&1; then echo "image $id is still here" >&2; return 1; fi
-    done
-    test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$origin")" \
-        && test -z "$(docker ps -aq --filter "label=linuxlab.deployment=$deployment")" \
-        && test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$origin")" \
-        && test -z "$(docker network ls -q --filter "label=com.docker.compose.project=$origin")" \
-        && test ! -e "$origin_dir" && test ! -e "$release" \
-        && test -z "$(find "$work" "$memory" -name 'linuxlab-*.tar.age*' -o -name 'release-*.env' -o -name production.env)"
+# Each condition on its own, so that a failure names what is left.
+failures_before=$failures
+none() { test -z "$("$@")"; }
+image_gone() { ! docker image inspect "$1" >/dev/null 2>&1; }
+expect_ok "A gone: no container of its project" none docker ps -aq --filter "label=com.docker.compose.project=$origin"
+expect_ok "A gone: no lab container of its deployment" none docker ps -aq --filter "label=linuxlab.deployment=$deployment"
+expect_ok "A gone: no volume of its project" none docker volume ls -q --filter "label=com.docker.compose.project=$origin"
+expect_ok "A gone: no network of its project" none docker network ls -q --filter "label=com.docker.compose.project=$origin"
+for index in 0 1 2; do
+    expect_ok "A gone: image ${images_a[index]} (${ids_a[index]:7:12})" image_gone "${ids_a[index]}"
+done
+expect_ok "A gone: its release file" test ! -e "$release"
+expect_ok "A gone: its settings, backup directory, backups, checksums and receipts" test ! -e "$origin_dir"
+expect_ok "A gone: its credential for the destination" test ! -e "$work/conf/host.conf"
+expect_ok "A gone: its content checkout" test ! -e "$content"
+expect_ok "A gone: nothing in its work directory (memory)" none find "$memory" -mindepth 1
+# Anywhere in this run's files but MinIO's own data directory, which holds the
+# objects A uploaded (as directories named after them) and must stay.
+local_copies() {
+    find "$work" "$memory" -path "$work/minio/data" -prune -o \( -name 'linuxlab-*.tar.age*' \
+        -o -name 'release-*.env' -o -name production.env \) -print
 }
-expect_ok "A is gone: containers, labs, volumes, networks, its three images, release file, settings, backups and receipts" gone_a
+expect_ok "A gone: no package, checksum, receipt, release file or settings left outside MinIO's data" none local_copies
+# The search of the first version of this check, which did not leave MinIO's data out
+# and failed with nothing of A left: what it finds, for the record.
+echo "note  the same search without leaving MinIO's data out finds $(find "$work" "$memory" \
+    \( -name 'linuxlab-*.tar.age*' -o -name 'release-*.env' -o -name production.env \) -print \
+    | sed "s#^$work/##" | sort | paste -sd ' ' | cut -c1-400)"
+if [ "$failures" = "$failures_before" ]; then
+    result 0 "A is gone: every local resource of its platform"
+else
+    result 1 "A is gone: every local resource of its platform ($((failures - failures_before)) left, above)"
+fi
+minio_ready() { curl -fsS "http://172.29.9.1:$MINIO_PORT/minio/health/ready" >/dev/null; }
+expect_ok "MinIO kept: it answers" minio_ready
+object_sums >"$work/objects-after"
+expect_ok "MinIO kept: A's $(wc -l <"$work/objects-before") objects (packages, checksums, receipts), same bytes" \
+    same "$work/objects-before" "$work/objects-after"
 memory_note "A gone"
 
 # ---------------------------------------------------------------------------
@@ -461,6 +496,14 @@ expect_ok "no private key in any log of the run" sh -c "! grep -rq AGE-SECRET-KE
 expect_ok "neither A's nor B's database password in the recovery's log" \
     sh -c "! grep -qF '$password_b' '$work/recovery.log'"
 
+a_absent() {
+    local id
+    for id in "${ids_a[@]}"; do image_gone "$id" || return 1; done
+    none docker ps -aq --filter "label=com.docker.compose.project=$origin" \
+        && none docker volume ls -q --filter "label=com.docker.compose.project=$origin" \
+        && none local_copies && test ! -e "$release" && test ! -e "$origin_dir"
+}
+expect_ok "at the end, still nothing of A on this host: images, containers, volumes, files" a_absent
 memory_note "end"
 if [ "$failures" -gt 0 ]; then
     echo "$failures checks failed" >&2
