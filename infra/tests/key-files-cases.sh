@@ -30,6 +30,9 @@ cleanup() {
 trap cleanup EXIT
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-key-cases
 export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
+# Swap is checked below with files of its own; until then, none.
+printf 'Filename\tType\tSize\tUsed\tPriority\n' >"$work/swaps"
+export LINUXLAB_TEST_SWAPS="$work/swaps"
 : >"$LINUXLAB_ENV_FILE"
 # shellcheck source-path=SCRIPTDIR source=../ops/lib.sh
 source "$ops/lib.sh"
@@ -204,6 +207,44 @@ if [ -n "${KEY_CASES_SMALL_TMPFS:-}" ]; then
         prepare "$KEY_CASES_SMALL_TMPFS/key-cases.work" $((64 * 1024 * 1024))
 else
     skip "not enough room on a 1 MiB tmpfs" "KEY_CASES_SMALL_TMPFS not given"
+fi
+
+echo "== swap, while the work directory is a tmpfs"
+# swaps LINE...: a /proc/swaps of the header and these lines, read by check_swap.
+swaps() {
+    printf 'Filename\tType\tSize\tUsed\tPriority\n' >"$work/swaps.case"
+    if [ $# -gt 0 ]; then printf '%s\n' "$@" >>"$work/swaps.case"; fi
+    SWAPS="$work/swaps.case"
+}
+swaps
+accepted "no swap" prepare "$shm/work"
+swaps "/swapfile                               file\t\t4194300\t0\t-2"
+refused "a swap file on disk" "swap in use and not encrypted: /swapfile" prepare "$shm/work"
+swaps "/dev/sda3                               partition\t1048572\t0\t-2"
+refused "a swap partition" "swap in use and not encrypted: /dev/sda3" prepare "$shm/work"
+swaps "/mnt/my\\040swap                          file\t\t1024\t0\t-2"
+refused "a swap file whose name has a space" "not encrypted: /mnt/my swap" prepare "$shm/work"
+swaps "/dev/zram0                              partition\t1048572\t0\t100"
+accepted "zram (compressed memory)" prepare "$shm/work"
+swaps "/dev/zram0                              partition\t1048572\t0\t100" \
+    "/swapfile                               file\t\t4194300\t0\t-2"
+refused "zram and a swap file" "not encrypted: /swapfile" prepare "$shm/work"
+no_new_run_dirs() { [ "$(find "$shm/work" -mindepth 1 -maxdepth 1 -name 'run.*' | wc -l)" -le 1 ]; }
+accepted "  no run directory made when refused" no_new_run_dirs
+SWAPS="$work/swaps.missing"
+refused "swaps unreadable" "cannot read" prepare "$shm/work"
+if [ -n "${KEY_CASES_RAMFS:-}" ]; then
+    swaps "/swapfile                               file\t\t4194300\t0\t-2"
+    accepted "on ramfs, whose pages are never swapped, swap does not matter" \
+        prepare "$KEY_CASES_RAMFS/key-cases.work"
+fi
+if [ -r /proc/swaps ]; then
+    SWAPS=/proc/swaps
+    if [ "$(sed 1d /proc/swaps | wc -l)" = 0 ]; then
+        accepted "this host: no swap in /proc/swaps" prepare "$shm/work"
+    else
+        echo "note  this host has swap: $(sed 1d /proc/swaps | awk '{print $1}' | paste -sd ' ')"
+    fi
 fi
 
 [ "$failures" -eq 0 ] || { echo "$failures key file cases failed" >&2; exit 1; }

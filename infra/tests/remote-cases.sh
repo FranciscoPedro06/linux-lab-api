@@ -132,6 +132,10 @@ host_rclone() {
 export PATH="$here/stubs:$PATH" STUB_LOG="$work/calls"
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-remote-cases
 export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
+# The host's swap is not the test's to turn off: lib.sh reads this file instead of
+# /proc/swaps, a header and no swap area (key-files-cases.sh checks the real rule).
+printf 'Filename\tType\tSize\tUsed\tPriority\n' >"$work/swaps"
+export LINUXLAB_TEST_SWAPS="$work/swaps"
 release="$work/release.env"
 image_id=sha256:$(printf 'a%.0s' $(seq 64))
 printf '%s\n' "API_SHA=0123456789abcdef0123456789abcdef01234567" \

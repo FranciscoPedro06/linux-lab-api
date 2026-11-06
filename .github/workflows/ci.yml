@@ -196,6 +196,8 @@ jobs:
         run: infra/tests/backup-cases.sh
       - name: Check the copies off the host against a real S3 API (MinIO, rclone)
         run: infra/tests/remote-cases.sh
+      - name: Check how a new host finds, downloads and checks them (MinIO, rclone, age)
+        run: infra/tests/offsite-cases.sh
       - run: docker build --target prod --tag linuxlab-api:ci .
       - run: docker build --tag linuxlab/lab-base:ci lab-image
       - name: Check what the images contain (no mission content, tests or secrets)

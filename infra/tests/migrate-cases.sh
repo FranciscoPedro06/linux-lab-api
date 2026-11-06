@@ -16,6 +16,10 @@ trap 'rm -rf "$work" "$shm"' EXIT
 export PATH="$here/stubs:$PATH" STUB_LOG="$work/calls"
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-migrate-cases
 export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
+# The host's swap is not the test's to turn off: lib.sh reads this file instead of
+# /proc/swaps, a header and no swap area (key-files-cases.sh checks the real rule).
+printf 'Filename\tType\tSize\tUsed\tPriority\n' >"$work/swaps"
+export LINUXLAB_TEST_SWAPS="$work/swaps"
 # The backup migrate.sh takes is encrypted: two keys of this run, its own work directory.
 age-keygen -o "$work/one.key" 2>/dev/null
 age-keygen -o "$work/two.key" 2>/dev/null

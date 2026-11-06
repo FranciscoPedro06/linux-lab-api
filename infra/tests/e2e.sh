@@ -202,6 +202,10 @@ expect_ok "deployment compose ($entry): published ports, one API process trustin
 echo "== start, with the operation scripts"
 overrides=("${deployment_files[@]:1}" "${test_files[@]}")
 export LINUXLAB_ENV_FILE=$env_file LINUXLAB_PROJECT=$project LINUXLAB_TEST_LOCK_FILE=$work/ops.lock
+# The host's swap is not the test's to turn off: lib.sh reads this file instead of
+# /proc/swaps, a header and no swap area (key-files-cases.sh checks the real rule).
+printf 'Filename\tType\tSize\tUsed\tPriority\n' >"$work/swaps"
+export LINUXLAB_TEST_SWAPS="$work/swaps"
 LINUXLAB_OVERRIDES=$(IFS=:; echo "${overrides[*]}")
 export LINUXLAB_OVERRIDES
 # The synthetic missions, committed in a throwaway repository like the private one.
