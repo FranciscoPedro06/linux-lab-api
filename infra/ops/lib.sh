@@ -15,6 +15,8 @@
 #   LINUXLAB_TEST_LOCK_FILE    lock file instead of /run/linuxlab-ops.lock
 #   LINUXLAB_TEST_BACKUP_RUN   the "<time>-<id>" part of backup names, instead of a
 #                              new one per run (to make two runs collide)
+#   LINUXLAB_TEST_SWAPS        a file read instead of /proc/swaps (check_swap), as
+#                              the test's host may have swap the test cannot turn off
 #
 # Nothing here prints a secret.
 
@@ -47,13 +49,15 @@ note() {
 PRODUCTION_PROJECT=linuxlab-prod
 LOCK_FILE=/run/linuxlab-ops.lock
 TEST_BACKUP_RUN=''
+SWAPS=/proc/swaps
 if [ "$PROJECT" = "$PRODUCTION_PROJECT" ]; then
-    for name in LINUXLAB_TEST_LOCK_FILE LINUXLAB_TEST_BACKUP_RUN; do
+    for name in LINUXLAB_TEST_LOCK_FILE LINUXLAB_TEST_BACKUP_RUN LINUXLAB_TEST_SWAPS; do
         [ -z "${!name:-}" ] || fail "$name is for test projects only; refusing it with project $PROJECT"
     done
 else
     LOCK_FILE=${LINUXLAB_TEST_LOCK_FILE:-$LOCK_FILE}
     TEST_BACKUP_RUN=${LINUXLAB_TEST_BACKUP_RUN:-}
+    SWAPS=${LINUXLAB_TEST_SWAPS:-$SWAPS}
 fi
 
 # Git Bash on Windows passes paths to docker in Windows form; elsewhere unchanged.
@@ -297,6 +301,32 @@ work_root() {
     echo "${root:-/run/linuxlab-backup}"
 }
 
+# Pages of a tmpfs can be written to swap: unencrypted data in the work directory
+# would then reach a disk. Status 0 when no swap is in use, or every swap area is in
+# memory (zram) or encrypted (a dm-crypt device); says which one is not, otherwise.
+check_swap() {
+    local name rest device uuid unprotected=()
+    [ -r "$SWAPS" ] || { echo "error: cannot read $SWAPS to check swap" >&2; return 1; }
+    while read -r name rest; do
+        if [ -z "$name" ] || [ "$name" = Filename ]; then continue; fi
+        # /proc/swaps escapes spaces in names as \040.
+        name=${name//\\040/ }
+        case "$name" in
+            /dev/zram*) continue ;;
+            /dev/dm-* | /dev/mapper/*)
+                device=$(basename -- "$(readlink -f -- "$name")")
+                uuid=$(cat "/sys/block/$device/dm/uuid" 2>/dev/null || true)
+                [[ $uuid == CRYPT-* ]] && continue
+                ;;
+        esac
+        unprotected+=("$name")
+    done <"$SWAPS"
+    if [ "${#unprotected[@]}" != 0 ]; then
+        echo "error: swap in use and not encrypted: ${unprotected[*]}. Unencrypted backups in the work directory (memory) could be written to it: turn it off (swapoff) or encrypt it; nothing was written (docs/operations.md#memory-and-swap)" >&2
+        return 1
+    fi
+}
+
 # prepare_work NEEDED_BYTES: checks the work directory and its free space, removes
 # what killed runs left in it, and sets RUN_DIR to a new run directory. Needs the lock.
 prepare_work() {
@@ -315,6 +345,8 @@ prepare_work() {
         tmpfs | ramfs) ;;
         *) fail "the work directory $root is on $fs, not in memory (tmpfs or ramfs): the unencrypted package must not reach a disk; nothing was written (docs/operations.md#encryption)" ;;
     esac
+    # ramfs pages are never swapped; tmpfs pages can be.
+    if [ "$fs" = tmpfs ]; then check_swap || exit 1; fi
     stale=$(find "$root" -mindepth 1 -maxdepth 1 -name 'run.*' | wc -l)
     if [ "$stale" != 0 ]; then
         find "$root" -mindepth 1 -maxdepth 1 -name 'run.*' -exec rm -rf -- {} +

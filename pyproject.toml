@@ -43,7 +43,7 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
 
 [tool.mypy]
 strict = true
-files = ["src", "tests", "migrations", "infra/ops/package.py"]
+files = ["src", "tests", "migrations", "infra/ops/package.py", "infra/ops/receipts.py", "infra/ops/recovery.py"]
 # google-re2 ships no type information; stubs/ holds a minimal stub.
 mypy_path = "stubs"
 plugins = ["pydantic.mypy"]

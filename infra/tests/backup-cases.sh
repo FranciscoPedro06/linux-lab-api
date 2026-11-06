@@ -29,6 +29,10 @@ trap cleanup EXIT
 export PATH="$here/stubs:$PATH" STUB_LOG="$work/calls"
 export LINUXLAB_ENV_FILE="$work/env" LINUXLAB_PROJECT=linuxlab-backup-cases
 export LINUXLAB_TEST_LOCK_FILE="$work/ops.lock"
+# The host's swap is not the test's to turn off: lib.sh reads this file instead of
+# /proc/swaps, a header and no swap area (key-files-cases.sh checks the real rule).
+printf 'Filename\tType\tSize\tUsed\tPriority\n' >"$work/swaps"
+export LINUXLAB_TEST_SWAPS="$work/swaps"
 backups="$work/backups"
 plain_dir="$shm/plain"
 release="$work/release.env"
@@ -870,9 +874,14 @@ for command in "restore.sh $backups/x.tar.age --identity-file $keys/one.key" "mi
     check "  and says so" err_says "LINUXLAB_TEST_LOCK_FILE is for test projects only"
 done
 : >"$STUB_LOG"
-run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod LINUXLAB_TEST_BACKUP_RUN=$fixed \
+run env -u LINUXLAB_TEST_LOCK_FILE -u LINUXLAB_TEST_SWAPS LINUXLAB_PROJECT=linuxlab-prod LINUXLAB_TEST_BACKUP_RUN=$fixed \
     "$ops/backup.sh" "$release"
 check "LINUXLAB_TEST_BACKUP_RUN is refused with the production project" failed
+check "  before any call" test ! -s "$STUB_LOG"
+: >"$STUB_LOG"
+run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
+check "LINUXLAB_TEST_SWAPS is refused with the production project" failed
+check "  and says so" err_says "LINUXLAB_TEST_SWAPS is for test projects only"
 check "  before any call" test ! -s "$STUB_LOG"
 
 # The production project uses /run/linuxlab-ops.lock. As root (a container), hold it
@@ -885,12 +894,12 @@ if [ -w /run ]; then
     flock -n "$canonical" -c "touch '$work/hold.started'; while [ ! -e '$work/hold.release' ]; do sleep 0.1; done" &
     held=$!
     wait_for "$work/hold.started"
-    run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
+    run env -u LINUXLAB_TEST_LOCK_FILE -u LINUXLAB_TEST_SWAPS LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
     check "the production project takes $canonical: refused while another process holds it" failed
     check "  and names it" err_says "is running (lock $canonical)"
     release_held
 else
-    run env -u LINUXLAB_TEST_LOCK_FILE LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
+    run env -u LINUXLAB_TEST_LOCK_FILE -u LINUXLAB_TEST_SWAPS LINUXLAB_PROJECT=linuxlab-prod "$ops/backup.sh" "$release"
     check "the production project uses $canonical (not writable here: refused, naming it)" \
         err_says "cannot open the lock file $canonical"
 fi

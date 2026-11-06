@@ -67,16 +67,10 @@ The per-process memory and host thread figures were measured with runsc in a loc
 - `aiodocker` picks the active Docker context before `DOCKER_HOST`, unlike the Docker CLI. When pointing the API or the tests at another daemon, set `DOCKER_CONTEXT=default` together with `DOCKER_HOST`, or make sure no other context is active.
 - `exec` with `stdin` needs a connection to Docker that can be half-closed: the Unix socket (Linux, and the API container in Compose, which mounts it) or TCP. The Windows named pipe cannot, so an API or test run directly on Windows refuses to run setup (`LabRuntimeError`) without sending any of the script, and the lab fails as `provisioning_failed`. Run the API through Compose, or the Docker tests from a Linux container or CI.
 
-Installing gVisor on a Linux host (the same steps as `.github/workflows/runtime.yml`):
+Installing gVisor on a Linux host, with the installer CI uses (`.github/workflows/runtime.yml`): it downloads the pinned release, refuses an archive whose SHA-512 is not the recorded one, unpacks it into `/usr/local/bin` and registers `runsc` with Docker (`runsc install`):
 
 ```sh
-release=20260921.0
-curl -fsSLo gvisor.tar.bz2 \
-  "https://storage.googleapis.com/gvisor/releases/release/${release}/x86_64/gvisor.tar.bz2"
-curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/${release}/x86_64/gvisor.tar.bz2.sha512" \
-  | sha512sum --check
-sudo tar -xjf gvisor.tar.bz2 -C /usr/local/bin runsc containerd-shim-runsc-v1 gvisor-bin
-sudo runsc install
+sudo infra/release/install-gvisor.sh
 sudo systemctl restart docker
 ```
 
