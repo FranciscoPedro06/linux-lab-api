@@ -120,8 +120,55 @@ def test_a_built_package_checks_and_says_what_restore_compares(tmp_path: Path) -
         "alembic_revision e6b40c7d9a18",
         f"schema_fingerprint {'c' * 64}",
         f"content 5 {'d' * 64}",
+        "content_sha -",
         "postgresql_major_at_least 16",
     ]
+
+
+CONTENT_SHA = "89abcdef0123456789abcdef0123456789abcdef"
+
+
+def test_a_recorded_content_commit_is_in_the_manifest_and_the_check(tmp_path: Path) -> None:
+    facts = {
+        "content_sha": CONTENT_SHA,
+        "content_synced_at": "2026-11-05T10:00:00Z",
+        "content_sha_reason": "recorded",
+    }
+    path = build(tmp_path, facts=facts)
+
+    content = manifest_of(path)["code"]["content"]
+    assert (content["sha"], content["synced_at"]) == (CONTENT_SHA, "2026-11-05T10:00:00Z")
+    assert content["source"].startswith("content_syncs")
+    assert f"content_sha {CONTENT_SHA}" in check(path)
+
+
+@pytest.mark.parametrize("reason", ["no-table", "no-sync", "no-commit", "changed"])
+def test_without_a_content_commit_the_manifest_says_why(tmp_path: Path, reason: str) -> None:
+    content = manifest_of(build(tmp_path, facts={"content_sha_reason": reason}))["code"]["content"]
+    assert (content["sha"], content["synced_at"]) == (None, None)
+    assert content["source"] == package.CONTENT_SHA_REASONS[reason]
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {"content_sha": CONTENT_SHA},
+        {"content_sha": CONTENT_SHA, "content_sha_reason": "changed"},
+        {"content_sha_reason": "recorded"},
+        {"content_sha": CONTENT_SHA, "content_sha_reason": "recorded"},
+        {"content_sha": "abc", "content_sha_reason": "recorded"},
+        {"content_sha_reason": "guessed"},
+    ],
+)
+def test_inconsistent_content_facts_are_refused(tmp_path: Path, facts: dict[str, str]) -> None:
+    with pytest.raises(package.PackageError, match="content"):
+        build(tmp_path, facts=facts)
+
+
+def test_a_malformed_content_sync_time_is_refused(tmp_path: Path) -> None:
+    path = build(tmp_path)
+    rewrite(path, lambda m: m["code"]["content"].update(synced_at="yesterday"))
+    refused(path, "code.content.synced_at")
 
 
 def test_the_package_holds_the_manifest_and_the_components_as_regular_files(

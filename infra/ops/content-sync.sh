@@ -9,7 +9,8 @@
 # against the release's API commit, under runc and runsc. The checkout must be at
 # that commit with nothing modified or untracked. Its content/ directory is mounted
 # read-only into a one-off task container, removed when the sync ends; no running
-# service ever sees it, and it never enters an image.
+# service ever sees it, and it never enters an image. The sync records CONTENT_SHA in
+# the database (content_syncs), which backups then name as the content's commit.
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 source "$(dirname "$0")/lib.sh"
 
@@ -23,8 +24,10 @@ content_sha=${3:?usage: content-sync.sh RELEASE_FILE CHECKOUT CONTENT_SHA}
 
 head=$(git -C "$checkout" rev-parse HEAD)
 [ "$head" = "$content_sha" ] || fail "the checkout is at $head, not $content_sha"
-dirty=$(git -C "$checkout" status --porcelain --untracked-files=all -- content)
-[ -z "$dirty" ] || fail "content/ of the checkout has changes or untracked files"
+# Ignored files too: anything in content/ that is not the commit's would be synced
+# under its name.
+dirty=$(git -C "$checkout" status --porcelain --untracked-files=all --ignored -- content)
+[ -z "$dirty" ] || fail "content/ of the checkout has changes, untracked or ignored files"
 
 note "syncing content $content_sha with API $API_SHA"
 compose up -d --wait postgres >/dev/null
@@ -33,5 +36,5 @@ compose up -d --wait postgres >/dev/null
 source_dir=$(cd "$checkout/content" && pwd)
 compose run --rm --no-deps --user "$(stat -c %u:%g "$source_dir")" \
     -v "$(host_path "$source_dir"):/content:ro" \
-    task linuxlab content sync --content-dir /content
+    task linuxlab content sync --content-dir /content --source-commit "$content_sha"
 note "content $content_sha synced"

@@ -177,6 +177,20 @@ JOIN mission_versions AS v ON v.mission_id = m.id AND v.version = m.current_vers
 SQL
 }
 
+# "<commit or -> <synced_at> <missions> <fingerprint>" of the last sync recorded in
+# content_syncs (empty when the table does not exist or has no row). A sync records
+# the commit only when content-sync.sh named it.
+last_content_sync() {
+    has_table "$1" content_syncs || return 0
+    psql_on "$1" -f - <<'SQL'
+-- linuxlab: last content sync
+SELECT coalesce(source_commit, '-') || ' '
+       || to_char(synced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') || ' '
+       || missions || ' ' || fingerprint
+FROM content_syncs ORDER BY id DESC LIMIT 1
+SQL
+}
+
 # "name:superuser" of every role that is not built in, comma separated.
 database_roles() {
     psql_on "$1" -c "SELECT string_agg(rolname || ':' || rolsuper, ',' ORDER BY rolname) FROM pg_roles WHERE rolname !~ '^pg_'"

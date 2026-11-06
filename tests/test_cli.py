@@ -45,6 +45,7 @@ def test_sync_then_sync_again(
         "modules: 2 created, 0 updated, 0 archived",
         "missions: 3 created, 0 updated, 0 archived",
         "versions: 3 created",
+        "recorded: content commit not given",
     ]
 
     assert sync("--content-dir", root) == 0

@@ -29,6 +29,8 @@
 #                                    revision, schema and content fingerprints, and
 #                                    whether tables exist (t or f)
 #   STUB_DATABASE_SIZE               pg_database_size in bytes (default 1000000)
+#   STUB_LAST_SYNC                   the last row of content_syncs, as lib.sh reads it
+#                                    (default: none)
 #
 # The synthetic dump stands for pg_dump's custom format: a header line, the data,
 # and a last line with the data's SHA-256. Like the real pg_restore, `--list` reads
@@ -105,6 +107,7 @@ case "$args" in
         case "$sql" in
             *"schema fingerprint"*) fact SCHEMA "$(printf 'c%.0s' $(seq 64))" ;;
             *"content fingerprint"*) fact CONTENT "5 $(printf 'd%.0s' $(seq 64))" ;;
+            *"last content sync"*) fact LAST_SYNC '' ;;
         esac
         ;;
     *" alembic heads "*)

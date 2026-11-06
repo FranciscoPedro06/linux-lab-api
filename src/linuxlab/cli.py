@@ -1,11 +1,12 @@
 """Command line entry point.
 
-    linuxlab content sync [--content-dir DIR] [--allow-empty]
+    linuxlab content sync [--content-dir DIR] [--allow-empty] [--source-commit SHA]
 
 Validates content/ and syncs it to the database at DATABASE_URL (see
-docs/architecture.md#missions-and-versioning). Exit status: 0 when the database
-matches the content, 1 when the content is invalid or empty or the sync failed,
-2 on a usage error.
+docs/architecture.md#missions-and-versioning). --source-commit records the commit of
+linux-lab-content the directory holds with the sync (content_syncs); the caller vouches
+for it. Exit status: 0 when the database matches the content, 1 when the content is
+invalid or empty or the sync failed, 2 on a usage error.
 """
 
 import argparse
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from linuxlab.config import get_settings
 from linuxlab.content.loader import ContentInvalid, load_content
-from linuxlab.content.sync import EmptyContent, SyncReport, sync_content
+from linuxlab.content.sync import COMMIT, EmptyContent, SyncReport, sync_content
 from linuxlab.db import create_engine, create_sessionmaker
 
 
@@ -36,11 +37,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="when the content directory is empty, archive every module and mission",
     )
+    sync.add_argument(
+        "--source-commit",
+        type=commit,
+        help="full commit SHA of linux-lab-content that the content directory holds",
+    )
     args = parser.parse_args(argv)
-    return content_sync(args.content_dir, allow_empty=args.allow_empty)
+    return content_sync(
+        args.content_dir, allow_empty=args.allow_empty, source_commit=args.source_commit
+    )
 
 
-def content_sync(content_dir: Path | None, *, allow_empty: bool = False) -> int:
+def commit(value: str) -> str:
+    if not COMMIT.match(value):
+        raise argparse.ArgumentTypeError("must be a full commit SHA (40 lowercase hex digits)")
+    return value
+
+
+def content_sync(
+    content_dir: Path | None, *, allow_empty: bool = False, source_commit: str | None = None
+) -> int:
     settings = get_settings()
     root = content_dir or settings.content_dir
     try:
@@ -54,7 +70,12 @@ def content_sync(content_dir: Path | None, *, allow_empty: bool = False) -> int:
     async def run() -> SyncReport:
         engine = create_engine(settings.database_url)
         try:
-            return await sync_content(create_sessionmaker(engine), content, allow_empty=allow_empty)
+            return await sync_content(
+                create_sessionmaker(engine),
+                content,
+                allow_empty=allow_empty,
+                source_commit=source_commit,
+            )
         finally:
             await engine.dispose()
 
@@ -87,6 +108,7 @@ def content_sync(content_dir: Path | None, *, allow_empty: bool = False) -> int:
         f"{report.missions_archived} archived"
     )
     print(f"versions: {report.versions_created} created")
+    print(f"recorded: content commit {source_commit or 'not given'}")
     if not report.changed:
         print("database already up to date")
     return 0
