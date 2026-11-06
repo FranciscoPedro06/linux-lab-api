@@ -483,16 +483,21 @@ recorded_count=$(expected content | cut -d' ' -f1)
 [ "$recorded_count" = - ] || [ "$mission_count" = "$recorded_count" ] \
     || fail "$mission_count missions read back, the manifest records $recorded_count"
 note "missions: $mission_count, $published published, each current version loads with the release's code"
-port=$(compose port caddy 443) || fail "Caddy publishes no port 443"
-port=${port##*:}
-python3 -I "$OPS_DIR/recovery.py" site 127.0.0.1 "$port" "$site" "${restored_certificate:--}" >"$STATE_DIR/site.log" 2>&1 \
-    || { cat "$STATE_DIR/site.log" >&2; fail "the site does not answer as it should through Caddy"; }
-sed 's/^/    /' "$STATE_DIR/site.log" >&2
+# The site's server in the configuration Caddy loaded from the release's Caddyfile
+# listens on :443. Its HTTP to HTTPS redirect on :80 is a server Caddy adds by itself
+# and does not show there: it is checked by a request to the published port instead.
 listeners=$(compose exec -T caddy wget -q -O - http://127.0.0.1:2019/config/apps/http/servers \
     | python3 -I -c 'import json, sys; print(" ".join(sorted({a for s in json.load(sys.stdin).values() for a in s.get("listen", [])})))') \
     || fail "Caddy's loaded configuration cannot be read"
-[ "$listeners" = ":443 :80" ] || fail "Caddy listens on $listeners, not :443 and :80"
-note "Caddy: configuration from the release's Caddyfile, listening on $listeners"
+[[ " $listeners " == *" :443 "* ]] || fail "Caddy's loaded configuration has no server on :443 (listeners: ${listeners:-none})"
+https_port=$(compose port caddy 443) || fail "Caddy publishes no port 443"
+http_port=$(compose port caddy 80) || fail "Caddy publishes no port 80"
+https_port=${https_port##*:} http_port=${http_port##*:}
+note "Caddy: configuration from the release's Caddyfile, server on :443; ports 80 and 443 published ($http_port, $https_port)"
+# Requests, not the ports alone: the redirect on 80, then the site and the API on 443.
+python3 -I "$OPS_DIR/recovery.py" site 127.0.0.1 "$https_port" "$http_port" "$site" "${restored_certificate:--}" >"$STATE_DIR/site.log" 2>&1 \
+    || { cat "$STATE_DIR/site.log" >&2; fail "the site does not answer as it should through Caddy"; }
+sed 's/^/    /' "$STATE_DIR/site.log" >&2
 touch "$STATE_DIR/done.checked"
 
 # ---------------------------------------------------------------------------
