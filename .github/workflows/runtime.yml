@@ -190,3 +190,67 @@ jobs:
 
       - name: Check the stack end to end, entry through ngrok (stand-in agent)
         run: api/infra/tests/e2e.sh "$(ls "$RUNNER_TEMP"/releases/release-*.env)" --entry ngrok --runtime runsc
+
+  # The loss of the host (docs/operations.md#disaster-recovery): an origin backed up to
+  # MinIO, destroyed, then recovered on a new host that shares nothing with it but
+  # MinIO and the keys. The new host is a privileged container running its own Docker
+  # Engine (Docker in Docker) with runsc, on a volume of its own: no image, volume,
+  # release file, backup or receipt of the origin. Run on the pull request's head
+  # commit, with the history the new host clones from.
+  disaster-recovery:
+    name: Disaster recovery on a new host (runsc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: api
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      # The frontend at the tip of its main branch; its commit is printed below.
+      - uses: actions/checkout@v7
+        with:
+          repository: FranciscoPedro06/linux-lab-web
+          ref: main
+          path: web
+          fetch-depth: 0
+
+      - name: Install gVisor
+        run: |
+          sudo api/infra/release/install-gvisor.sh
+          sudo systemctl restart docker
+
+      - name: Install age, rclone, and MinIO for the tests
+        run: |
+          api/infra/release/install-age.sh "$RUNNER_TEMP/tools"
+          api/infra/release/install-rclone.sh "$RUNNER_TEMP/tools"
+          api/infra/tests/install-minio.sh "$RUNNER_TEMP/tools"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+
+      # The recovery refuses to decrypt into memory that can be swapped to a disk
+      # unencrypted, as on a production host; the runner has a swap file.
+      - name: Turn swap off
+        run: |
+          sudo swapoff -a
+          test "$(sed 1d /proc/swaps | wc -l)" = 0
+
+      - name: Show versions
+        run: |
+          age --version
+          rclone version | head -n 1
+          runsc --version
+          docker version --format 'Docker Engine {{.Server.Version}}'
+          docker compose version
+          echo "api commit: $(git -C api rev-parse HEAD)"
+          echo "web commit: $(git -C web rev-parse HEAD)"
+          df -h /
+
+      - name: Build the origin's release
+        run: |
+          api/infra/release/build.sh --api-repo api --api-sha "$(git -C api rev-parse HEAD)" \
+            --web-repo web --web-sha "$(git -C web rev-parse HEAD)" --out "$RUNNER_TEMP/releases"
+
+      - name: Lose the origin, recover on a new host, compare
+        run: |
+          api/infra/tests/disaster.sh "$(ls "$RUNNER_TEMP"/releases/release-*.env)" \
+            --api-repo api --web-repo web --runtime runsc
