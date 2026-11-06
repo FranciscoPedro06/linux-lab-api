@@ -13,6 +13,7 @@ How to install, update, check, back up and recover the production stack describe
 | `infra/ops/prune-backups.sh` | Removes old local backups whose copy off the host it reads back first; disabled unless configured |
 | `infra/ops/backup-status.sh` | Reports the copies off the host: latest receipt, its age, pending backups, failures; changes nothing |
 | `infra/ops/restore.sh` | Restores a package's database into a new database and compares it with the manifest; drops it afterwards unless `--keep` |
+| `infra/ops/restore-offsite.sh` | On a new host: finds the newest backup confirmed off the host, checks and decrypts it, rebuilds the release from its commits, restores PostgreSQL and Caddy's data, starts and checks the stack ([Disaster recovery](#disaster-recovery)) |
 | `infra/ops/check-labs.sh` | Compares lab containers with the database, checks disk, memory and the API's log; changes nothing |
 | `infra/tests/e2e.sh` | The end-to-end checks on a disposable project ([deployment.md](deployment.md#checking-a-release)) |
 
@@ -26,14 +27,14 @@ None of these is made yet, and none is assumed by the configuration:
 | Domain and DNS | An `A` record for the site. No `AAAA` record until IPv6 has been checked on the host ([deployment.md](deployment.md#client-addresses)) |
 | SSH access | Keys only, no password or root login, from known addresses where the provider allows it |
 | Firewall | The provider's firewall: 80 and 443 open, SSH restricted, everything else closed. Docker's published ports bypass a host firewall such as ufw, so the host firewall alone is not enough |
-| Backup destination | S3-compatible storage off the host, reached with rclone: provider, bucket, a credential limited to create and read under one prefix, versioning or Object Lock, lifecycle rules ([Copies off the host](#copies-off-the-host)) |
+| Backup destination | S3-compatible storage off the host, reached with rclone: provider, bucket, a credential limited to create and read under one prefix, versioning or Object Lock, lifecycle rules ([Copies off the host](#copies-off-the-host)); and a second credential, for recovery, limited to list and read that prefix, kept by the operator ([Disaster recovery](#the-recovery-credential)) |
 | Local retention | Days a backup stays on the host once its copy off the host is confirmed; none until decided ([Local retention](#local-retention)) |
 | Access to the private content | How the host gets a checkout of `linux-lab-content` ([Syncing mission content](#syncing-mission-content)). The beta must not open before this is decided and tested |
 | `LAB_CAPACITY` | Sized to the chosen VM |
 
 ## Preparing the host
 
-1. Install Docker Engine from Docker's repository, `python3` (3.10 or later: the operation scripts build and check backup packages with it), age with `sudo infra/release/install-age.sh` (the release the scripts are tested with, its archive checked against the SHA-256 in `infra/ops/age.sh`; [Backups](#backups)) and gVisor as in [runtime.md](runtime.md#environment) (same release and SHA-512 as `.github/workflows/runtime.yml`). Record `uname -r`, `docker version` and `runsc --version`.
+1. Install Docker Engine from Docker's repository, `python3` (3.10 or later: the operation scripts build and check backup packages with it), age with `sudo infra/release/install-age.sh` (the release the scripts are tested with, its archive checked against the SHA-256 in `infra/ops/age.sh`; [Backups](#backups)), rclone with `sudo infra/release/install-rclone.sh`, and gVisor with `sudo infra/release/install-gvisor.sh` (the release CI tests, its archive checked against the recorded SHA-512; [runtime.md](runtime.md#environment)). Turn swap off or encrypt it ([Memory and swap](#memory-and-swap)). Record `uname -r`, `docker version` and `runsc --version`.
 2. Merge `infra/docker/daemon.json.example` into `/etc/docker/daemon.json` by hand and restart Docker. Check: `docker info --format '{{json .Runtimes}}'` lists `runsc`; `docker run --rm --runtime=runsc --network=none ubuntu:24.04 true` works; `docker info --format '{{.LoggingDriver}}'` is `json-file`.
 3. Create the directories, owned by root: `/etc/linuxlab` (0700), `/var/lib/linuxlab/releases`, `/var/lib/linuxlab/content` (0700, the private checkout), `/var/backups/linuxlab` (0700).
 4. Write `/etc/linuxlab/backup-recipients.txt` (root, 0644 or stricter) with the two public keys backups are encrypted to ([Encryption](#encryption)). Copy `infra/production.env.example` to `/etc/linuxlab/production.env` (0600), fill it in (it says how to generate each secret), and run `infra/release/check-env.sh /etc/linuxlab/production.env`. Secrets go only in that file: never on a command line, in a shell history or in the repository.
@@ -87,6 +88,8 @@ How the host gets the checkout is pending. The options:
 
 Either way, only root reads the checkout, and the commit synced is the one the missions workflow tested.
 
+Each sync that succeeds is recorded in the database, in the same transaction (`content_syncs`): when it ran, the commit `content-sync.sh` checked the checkout against (it refuses a checkout at another commit, or with changed, untracked or ignored files in `content/`), and the missions' fingerprint right after it. A backup names that commit as the content's only while the missions are still what that sync left ([Backups](#backups)). A sync run by hand with `linuxlab content sync` records no commit unless given `--source-commit`.
+
 ## Backups
 
 `backup.sh` writes one encrypted package into `BACKUP_DIR` (0700, files 0600): `linuxlab-<time>-<id>-<label>.tar.age`, an uncompressed tar archive encrypted with age ([Encryption](#encryption)), and `linuxlab-<time>-<id>-<label>.tar.age.sha256`, the SHA-256 of the encrypted bytes. Nothing unencrypted is ever written to `BACKUP_DIR`. The package, once decrypted, holds, as regular files and nothing else:
@@ -103,7 +106,7 @@ The manifest (`format_version` 1) records:
 
 - the backup: its id (`<time>-<id>`), UTC time and label;
 - the code: the API and web commits of the release file, whose image ids `load_release` checks against the local images; each image's `org.opencontainers.image.revision` label, which must match (`backup.sh` stops otherwise); and the image of the running API and Caddy containers, when they run;
-- the private content: **no commit**. `content-sync.sh` does not store the commit it synced, so the manifest says so and records instead the number of missions and a fingerprint of them (slug, status, current version and that version's `content_hash`, which a checkout of `linux-lab-content` can be checked against);
+- the private content: the number of missions and a fingerprint of them (slug, status, current version and that version's `content_hash`, which a checkout of `linux-lab-content` can be checked against), and the commit of the last sync recorded in `content_syncs` with the time of that sync, when that sync named one and the missions are still what it left; otherwise no commit (`code.content.sha` null) and, in `code.content.source`, why: no `content_syncs` table yet, no sync since, a sync without a commit, or missions changed since. Backups made before this record existed have no commit either;
 - PostgreSQL: the database's name, the server's version, `pg_dump`'s version, the Alembic revision, a fingerprint of the schema (columns, constraints, indexes, triggers, functions and sequences, without owners), and the roles;
 - each component's path, type, size and SHA-256;
 - what a restore needs: PostgreSQL of the dump's major version or later, the release images, the role `linuxlab`; and what the operator provides separately: `/etc/linuxlab/production.env`, a checkout of `linux-lab-content`, the release file or its commits.
@@ -169,6 +172,21 @@ One recipient per line; lines starting with `#` and blank lines are ignored. `ba
 **Unencrypted data while a backup runs.** The dump, Caddy's data and the package exist unencrypted in `BACKUP_WORK_DIR`, by default `/run/linuxlab-backup` on `/run`'s tmpfs (memory, gone at reboot), mode 0700, made if missing and refused if it is a link, is not root's or has another mode, or is not on tmpfs or ramfs: the filesystem it is really on decides (`stat -f`), not its path, and no other directory and no disk is ever used instead. Each run works in a directory of its own there (`run.<random>`), removed as soon as the package is encrypted and again by the run's trap on success, failure, `INT`, `TERM` and `HUP`. A run killed outright (`SIGKILL`, out of memory) leaves its run directory: the next backup or restore, which holds the lock, removes it, and a reboot empties `/run` anyway. Removal is `rm`, not secure erasure. Before dumping, `backup.sh` checks that the work directory has room for twice the database's size (three times with `--restore-test`) plus 64 MiB, and stops otherwise. On ramfs, which has no size of its own, the room is the memory available. `/run` is usually a tenth of the memory: if the database outgrows it, point `BACKUP_WORK_DIR` at a tmpfs mounted for this, of the size needed (and the memory to back it). A directory on disk is refused: unencrypted data would reach the disk and could outlive its removal there.
 
 **Rotation.** A change of the recipients file applies to backups made after it; nothing is decrypted or encrypted again. Each backup needs one of the keys it was encrypted to, so a private key is kept as long as any backup encrypted only to it, and those to its pair, are kept. To add or replace a key: make the new key away from the host; add its public key to the recipients file (keeping the others); run a backup, copy it to the operator's machine and check there that the new key decrypts it (`age --decrypt -i <new key> -o /dev/null <package>`), never on the host; only then remove an old public key from the file, and keep the old private key until the last backup that needs it has expired.
+
+### Memory and swap
+
+Unencrypted packages exist only in the work directory, which must be a tmpfs or a ramfs (memory). A tmpfs can be written to swap under memory pressure, and swap on a disk would then hold unencrypted data that outlives the run. So `backup.sh`, `restore.sh`, `migrate.sh` and `restore-offsite.sh` refuse to write into a tmpfs work directory while any swap area that is neither encrypted (a dm-crypt device) nor in memory (zram) is in use (`/proc/swaps`), and say which one. On the host, either:
+
+- no swap: `swapoff -a`, and remove the swap entries from `/etc/fstab` (and the provider's swap file, if its image makes one); or
+- encrypted swap: swap on a dm-crypt device with a random key at each boot (`/etc/crypttab`: `swap /dev/<device> /dev/urandom swap,cipher=aes-xts-plain64,size=512`).
+
+A ramfs is never swapped, but has no size limit: it is accepted, not recommended. Prefer a tmpfs with an explicit size, for the work directory only, when `/run` (usually a tenth of the memory) is too small for twice the package plus 64 MiB:
+
+```
+tmpfs  /run/linuxlab-backup  tmpfs  size=2g,mode=0700,uid=0,gid=0,noexec,nosuid,nodev  0 0
+```
+
+with `BACKUP_WORK_DIR=/run/linuxlab-backup` and the memory to back it. The room is checked before anything is decrypted or dumped.
 
 ### Copies off the host
 
@@ -274,7 +292,7 @@ rclone --config /etc/linuxlab/rclone.conf --s3-no-check-bucket cat --no-traverse
 rclone --config /etc/linuxlab/rclone.conf --s3-no-check-bucket cat --no-traverse offsite:<bucket>/<prefix>/<name>.tar.age.sha256 >/var/backups/linuxlab/recovered/<name>.tar.age.sha256
 ```
 
-Caddy's data is checked with the package but no script restores it yet: on a new host, it would be extracted from the package (`caddy/caddy-data.tar.gz`) into the new deployment's `caddy-data` volume before Caddy starts.
+`restore.sh` restores the database only. On a new host, the whole deployment, Caddy's data included, is restored by `restore-offsite.sh` ([Disaster recovery](#disaster-recovery)).
 
 Emergency, when the database in use cannot be kept (a migration that cannot be fixed forward, corruption):
 
@@ -285,6 +303,111 @@ Emergency, when the database in use cannot be kept (a migration that cannot be f
 5. Start Caddy again. The old database stays untouched until it is decided what to do with it.
 
 This is not a rollback without loss: **everything written after the dump is gone**, accounts, sessions, progress, validation runs and history included, and students lose the labs they had.
+
+## Disaster recovery
+
+When the host is lost (disk, VM or account gone, or a compromise that rules out restoring over it), the platform is rebuilt on a new host by `infra/ops/restore-offsite.sh`, from the copies off the host alone. Nothing of the lost host is used: not its disk, its backups or receipts, its release file, its images, or its settings.
+
+### What a recovery needs
+
+| From | What | Notes |
+|---|---|---|
+| The destination | The newest backup whose package, checksum and receipt read back intact | Found by listing the prefix with the recovery credential, or named by the operator (`--receipt`) |
+| GitHub | `linux-lab-api` and `linux-lab-web`, holding the commits the manifest names | Public repositories; cloned on the new host |
+| The operator | `/etc/linuxlab/production.env` for the new host | Written anew, as in [Preparing the host](#preparing-the-host): new `POSTGRES_PASSWORD` (the dump holds no role password), invite code, `DOCKER_SOCKET_GID` of the new host, `LAB_CAPACITY` for its size. Same `SITE_ADDRESS` and `PUBLIC_ORIGIN` to keep the certificate and the origin users know |
+| The operator | `/etc/linuxlab/backup-recipients.txt` | The public keys, as before, for the backups the new host will take |
+| The operator | The recovery credential: an rclone configuration file | See below; never the host's own credential |
+| The operator | One age private key the backups are encrypted to | The operator's or the offline recovery key, on a tmpfs, removed afterwards |
+| The operator | DNS and firewall | The site's `A` record to the new host, 80 and 443 open, as in [Decisions](#decisions-before-the-first-deployment) |
+
+Not needed: the private content repository. The missions are in the database (every version, with its specification), and are restored with it. The content's commit is reported when the backup recorded it ([Syncing mission content](#syncing-mission-content)); for older backups it is reported unknown, and the missions are checked against the manifest's fingerprint instead.
+
+### The recovery credential
+
+The host's credential can create and read objects but cannot list them, so a new host could not find the backups with it, and widening it would let a compromised host learn and read every backup name. A second credential, made for recovery and kept by the operator away from the host (with the keys), may list the prefix and read objects, and nothing else: no upload, no deletion, no other prefix. As an S3 policy, with the bucket and prefix of `BACKUP_REMOTE`:
+
+```json
+{"Version": "2012-10-17", "Statement": [
+  {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::<bucket>"],
+   "Condition": {"StringLike": {"s3:prefix": ["<prefix>/", "<prefix>/*"]}}},
+  {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::<bucket>/<prefix>/*"]}]}
+```
+
+Its rclone configuration (a remote named, for example, `recovery`) goes in a file of root's, mode 0600, in a directory only root can change, as identity files; `restore-offsite.sh` refuses it when it is the file, or a copy of the file, named by `BACKUP_RCLONE_CONFIG`. Where a provider cannot restrict listing to a prefix, the credential gets `GetObject` only, and the operator names the receipt instead (`--receipt linuxlab-<time>-<id>-<label>.tar.age.receipt.json`): receipt names are in the backup log and in `backup-status.sh` output, which the operator should keep off the host as well. `infra/tests/minio.sh` creates exactly these credentials; `infra/tests/offsite-cases.sh` checks that the recovery credential lists and reads under the prefix only, cannot upload or delete, and that the host's still cannot list.
+
+### Preparing the new host
+
+As in [Preparing the host](#preparing-the-host): Linux x86_64, Docker Engine 28 or later with the Compose plugin, `python3` 3.10 or later, `git`, `flock`; then, from a clone of `linux-lab-api`:
+
+```sh
+git clone https://github.com/FranciscoPedro06/linux-lab-api /var/lib/linuxlab/src/linux-lab-api
+git clone https://github.com/FranciscoPedro06/linux-lab-web /var/lib/linuxlab/src/linux-lab-web
+cd /var/lib/linuxlab/src/linux-lab-api
+sudo infra/release/install-age.sh
+sudo infra/release/install-rclone.sh
+sudo infra/release/install-gvisor.sh && sudo systemctl restart docker
+```
+
+[Memory and swap](#memory-and-swap) applies before anything is decrypted. Then the settings, the recovery credential and the key; the key on `/run`'s tmpfs, pasted (`cat` reads until Ctrl-D):
+
+```sh
+install -d -m 700 /etc/linuxlab /run/linuxlab-key
+(umask 077; cat >/etc/linuxlab/production.env)          # or from infra/production.env.example
+(umask 022; cat >/etc/linuxlab/backup-recipients.txt)
+(umask 077; cat >/etc/linuxlab/recovery-rclone.conf)
+(umask 077; cat >/run/linuxlab-key/recovery.key)
+infra/release/check-env.sh /etc/linuxlab/production.env
+```
+
+Leave `BACKUP_REMOTE` empty until the recovery is done: the new host's own credential is set afterwards.
+
+### Running it
+
+```sh
+sudo infra/ops/restore-offsite.sh --remote recovery:<bucket>/<prefix> \
+  --rclone-config /etc/linuxlab/recovery-rclone.conf --identity-file /run/linuxlab-key/recovery.key \
+  --api-repo /var/lib/linuxlab/src/linux-lab-api --web-repo /var/lib/linuxlab/src/linux-lab-web
+```
+
+`--check-only` stops after the backup is downloaded, decrypted and checked (no Docker, nothing restored): a rehearsal that can be run from any machine with the tools. In order, the script:
+
+1. Checks the host: Linux x86_64, root, the tools and their tested releases (age, rclone), Docker Engine 28 or later, Compose, `runsc` registered, `check-env.sh` on the environment file, the identity and credential files (owner, mode, directories). Takes the operations' lock.
+2. Lists the receipts under the prefix (or reads the one given), and keeps only those that describe a confirmed copy, made for this bucket and prefix: named as a backup's receipt, `format_version` 1, `status` verified, the object, checksum object and backup id consistent with the name, a size and two SHA-256, a `verified_at` time. Refused receipts are listed with the reason; neither a file name nor an object's date is trusted.
+3. Takes the valid receipts newest first by `verified_at`, and for each: reads its checksum object, which must have the receipt's `checksum_sha256` and name the package with the receipt's `sha256`; checks the room on disk; downloads the package and requires its byte count and SHA-256 to be the receipt's, then its checksum file, then an age header. The first that passes is used; each newer one that did not is reported, with why, and the report warns that what was written after the backup used is lost.
+4. Decrypts the package with age into the work directory (memory), checks it with `package.py` (layout, manifest, each component's size and SHA-256) while unpacking it, and requires its manifest to be of the backup the receipt names.
+5. Requires its own checkout to hold the manifest's API commit in its history, and the clones to hold both commits; builds the release with `infra/release/build.sh` from those exact commits (`git archive` of each), never from a branch or a tag; checks the images' `org.opencontainers.image.revision` labels against the commits. The new image ids differ from the lost host's: the recorded ids are reported, not required.
+6. Creates the project's volumes, labeled with the backup (`linuxlab.recovery`), and refuses any volume of the project that exists without that label: an existing deployment is never written to. Starts PostgreSQL alone (the release's pinned image), requires a server of the dump's major version or later, reads the dump back in full, and requires the database to be empty.
+7. Restores the dump in one transaction (`pg_restore --single-transaction --exit-on-error --no-owner`), then requires the Alembic revision, the schema fingerprint, the missions' fingerprint and the roles to be the manifest's, and every sequence to be ahead of its column; prints the row counts.
+8. Extracts Caddy's data into the new `caddy-data` volume and compares it entry by entry with the package (`tar --compare`); `caddy-config` stays new and empty: Caddy starts from the release's Caddyfile.
+9. Starts the stack (`up --wait`), then checks it: the API's health (database and runtime); every mission's current version read back by the release's own code as provisioning and validation read it, and their number the manifest's; through Caddy on the published port, with the site's name: the certificate served is the restored one, the entry page with the site's headers, client routes, the API's health and routes (401 without a session), no API documentation; Caddy's listeners, 80 and 443.
+10. Writes a report, `/var/lib/linuxlab/recovery/<backup>/report.txt`: the backup used and those rejected, the commits, the release file, the database's revision and missions, Caddy's certificate.
+
+Everything decrypted is removed when the script ends, whatever the reason; only encrypted files are downloaded to disk. Any inconsistency stops the run with exit status 1 and says what was done (`done.*` and `restored.*` files in the backup's recovery directory). Running the same command again goes on from there: a restored database is checked again, not restored again (and a database the recovery did not restore is never overwritten), Caddy's data likewise, the release file is reused when its images still match. To start over, with another backup for example: `docker compose -p linuxlab-prod down --volumes` removes the volumes the recovery made, which hold only restored data. Nothing is ever dropped or overwritten by the script itself.
+
+### After the recovery
+
+1. Point the site's `A` record to the new host; open 80 and 443 in the provider's firewall (and SSH as decided). Caddy serves the restored certificate for `SITE_ADDRESS`, and renews it with ACME as usual once the name resolves to the new host. With another domain, or without Caddy's data in the backup, it requests a new certificate (mind the ACME rate limits: use the staging directory first, as for the first deployment).
+2. The acceptance of [Deploying](#deploying), step 4, on the real host.
+3. Remove the key and the recovery credential from the host: `rm -rf /run/linuxlab-key /etc/linuxlab/recovery-rclone.conf`. Keep `/var/lib/linuxlab/recovery` (encrypted package and report) until the first backup of the new host is confirmed, then remove it.
+4. Give the new host its own credential (`BACKUP_REMOTE`, `BACKUP_RCLONE_CONFIG`, [Copies off the host](#copies-off-the-host)), take a backup and check that it is confirmed off the host; install the cron lines.
+5. Labs the backup recorded as unfinished have no container: the reaper ends them as `container_lost` when the API starts. Students lose what they did after the backup.
+
+### What is tested
+
+- `infra/tests/offsite-cases.sh` (CI, job "Docker image"): the discovery, download and checks against MinIO with real rclone and age, without Docker: the newest backup by `verified_at`, receipts that are not JSON, pending, of another prefix or for other objects; packages changed, cut or missing off the host, a changed checksum object (each rejected, the next one used, the warning); a package under another backup's receipt; a credential without listing (refused, then `--receipt`); the host's own credential refused; a key that is not a recipient; unsafe identity or environment files; unencrypted swap; a work directory on disk.
+- `infra/tests/disaster.sh` (CI, job "Disaster recovery on a new host (runsc)"): an origin on the runner's Docker Engine, with synthetic missions synced at a commit and students who used labs, backed up three times to MinIO with the host's credential (by migrate.sh, then twice by backup.sh, students working in between), then destroyed: its containers, labs, volumes and networks, its three images and its release file, its settings, backups and receipts, each checked gone. A new host, a privileged container with its own Docker Engine on its own volume (no image, volume, release file, backup or receipt of the origin; only MinIO and the keys are shared), is prepared with the repository's installers and recovered with `restore-offsite.sh` as `linuxlab-prod`, with the swap of the runner turned off. Then: every table's rows, the sequences, the extensions and the schema equal the origin's; the content commit is the one synced; Caddy's certificate and CA are the origin's and served; the images carry the manifest's commits; a second run restores nothing again; a volume not made by the recovery is refused; the site's checks pass through the new Caddy; a student of the origin logs in with their password and finds their progress; a new student's whole session runs with labs under runsc on the new host.
+
+Not tested: the private missions (CI has no access to `linux-lab-content`; the origin syncs the synthetic missions of `tests/fixtures/content` from a commit of a throwaway repository, through `content-sync.sh`), a real provider (only MinIO: listing restricted by prefix, conditional writes and error codes may differ), a real domain with an ACME certificate restored and renewed (the tests use Caddy's local CA for `linuxlab.localhost`), DNS and firewall changes, a host provisioned by a provider image (the tests use Alpine in a container with Docker's `dind` image), and databases of production size.
+
+### Known limitations
+
+- **Content commit of older backups.** Backups taken before `content_syncs` existed, or after a sync run without a commit, record no content commit (`code.content.sha` is null, and `code.content.source` says why). Their missions are restored from the database and checked against the manifest's fingerprint; the commit they came from is reported unknown. Backups taken after a `content-sync.sh` record it.
+- **Secrets are the operator's.** `production.env`, the recipients file, the recovery credential and an age private key are not in any backup and cannot be recovered from one. Without a private key the backups are unreadable; without the recovery credential (or the receipt names and a reading credential), the backups cannot be found.
+- **Domain and DNS.** The restored certificate is only useful under the same `SITE_ADDRESS`, once DNS points to the new host. Until then the platform answers only by address.
+- **Rebuilt images are not the lost host's images.** They are built from the same commits, but the API's `Dockerfile` uses base images by tag (the edge's and PostgreSQL's are pinned by digest), and `npm ci` and `uv sync` resolve from their lock files at build time: a base image updated since gives other image ids. The labels prove the source commit, not bit-for-bit identity.
+- **MinIO is not the provider.** Listing restricted to a prefix, the policy syntax, and how a provider answers a missing or forbidden object are checked against MinIO only.
+- **Memory and space.** The decrypted package and its unpacked components need about twice the package's size in the work directory (memory); Docker needs room for the images and the restored database (the script requires 6 GiB plus ten times the dump's size). Both are checked before anything is restored; a tmpfs sized for this must be mounted when `/run` is too small ([Memory and swap](#memory-and-swap)).
+- **No restore of PostgreSQL globals.** As for any restore: only the role `linuxlab`, created by the postgres image, exists; a database with other roles is not backed up ([Backups](#backups)).
 
 ## Checking labs
 
@@ -350,4 +473,5 @@ Only when the conditions in [deployment.md](deployment.md#entry-through-ngrok) a
 | Certificate errors | Caddy's log (ACME errors); DNS still points to the host; ports 80 and 443 reachable; staging directory left in `ACME_CA` |
 | API refuses to start | Its log: `refusing to start` means Docker or runsc is not available ([runtime.md](runtime.md)) |
 | Labs fail to start | `lab_start_failed` and setup errors in the API's log; `LAB_CAPACITY` reached; disk and memory (`check-labs.sh`) |
-| Suspected compromise of the API or a lab escape | Stop the stack (`docker compose ... stop`), keep the host as it is for investigation, do not restore over it. The API has root-equivalent access to the host through the Docker socket ([threat-model.md](threat-model.md#accepted-risks)) |
+| Suspected compromise of the API or a lab escape | Stop the stack (`docker compose ... stop`), keep the host as it is for investigation, do not restore over it. The API has root-equivalent access to the host through the Docker socket ([threat-model.md](threat-model.md#accepted-risks)). Rebuild on a new host ([Disaster recovery](#disaster-recovery)), and rotate the secrets the old host held |
+| The host is lost | [Disaster recovery](#disaster-recovery) |
