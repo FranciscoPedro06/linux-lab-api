@@ -123,7 +123,8 @@ database_name() {
 
 # Facts about a database, for the backup's manifest and for restore.sh to compare
 # with what it restored. None of them changes while the lock is held: migrations and
-# content syncs take it too, and the API changes neither the schema nor the missions.
+# content syncs take it too, and the API changes neither the schema nor the missions
+# and questions.
 
 # Status 0 when the table exists in the public schema.
 has_table() {
@@ -181,17 +182,36 @@ JOIN mission_versions AS v ON v.mission_id = m.id AND v.version = m.current_vers
 SQL
 }
 
-# "<commit or -> <synced_at> <missions> <fingerprint>" of the last sync recorded in
-# content_syncs (empty when the table does not exist or has no row). A sync records
-# the commit only when content-sync.sh named it.
+# "<questions> <SHA-256>" of the questions as synced, as content_fingerprint for the
+# missions (empty when the database has no questions table yet). The SHA-256 of no
+# questions is that of nothing.
+question_fingerprint() {
+    has_table "$1" questions || return 0
+    psql_on "$1" -f - <<'SQL'
+-- linuxlab: question fingerprint
+SELECT count(*) || ' ' || encode(sha256(convert_to(coalesce(string_agg(
+           format('%s %s %s %s', q.slug, q.status, q.current_version, v.content_hash),
+           E'\n' ORDER BY q.slug), ''), 'UTF8')), 'hex')
+FROM questions AS q
+JOIN question_versions AS v ON v.question_id = q.id AND v.version = q.current_version
+SQL
+}
+
+# "<commit or -> <synced_at> <missions> <fingerprint> <questions> <fingerprint>" of
+# the last sync recorded in content_syncs (empty when the table does not exist or has
+# no row). A sync records the commit only when content-sync.sh named it. The
+# questions are "- -" in a schema of before them, whose content_syncs has no such
+# columns: to_jsonb reads the row whatever its columns.
 last_content_sync() {
     has_table "$1" content_syncs || return 0
     psql_on "$1" -f - <<'SQL'
 -- linuxlab: last content sync
 SELECT coalesce(source_commit, '-') || ' '
        || to_char(synced_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') || ' '
-       || missions || ' ' || fingerprint
-FROM content_syncs ORDER BY id DESC LIMIT 1
+       || missions || ' ' || fingerprint || ' '
+       || coalesce(to_jsonb(c) ->> 'questions', '-') || ' '
+       || coalesce(to_jsonb(c) ->> 'question_fingerprint', '-')
+FROM content_syncs AS c ORDER BY id DESC LIMIT 1
 SQL
 }
 
@@ -378,7 +398,7 @@ drop_restore_target() {
 # restore_database DUMP EXPECTED: EXPECTED is what `package.py check` printed for the
 # package. Fails (exit 1) on any difference; the caller's trap drops the database.
 restore_database() {
-    local dump=$1 expected_file=$2 current major target exists revision content
+    local dump=$1 expected_file=$2 current major target exists revision content questions
     expected() { sed -n "s/^$1 //p" "$expected_file"; }
     current=$(database_name)
     major=$(($(psql_on postgres -c "SHOW server_version_num") / 10000))
@@ -407,7 +427,9 @@ restore_database() {
     compare "the schema fingerprint" "$(schema_fingerprint "$target")" "$(expected schema_fingerprint)"
     content=$(content_fingerprint "$target")
     compare "the missions" "${content:--}" "$(expected content)"
-    note "the restored database matches the manifest (revision, schema, missions)"
+    questions=$(question_fingerprint "$target")
+    compare "the questions" "${questions:--}" "$(expected questions)"
+    note "the restored database matches the manifest (revision, schema, missions, questions)"
 
     echo "restored $target:"
     restore_report "$target" | sed 's/^/  /'
@@ -423,6 +445,8 @@ restore_report() {
         FROM (VALUES ('alembic_version', 'string_agg(version_num, '','')'),
                      ('users', 'count(*)'), ('lab_sessions', 'count(*)'),
                      ('mission_versions', 'count(*)'), ('user_missions', 'count(*)'),
+                     ('question_versions', 'count(*)'), ('user_questions', 'count(*)'),
+                     ('question_attempts', 'count(*)'),
                      ('validation_runs', 'count(*)'), ('command_history', 'count(*)'))
              AS t (name, expression)
         WHERE to_regclass(name) IS NOT NULL"

@@ -132,17 +132,21 @@ pg_dump_version=$(compose exec -T postgres pg_dump --version)
 revision=$(alembic_revision "$database")
 schema=$(schema_fingerprint "$database")
 content=$(content_fingerprint "$database")
+questions=$(question_fingerprint "$database")
 # The content's commit: that of the last recorded sync, and only while the missions
-# are still what that sync left (package.py says why when there is none).
+# and the questions are still what that sync left (package.py says why when there is
+# none). Without a questions table, both sides are "- -".
 content_sha='' content_synced_at='' content_reason=no-table
 if has_table "$database" content_syncs; then
     content_reason=no-sync
     last_sync=$(last_content_sync "$database")
     if [ -n "$last_sync" ]; then
-        read -r last_commit last_at last_missions last_fingerprint <<<"$last_sync"
+        read -r last_commit last_at last_missions last_fingerprint last_questions \
+            last_question_fingerprint <<<"$last_sync"
         if [ "$last_commit" = - ]; then
             content_reason=no-commit
-        elif [ "$last_missions $last_fingerprint" != "$content" ]; then
+        elif [ "$last_missions $last_fingerprint" != "$content" ] \
+            || [ "${last_questions:--} ${last_question_fingerprint:--}" != "${questions:-- -}" ]; then
             content_reason=changed
         else
             content_sha=$last_commit content_synced_at=$last_at content_reason=recorded
@@ -196,7 +200,7 @@ python3 "$OPS_DIR/package.py" build "$plain" "${components[@]}" \
     --fact "database=$database" --fact "server_version=$server_version" \
     --fact "server_version_num=$server_version_num" --fact "pg_dump_version=$pg_dump_version" \
     --fact "alembic_revision=$revision" --fact "schema_fingerprint=$schema" \
-    --fact "content=$content" --fact "content_sha=$content_sha" \
+    --fact "content=$content" --fact "questions=$questions" --fact "content_sha=$content_sha" \
     --fact "content_synced_at=$content_synced_at" --fact "content_sha_reason=$content_reason" \
     --fact "roles=$roles" --fact "caddy_data=$caddy_data" \
     || fail "the package could not be written; no backup written"

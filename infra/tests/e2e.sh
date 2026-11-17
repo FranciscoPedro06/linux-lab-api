@@ -436,6 +436,7 @@ content = m["code"]["content"]
 assert synced == recorded == content["sha"], (synced, recorded, content)
 assert content["synced_at"] and content["source"].startswith("content_syncs"), content
 assert content["missions"] > 0, content
+assert content["questions"] == 3 and content["question_fingerprint"], content
 assert pg["alembic_revision"] == revision and pg["server_version_num"] == int(version_num), pg
 assert pg["roles"] == [{"name": "linuxlab", "superuser": True}], pg
 assert m["restore"]["postgresql_major_at_least"] == int(version_num) // 10000
@@ -467,7 +468,7 @@ users_before=$(compose exec -T postgres psql -At -U linuxlab -d linuxlab -c 'SEL
 restore() { "$repo/infra/ops/restore.sh" "$release" "$@"; }
 restores_with() {
     restore "$package" --identity-file "$work/keys/$1.key" >"$work/restore-$1.log" 2>&1 \
-        && grep -q "matches the manifest (revision, schema, missions)" "$work/restore-$1.log"
+        && grep -q "matches the manifest (revision, schema, missions, questions)" "$work/restore-$1.log"
 }
 expect_ok "restore.sh with the operator's key: restored into a new database, matching the manifest, and dropped it" \
     restores_with operator
