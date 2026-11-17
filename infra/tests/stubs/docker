@@ -25,9 +25,9 @@
 #   STUB_REVISION_<image>            revision label of the image api, lab or edge
 #   STUB_RUNNING_<service>           image id of the service's running container
 #   STUB_ROLES                       roles (default linuxlab:true)
-#   STUB_ALEMBIC, STUB_SCHEMA, STUB_CONTENT, STUB_TABLES
-#                                    revision, schema and content fingerprints, and
-#                                    whether tables exist (t or f)
+#   STUB_ALEMBIC, STUB_SCHEMA, STUB_CONTENT, STUB_QUESTIONS, STUB_TABLES
+#                                    revision, schema, content and question
+#                                    fingerprints, and whether tables exist (t or f)
 #   STUB_DATABASE_SIZE               pg_database_size in bytes (default 1000000)
 #   STUB_LAST_SYNC                   the last row of content_syncs, as lib.sh reads it
 #                                    (default: none)
@@ -107,6 +107,7 @@ case "$args" in
         case "$sql" in
             *"schema fingerprint"*) fact SCHEMA "$(printf 'c%.0s' $(seq 64))" ;;
             *"content fingerprint"*) fact CONTENT "5 $(printf 'd%.0s' $(seq 64))" ;;
+            *"question fingerprint"*) fact QUESTIONS "2 $(printf 'e%.0s' $(seq 64))" ;;
             *"last content sync"*) fact LAST_SYNC '' ;;
         esac
         ;;

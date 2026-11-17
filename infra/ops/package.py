@@ -72,7 +72,8 @@ GLOBALS = (
 # backup.sh before content_syncs existed), CONTENT_SHA_SOURCE.
 FINGERPRINT_NOTE = (
     " The fingerprint identifies the missions in this dump (slug, status, current version"
-    " and its content_hash, which can be recomputed from a checkout of linux-lab-content)"
+    " and its content_hash, which can be recomputed from a checkout of linux-lab-content),"
+    " and question_fingerprint the questions, in the same way"
 )
 CONTENT_SHA_SOURCE = (
     "not recorded: content-sync.sh does not store the commit it synced." + FINGERPRINT_NOTE
@@ -84,10 +85,11 @@ CONTENT_SHA_REASONS = {
     + FINGERPRINT_NOTE,
     "no-commit": "not recorded: the last content sync was run without a commit (not by"
     " content-sync.sh)." + FINGERPRINT_NOTE,
-    "changed": "not recorded: the missions differ from what the last recorded content"
-    " sync left, so its commit would not describe them." + FINGERPRINT_NOTE,
+    "changed": "not recorded: the missions or the questions differ from what the last"
+    " recorded content sync left, so its commit would not describe them." + FINGERPRINT_NOTE,
     "recorded": "content_syncs: the commit the last content sync synced (content-sync.sh"
-    " checks that the checkout is at it, unchanged), whose missions fingerprint is this one",
+    " checks that the checkout is at it, unchanged), whose missions and questions"
+    " fingerprints are these",
 }
 REQUIRES = [
     "PostgreSQL of the dump's major version or later, and its pg_restore"
@@ -145,7 +147,8 @@ class Facts:
             "api_sha", "api_image_id", "api_image_revision", "api_running_image_id",
             "web_sha", "edge_image_id", "web_image_revision", "edge_running_image_id",
             "database", "server_version", "server_version_num", "pg_dump_version",
-            "alembic_revision", "schema_fingerprint", "content", "roles", "caddy_data",
+            "alembic_revision", "schema_fingerprint", "content", "questions", "roles",
+            "caddy_data",
             "content_sha", "content_synced_at", "content_sha_reason",
         }
     )  # fmt: skip
@@ -175,12 +178,15 @@ class Facts:
             roles.append({"name": name, "superuser": superuser == "true"})
         return roles
 
-    def content(self) -> tuple[int | None, str | None]:
-        value = self.values.get("content", "")
+    def content(self, key: str = "content") -> tuple[int | None, str | None]:
+        """ "<count> <SHA-256>" of the missions (content) or of the questions (questions):
+        none when the database has no such table, or when backup.sh did not say (one
+        from before questions existed)."""
+        value = self.values.get(key, "")
         if value == "":
             return None, None
         count, _, fingerprint = value.partition(" ")
-        expect(count.isdigit() and bool(SHA256.match(fingerprint)), "fact content is malformed")
+        expect(count.isdigit() and bool(SHA256.match(fingerprint)), f"fact {key} is malformed")
         return int(count), fingerprint
 
     def content_source(self) -> dict[str, Any]:
@@ -201,6 +207,7 @@ class Facts:
 
 def build_manifest(facts: Facts, components: list[dict[str, Any]]) -> dict[str, Any]:
     missions, content_fingerprint = facts.content()
+    questions, question_fingerprint = facts.content("questions")
     version_num = int(facts.get("server_version_num", SERVER_VERSION_NUM))
     has_caddy = any(component["name"] == "caddy-data" for component in components)
     return {
@@ -230,6 +237,8 @@ def build_manifest(facts: Facts, components: list[dict[str, Any]]) -> dict[str, 
                 **facts.content_source(),
                 "missions": missions,
                 "fingerprint": content_fingerprint,
+                "questions": questions,
+                "question_fingerprint": question_fingerprint,
             },
         },
         "postgresql": {
@@ -327,6 +336,23 @@ def validate_manifest(manifest: Any) -> list[dict[str, Any]]:
     matches(content.get("sha"), SHA1, "code.content.sha", optional=True)
     matches(content.get("synced_at"), TIMESTAMP, "code.content.synced_at", optional=True)
     matches(content.get("fingerprint"), SHA256, "code.content.fingerprint", optional=True)
+    # Absent from the manifests of before questions: read as none.
+    matches(
+        content.get("question_fingerprint"),
+        SHA256,
+        "code.content.question_fingerprint",
+        optional=True,
+    )
+    questions = content.get("questions")
+    expect(
+        questions is None
+        or (isinstance(questions, int) and not isinstance(questions, bool) and questions >= 0),
+        "manifest: code.content.questions is malformed",
+    )
+    expect(
+        (questions is None) == (content.get("question_fingerprint") is None),
+        "manifest: code.content.questions and question_fingerprint go together",
+    )
     postgresql = field(manifest, "postgresql", dict, "")
     field(postgresql, "database", str, "postgresql.")
     field(postgresql, "server_version_num", int, "postgresql.")
@@ -421,6 +447,10 @@ def check(package: Path, extract: Path | None, out: Callable[[str], None]) -> No
         out(f"content {content.get('missions')} {content['fingerprint']}")
     else:
         out("content -")
+    if content.get("question_fingerprint"):
+        out(f"questions {content['questions']} {content['question_fingerprint']}")
+    else:
+        out("questions -")
     out(f"content_sha {content.get('sha') or '-'}")
     out(f"postgresql_major_at_least {manifest['restore']['postgresql_major_at_least']}")
 

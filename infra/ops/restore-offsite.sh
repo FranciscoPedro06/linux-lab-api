@@ -358,12 +358,14 @@ compare() {
     [ "$2" = "$3" ] || fail "the database differs from the manifest: $1 is ${2:--}, the manifest says ${3:--}"
 }
 check_database() {
-    local revision content
+    local revision content questions
     revision=$(alembic_revision "$database")
     compare "the Alembic revision" "${revision:--}" "$(expected alembic_revision)"
     compare "the schema fingerprint" "$(schema_fingerprint "$database")" "$(expected schema_fingerprint)"
     content=$(content_fingerprint "$database")
     compare "the missions" "${content:--}" "$(expected content)"
+    questions=$(question_fingerprint "$database")
+    compare "the questions" "${questions:--}" "$(expected questions)"
     compare "the roles" "$(database_roles "$database")" "linuxlab:true"
 }
 if [ "$objects" = 0 ]; then
@@ -396,7 +398,7 @@ SQL
 )
 [ -z "$behind" ] || fail "sequences behind their columns after the restore: $behind"
 touch "$STATE_DIR/done.database"
-note "$database matches the manifest: Alembic revision, schema, missions, roles; sequences ahead of their columns"
+note "$database matches the manifest: Alembic revision, schema, missions, questions, roles; sequences ahead of their columns"
 restore_report "$database" | sed 's/^/    /' >&2
 
 # ---------------------------------------------------------------------------
@@ -483,6 +485,46 @@ recorded_count=$(expected content | cut -d' ' -f1)
 [ "$recorded_count" = - ] || [ "$mission_count" = "$recorded_count" ] \
     || fail "$mission_count missions read back, the manifest records $recorded_count"
 note "missions: $mission_count, $published published, each current version loads with the release's code"
+# The questions the same way: every question's current version must load as the
+# answer endpoint reads it.
+questions=$(compose run --rm --no-deps -T task python - <<'PY'
+import asyncio
+from sqlalchemy import select
+from linuxlab.config import get_settings
+from linuxlab.content.models import Question, QuestionVersion
+from linuxlab.content.stored import question_spec
+from linuxlab.db import create_engine
+
+async def main():
+    engine = create_engine(get_settings().database_url)
+    try:
+        async with engine.connect() as connection:
+            rows = (await connection.execute(
+                select(Question.slug, Question.status, QuestionVersion.spec).join(
+                    QuestionVersion,
+                    (QuestionVersion.question_id == Question.id) & (QuestionVersion.version == Question.current_version),
+                )
+            )).all()
+    finally:
+        await engine.dispose()
+    broken = []
+    for slug, status, spec in rows:
+        try:
+            question_spec(spec)
+        except Exception:
+            broken.append(slug)
+    published = sum(1 for _, status, _ in rows if status == "published")
+    print(len(rows), published, ",".join(broken) or "-")
+
+asyncio.run(main())
+PY
+) || fail "the questions could not be read back with the release's code"
+read -r question_count questions_published broken <<<"$questions"
+[ "$broken" = - ] || fail "questions whose current version this release cannot use: $broken"
+recorded_count=$(expected questions | cut -d' ' -f1)
+[ "$recorded_count" = - ] || [ "$question_count" = "$recorded_count" ] \
+    || fail "$question_count questions read back, the manifest records $recorded_count"
+note "questions: $question_count, $questions_published published, each current version loads with the release's code"
 # The site's server in the configuration Caddy loaded from the release's Caddyfile
 # listens on :443. Its HTTP to HTTPS redirect on :80 is a server Caddy adds by itself
 # and does not show there: it is checked by a request to the published port instead.

@@ -10,7 +10,7 @@ exits 1 if any failed.
     python e2e.py site
     python e2e.py flow EMAIL OTHER_EMAIL
     python e2e.py restart EMAIL
-    python e2e.py returning EMAIL MISSION
+    python e2e.py returning EMAIL MISSION QUESTION
     python e2e.py end EMAIL
 """
 
@@ -279,6 +279,8 @@ def flow(email: str, other_email: str) -> None:
         commands,
     )
 
+    answer_questions(site)
+
     expect(
         handshake_status(site, lab_id, "https://evil.example") == 403,
         "terminal refused for another origin",
@@ -339,6 +341,61 @@ def flow(email: str, other_email: str) -> None:
     finish()
 
 
+# The synthetic question of tests/fixtures/content: its correct option, a wrong one
+# and what only an answer may reveal.
+QUESTION = "sample-choice"
+RIGHT, WRONG = "pwd", "cd"
+SECRETS = ("Feedback sintético", "Explicação sintética")
+
+
+def question_card(site: "Site", slug: str) -> dict[str, Any]:
+    status, modules = site.json("GET", "/api/question-modules")
+    cards = {
+        card["slug"]: card
+        for module in (modules if status == 200 else [])
+        for card in module["questions"]
+    }
+    card: dict[str, Any] = cards.get(slug, {})
+    return card
+
+
+def answer_questions(site: "Site") -> None:
+    """A question read without its answer, a wrong answer, then the right one."""
+    card = question_card(site, QUESTION)
+    expect(card.get("progress", {}).get("status") == "not_answered", "question listed", card)
+    status, question = site.json("GET", f"/api/questions/{QUESTION}")
+    raw = json.dumps(question, ensure_ascii=False)
+    expect(
+        status == 200
+        and [option["id"] for option in question.get("options", [])] == ["cd", "pwd", "ls"]
+        and not {"answer", "explanation"} & set(question)
+        and all(set(option) == {"id", "text"} for option in question.get("options", []))
+        and not any(secret in raw for secret in SECRETS),
+        "question read without its answer, feedback or explanation",
+        (status, question),
+    )
+    version = question.get("version")
+    path = f"/api/questions/{QUESTION}/answers"
+    status, wrong = site.json("POST", path, {"version": version, "option": WRONG})
+    expect(
+        status == 200
+        and wrong.get("correct") is False
+        and (wrong.get("feedback") or "").startswith("Feedback sintético")
+        and wrong.get("progress", {}).get("status") == "attempted",
+        "wrong answer: its feedback",
+        (status, wrong),
+    )
+    status, right = site.json("POST", path, {"version": version, "option": RIGHT})
+    expect(
+        status == 200
+        and right.get("correct") is True
+        and right.get("newly_completed") is True
+        and right.get("progress", {}).get("attempts") == 2,
+        "right answer: question completed",
+        (status, right),
+    )
+
+
 def restart(email: str) -> None:
     """Holds a terminal while e2e.sh restarts the API, then reconnects like the web."""
     site = Site()
@@ -366,9 +423,10 @@ def restart(email: str) -> None:
     finish()
 
 
-def returning(email: str, mission: str) -> None:
-    """An account of before a recovery: logs in with its password, finds the mission it
-    completed there, and can still start a lab of it (infra/tests/disaster.sh)."""
+def returning(email: str, mission: str, question: str) -> None:
+    """An account of before a recovery: logs in with its password, finds the mission and
+    the question it completed there, can still start a lab of the mission and answer
+    the question (infra/tests/disaster.sh)."""
     site = Site()
     status, _ = site.json("POST", "/api/auth/login", {"email": email, "password": PASSWORD})
     expect(status == 200, f"{email} logs in with the password set before the loss", status)
@@ -380,6 +438,23 @@ def returning(email: str, mission: str) -> None:
     }
     progress = cards.get(mission, {}).get("progress", {})
     expect(progress.get("status") == "completed", f"{mission} still completed", progress)
+    progress = question_card(site, question).get("progress", {})
+    expect(
+        progress.get("status") == "completed" and progress.get("attempts") == 2,
+        f"{question} still completed, with its two answers",
+        progress,
+    )
+    status, detail = site.json("GET", f"/api/questions/{question}")
+    status, again = site.json(
+        "POST",
+        f"/api/questions/{question}/answers",
+        {"version": detail.get("version"), "option": RIGHT},
+    )
+    expect(
+        status == 200 and again.get("correct") is True and again.get("newly_completed") is False,
+        f"{question} answered again, its first completion kept",
+        (status, again),
+    )
     status, lab = site.json("POST", "/api/labs", {"mission_slug": mission})
     expect(status == 201 and lab.get("status") == "ready", "a lab of it starts", (status, lab))
     if status == 201:

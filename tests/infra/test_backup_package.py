@@ -49,6 +49,7 @@ FACTS = {
     "alembic_revision": "e6b40c7d9a18",
     "schema_fingerprint": "c" * 64,
     "content": "5 " + "d" * 64,
+    "questions": "2 " + "e" * 64,
     "roles": "linuxlab:true",
     "caddy_data": "",
 }
@@ -120,9 +121,52 @@ def test_a_built_package_checks_and_says_what_restore_compares(tmp_path: Path) -
         "alembic_revision e6b40c7d9a18",
         f"schema_fingerprint {'c' * 64}",
         f"content 5 {'d' * 64}",
+        f"questions 2 {'e' * 64}",
         "content_sha -",
         "postgresql_major_at_least 16",
     ]
+
+
+def test_the_questions_are_in_the_manifest(tmp_path: Path) -> None:
+    content = manifest_of(build(tmp_path))["code"]["content"]
+    assert (content["questions"], content["question_fingerprint"]) == (2, "e" * 64)
+
+
+def test_without_a_questions_table_the_manifest_records_none(tmp_path: Path) -> None:
+    path = build(tmp_path, facts={"questions": ""})
+    content = manifest_of(path)["code"]["content"]
+    assert (content["questions"], content["question_fingerprint"]) == (None, None)
+    assert "questions -" in check(path)
+
+
+def test_a_manifest_of_before_questions_still_checks(tmp_path: Path) -> None:
+    path = build(tmp_path)
+
+    def drop(manifest: dict[str, Any]) -> None:
+        del manifest["code"]["content"]["questions"]
+        del manifest["code"]["content"]["question_fingerprint"]
+
+    rewrite(path, drop)
+    assert "questions -" in check(path)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"questions": -1},
+        {"questions": True},
+        {"questions": "2"},
+        {"question_fingerprint": "e"},
+        {"questions": None},
+        {"question_fingerprint": None},
+    ],
+)
+def test_malformed_questions_in_the_manifest_are_refused(
+    tmp_path: Path, change: dict[str, Any]
+) -> None:
+    path = build(tmp_path)
+    rewrite(path, lambda m: m["code"]["content"].update(change))
+    refused(path, "code.content.question")
 
 
 CONTENT_SHA = "89abcdef0123456789abcdef0123456789abcdef"
@@ -233,6 +277,8 @@ def test_without_caddy_data_the_manifest_says_why(tmp_path: Path) -> None:
         ("api_image_id", "sha256:stub"),
         ("alembic_revision", "head; DROP"),
         ("schema_fingerprint", ""),
+        ("questions", "2"),
+        ("questions", "x " + "e" * 64),
         ("server_version_num", "16"),
         ("roles", "linuxlab:yes"),
     ],

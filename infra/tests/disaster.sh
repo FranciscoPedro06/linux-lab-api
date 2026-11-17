@@ -422,7 +422,7 @@ else
     tail -n 60 "$work/recovery.log" >&2
     exit 1
 fi
-sed 's/^/    /' "$work/recovery.log" | grep -E '^    (==|.*(selected|valid receipt|images built|matches the manifest|restored into|missions:|API:|Caddy:|ok |note )|backup:|api:|web:|content:)' || true
+sed 's/^/    /' "$work/recovery.log" | grep -E '^    (==|.*(selected|valid receipt|images built|matches the manifest|restored into|missions:|questions:|API:|Caddy:|ok |note )|backup:|api:|web:|content:)' || true
 expect_ok "the newest backup was found and used ($last_key)" grep -q "^backup: $last_key " "$work/recovery.log"
 expect_ok "  found by listing with the recovery credential, not from a file of A" grep -q "$backups_a valid receipt(s) of $backups_a" "$work/recovery.log"
 
@@ -486,8 +486,8 @@ client_b() {
 }
 memory_note "B recovered"
 expect_ok "the site through B's Caddy: headers, routes, API, limits, redirect" logged b-site.log client_b site
-expect_ok "ana, a student of A, logs in on B and finds sample-file completed; a lab of it starts under runsc" \
-    logged b-returning.log client_b returning ana@dr.example sample-file
+expect_ok "ana, a student of A, logs in on B and finds sample-file and sample-choice completed; a lab of it starts under runsc" \
+    logged b-returning.log client_b returning ana@dr.example sample-file sample-choice
 expect_ok "a new student's whole session on B: lab, terminal, validation, history, reset, switch" \
     logged b-flow.log client_b flow erin@dr.example fabi@dr.example
 expect_ok "B's API runs labs under runsc, in production mode" \

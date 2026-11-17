@@ -152,7 +152,8 @@ package_plain() {
         web_image_revision= edge_running_image_id= database=linuxlab server_version=16.15
         server_version_num=160015 "pg_dump_version=pg_dump (PostgreSQL) 16.15"
         alembic_revision=e6b40c7d9a18 "schema_fingerprint=$(printf 'c%.0s' $(seq 64))"
-        "content=5 $(printf 'd%.0s' $(seq 64))" roles=linuxlab:true "caddy_data=no volume"
+        "content=5 $(printf 'd%.0s' $(seq 64))" "questions=2 $(printf 'e%.0s' $(seq 64))"
+        roles=linuxlab:true "caddy_data=no volume"
     )
     local given
     for given in "$@"; do
@@ -256,6 +257,9 @@ check "  the API and web commits of the release file" \
 check "  no content commit, and why" \
     test "$(json "$package" 'm["code"]["content"]["sha"] is None and "not recorded" in m["code"]["content"]["source"]')" = true
 check "  the missions' fingerprint" test "$(json "$package" 'm["code"]["content"]["missions"]')" = 5
+check "  the questions' fingerprint" \
+    test "$(json "$package" '[m["code"]["content"]["questions"], m["code"]["content"]["question_fingerprint"]]')" \
+    = "[2, \"$(printf 'e%.0s' $(seq 64))\"]"
 check "  the database, its server, pg_dump and Alembic revision" \
     test "$(json "$package" '[m["postgresql"][k] for k in ("database", "server_version_num", "pg_dump_version", "alembic_revision", "schema_fingerprint")]')" \
     = "[\"linuxlab\", 160015, \"pg_dump (PostgreSQL) 16.15\", \"e6b40c7d9a18\", \"$schema_c\"]"
@@ -416,27 +420,43 @@ check "  a running API that is not the release's is reported" err_says "not this
 reset
 STUB_TABLES=f backup
 package=$(cat "$work/out")
-check "a database never migrated: no Alembic revision and no missions" \
-    test "$(json "$package" '[m["postgresql"]["alembic_revision"], m["code"]["content"]["fingerprint"]]')" = "[null, null]"
+check "a database never migrated: no Alembic revision, no missions and no questions" \
+    test "$(json "$package" '[m["postgresql"]["alembic_revision"], m["code"]["content"]["fingerprint"], m["code"]["content"]["question_fingerprint"]]')" = "[null, null, null]"
 check "  and no content commit, because there is no content_syncs table" \
     test "$(json "$package" '[m["code"]["content"]["sha"], "no content_syncs table" in m["code"]["content"]["source"]]')" = "[null, true]"
 content_sha=89abcdef0123456789abcdef0123456789abcdef
 fingerprint_d=$(printf 'd%.0s' $(seq 64))
+fingerprint_e=$(printf 'e%.0s' $(seq 64))
 reset
-STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 5 $fingerprint_d" backup
+STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 5 $fingerprint_d 2 $fingerprint_e" backup
 package=$(cat "$work/out")
-check "the commit of the last recorded content sync, while the missions are what it left" \
+check "the commit of the last recorded content sync, while the missions and questions are what it left" \
     test "$(json "$package" '[m["code"]["content"]["sha"], m["code"]["content"]["synced_at"], m["code"]["content"]["source"].startswith("content_syncs")]')" \
     = "[\"$content_sha\", \"2026-11-05T10:00:00Z\", true]"
 check "  package.py check prints it" \
     test "$(decrypt "$package" one && python3 "$ops/package.py" check "$work/decrypted.tar" | sed -n 's/^content_sha //p')" = "$content_sha"
 reset
-STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 4 $fingerprint_d" backup
+STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 4 $fingerprint_d 2 $fingerprint_e" backup
 package=$(cat "$work/out")
 check "no content commit when the missions changed after the last recorded sync" \
     test "$(json "$package" '[m["code"]["content"]["sha"], m["code"]["content"]["synced_at"], "differ from what the last recorded" in m["code"]["content"]["source"]]')" = "[null, null, true]"
 reset
-STUB_LAST_SYNC="- 2026-11-05T10:00:00Z 5 $fingerprint_d" backup
+STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 5 $fingerprint_d 1 $fingerprint_e" backup
+package=$(cat "$work/out")
+check "no content commit when the questions changed after the last recorded sync" \
+    test "$(json "$package" '[m["code"]["content"]["sha"], "differ from what the last recorded" in m["code"]["content"]["source"]]')" = "[null, true]"
+reset
+STUB_QUESTIONS='' STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 5 $fingerprint_d - -" backup
+package=$(cat "$work/out")
+check "a sync of a schema without questions still names its commit" \
+    test "$(json "$package" '[m["code"]["content"]["sha"], m["code"]["content"]["questions"]]')" = "[\"$content_sha\", null]"
+reset
+STUB_LAST_SYNC="$content_sha 2026-11-05T10:00:00Z 5 $fingerprint_d - -" backup
+package=$(cat "$work/out")
+check "no content commit when questions appeared after a sync of before them" \
+    test "$(json "$package" 'm["code"]["content"]["sha"]')" = null
+reset
+STUB_LAST_SYNC="- 2026-11-05T10:00:00Z 5 $fingerprint_d 2 $fingerprint_e" backup
 package=$(cat "$work/out")
 check "no content commit when the last sync named none" \
     test "$(json "$package" '[m["code"]["content"]["sha"], "without a commit" in m["code"]["content"]["source"]]')" = "[null, true]"

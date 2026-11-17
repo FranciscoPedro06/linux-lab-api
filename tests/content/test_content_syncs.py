@@ -1,5 +1,6 @@
 """content_syncs: the record of each sync, read by backups (infra/ops/backup.sh)."""
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from linuxlab.content.loader import load_content
 from linuxlab.content.sync import EmptyContent, sync_content
 from tests.auth.support import run, sql
 
-from .support import copy_fixture, edit_yaml, mission_file
+from .support import copy_fixture, edit_yaml, mission_file, module_file
 
 pytestmark = pytest.mark.integration
 
@@ -48,10 +49,12 @@ def rows(client: TestClient) -> list[tuple[Any, ...]]:
 
 
 def backup_reads(client: TestClient) -> tuple[str, str]:
-    """What backup.sh compares: the missions now, and the last recorded sync."""
-    ((now,),) = sql(client, lib_query("content fingerprint"))
+    """What backup.sh compares: the missions and the questions now, and the last
+    recorded sync."""
+    ((missions,),) = sql(client, lib_query("content fingerprint"))
+    ((questions,),) = sql(client, lib_query("question fingerprint"))
     ((last,),) = sql(client, lib_query("last content sync"))
-    return now, last
+    return f"{missions} {questions}", last
 
 
 def test_each_sync_is_recorded_with_its_commit_and_fingerprint(
@@ -73,10 +76,61 @@ def test_the_fingerprint_is_lib_sh_s(client: TestClient, tmp_path: Path) -> None
     sync(client, root, COMMIT)
 
     now, last = backup_reads(client)
-    commit, synced_at, missions, fingerprint = last.split(" ")
+    commit, synced_at, missions, fingerprint, questions, question_fingerprint = last.split(" ")
     assert commit == COMMIT
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", synced_at)
-    assert f"{missions} {fingerprint}" == now
+    assert f"{missions} {fingerprint} {questions} {question_fingerprint}" == now
+    assert questions == "3"
+
+
+def test_the_question_fingerprint_is_lib_sh_s(client: TestClient, tmp_path: Path) -> None:
+    sync(client, copy_fixture(tmp_path), COMMIT)
+    ((recorded,),) = sql(
+        client, "SELECT questions || ' ' || question_fingerprint FROM content_syncs"
+    )
+    ((computed,),) = sql(client, lib_query("question fingerprint"))
+    assert recorded == computed
+    assert recorded.startswith("3 ")
+
+
+def test_without_questions_the_fingerprint_is_that_of_nothing(
+    client: TestClient, tmp_path: Path
+) -> None:
+    root = copy_fixture(tmp_path)
+    module_file(root, "quiz").unlink()
+    for path in (root / "questions").iterdir():
+        path.unlink()
+    sync(client, root, COMMIT)
+    ((questions, fingerprint),) = sql(
+        client, "SELECT questions, question_fingerprint FROM content_syncs"
+    )
+    assert (questions, fingerprint) == (0, hashlib.sha256(b"").hexdigest())
+
+
+def test_a_new_question_version_changes_its_fingerprint_only(
+    client: TestClient, tmp_path: Path
+) -> None:
+    root = copy_fixture(tmp_path)
+    sync(client, root, COMMIT)
+    edit_yaml(root / "questions" / "sample-path.yaml", lambda d: d.update(explanation="Outra."))
+    sync(client, root, OTHER)
+
+    first, second = rows(client)
+    assert second[2] == first[2]  # the missions' fingerprint
+    fingerprints = sql(client, "SELECT question_fingerprint FROM content_syncs ORDER BY id")
+    assert fingerprints[0] != fingerprints[1]
+    now, last = backup_reads(client)
+    assert last.startswith(OTHER) and last.endswith(now)
+
+
+def test_questions_changed_outside_a_sync_no_longer_match(
+    client: TestClient, tmp_path: Path
+) -> None:
+    sync(client, copy_fixture(tmp_path), COMMIT)
+    sql(client, "UPDATE questions SET status = 'draft' WHERE slug = 'sample-choice'")
+
+    now, last = backup_reads(client)
+    assert not last.endswith(now)
 
 
 def test_a_new_version_changes_the_fingerprint_and_is_recorded(
