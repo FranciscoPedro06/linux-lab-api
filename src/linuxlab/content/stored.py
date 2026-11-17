@@ -1,4 +1,5 @@
-"""What lab provisioning and validation read from a stored mission version.
+"""What lab provisioning and validation read from a stored mission version, and the
+answer endpoint from a stored question version.
 
 mission_versions.spec was produced by the sync from a validated mission.yaml, with
 referenced files inlined. Provisioning reads the environment, parameters and setup,
@@ -19,6 +20,7 @@ from linuxlab.content.schema import (
     Environment,
     Param,
     ParamName,
+    QuestionFile,
     Setup,
     SetupUser,
     check_condition_tree,
@@ -86,3 +88,19 @@ def validation_spec(spec: Mapping[str, Any]) -> ValidationSpec:
     if not isinstance(tree, BaseModel):
         raise InvalidSpecError("stored mission specification is invalid")
     return ValidationSpec(tree=tree, params=frozenset(params))
+
+
+def question_spec(spec: Mapping[str, Any]) -> QuestionFile:
+    """A stored question version, checked again with every rule the sync applied (the
+    answer names an option, each wrong option has a feedback, ...).
+
+    The stored spec has every field of the question's file but its status, which
+    belongs to the question and not to the version: it is given back as `draft` only to
+    read the rest, and must not be used.
+    """
+    if not isinstance(spec, Mapping) or "status" in spec:
+        raise InvalidSpecError("stored question specification is invalid")
+    try:
+        return QuestionFile.model_validate({**spec, "status": "draft"})
+    except (TypeError, ValidationError):
+        raise InvalidSpecError("stored question specification is invalid") from None

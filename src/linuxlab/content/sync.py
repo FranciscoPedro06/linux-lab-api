@@ -1,24 +1,25 @@
-"""Sync validated content into modules, missions and mission_versions.
+"""Sync validated content into modules, missions, questions and their versions.
 
 content/ is the source of truth; the database is its queryable copy, plus every
 version that was ever published. One sync is one transaction, serialized with any
 other sync by an advisory lock taken before the current state is read:
 
-- modules and missions are matched by slug, created when new and updated in place
-  (title, status, module, position) without creating a version;
-- a mission gets a new version, numbered after its highest one, only when its
-  content hash differs from that of its current version;
-- modules and missions missing from content/ are archived, never deleted, and keep
-  their versions;
+- modules, missions and questions are matched by slug, created when new and updated
+  in place (title, status, module, position) without creating a version;
+- a mission or question gets a new version, numbered after its highest one, only when
+  its content hash differs from that of its current version;
+- modules, missions and questions missing from content/ are archived, never deleted,
+  and keep their versions;
 - an error anywhere rolls the whole sync back;
 - each sync that succeeds adds a row to content_syncs, in the same transaction: the
-  commit it synced when the caller names one, and the missions' fingerprint after it.
+  commit it synced when the caller names one, and the fingerprints of the missions and
+  of the questions after it.
 
-Running it again on the same content changes no module, mission or version.
+Running it again on the same content changes no module, mission, question or version.
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -27,7 +28,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from linuxlab.content import loader
 from linuxlab.content.loader import Content
-from linuxlab.content.models import ContentSync, Mission, MissionVersion, Module
+from linuxlab.content.models import (
+    ContentSync,
+    Mission,
+    MissionVersion,
+    Module,
+    Question,
+    QuestionVersion,
+)
 
 SYNC_LOCK = 0x6D69_7373  # "miss"
 ARCHIVED = "archived"
@@ -43,10 +51,19 @@ FINGERPRINT = text(
     " FROM missions AS m"
     " JOIN mission_versions AS v ON v.mission_id = m.id AND v.version = m.current_version"
 )
+# The same for questions: question_fingerprint in infra/ops/lib.sh.
+QUESTION_FINGERPRINT = text(
+    "SELECT count(*), encode(sha256(convert_to(coalesce(string_agg("
+    "format('%s %s %s %s', q.slug, q.status, q.current_version, v.content_hash),"
+    " E'\\n' ORDER BY q.slug), ''), 'UTF8')), 'hex')"
+    " FROM questions AS q"
+    " JOIN question_versions AS v ON v.question_id = q.id AND v.version = q.current_version"
+)
 
 
 class EmptyContent(Exception):
-    """content/ has no modules and no missions, and archiving everything was not asked for."""
+    """content/ has no modules, missions or questions, and archiving everything was not
+    asked for."""
 
 
 @dataclass
@@ -58,10 +75,22 @@ class SyncReport:
     missions_updated: int = 0
     missions_archived: int = 0
     versions_created: int = 0
+    questions_created: int = 0
+    questions_updated: int = 0
+    questions_archived: int = 0
+    question_versions_created: int = 0
 
     @property
     def changed(self) -> bool:
         return any(getattr(self, field.name) for field in fields(self))
+
+
+@dataclass
+class _Counts:
+    created: int = 0
+    updated: int = 0
+    archived: int = 0
+    versions: int = 0
 
 
 async def sync_content(
@@ -87,9 +116,27 @@ async def sync_content(
         # left by any sync that ran first.
         await db.execute(select(func.pg_advisory_xact_lock(SYNC_LOCK)))
         module_ids = await _sync_modules(db, content, report)
-        await _sync_missions(db, content, module_ids, report)
-        missions, fingerprint = (await db.execute(FINGERPRINT)).one()
-        db.add(ContentSync(source_commit=source_commit, missions=missions, fingerprint=fingerprint))
+        missions = await _sync_listed(db, content.missions, Mission, MissionVersion, module_ids)
+        report.missions_created = missions.created
+        report.missions_updated = missions.updated
+        report.missions_archived = missions.archived
+        report.versions_created = missions.versions
+        questions = await _sync_listed(db, content.questions, Question, QuestionVersion, module_ids)
+        report.questions_created = questions.created
+        report.questions_updated = questions.updated
+        report.questions_archived = questions.archived
+        report.question_versions_created = questions.versions
+        mission_count, fingerprint = (await db.execute(FINGERPRINT)).one()
+        question_count, question_fingerprint = (await db.execute(QUESTION_FINGERPRINT)).one()
+        db.add(
+            ContentSync(
+                source_commit=source_commit,
+                missions=mission_count,
+                fingerprint=fingerprint,
+                questions=question_count,
+                question_fingerprint=question_fingerprint,
+            )
+        )
     return report
 
 
@@ -114,63 +161,81 @@ async def _sync_modules(db: AsyncSession, content: Content, report: SyncReport) 
     return {slug: row.id for slug, row in rows.items()}
 
 
-async def _sync_missions(
-    db: AsyncSession, content: Content, module_ids: dict[str, int], report: SyncReport
-) -> None:
-    rows = {row.slug: row for row in await db.scalars(select(Mission))}
+async def _sync_listed(
+    db: AsyncSession,
+    items: Sequence[loader.Mission | loader.Question],
+    row_model: type[Mission] | type[Question],
+    version_model: type[MissionVersion] | type[QuestionVersion],
+    module_ids: dict[str, int],
+) -> _Counts:
+    """Missions with their versions, or questions with theirs: the same rules."""
+    counts = _Counts()
+    owner = getattr(version_model, _owner_column(version_model))
+    found: Any = await db.scalars(select(row_model))
+    rows: dict[str, Any] = {row.slug: row for row in found}
     # A Result has keys(), so dict() would read it as a mapping.
     current = await db.execute(
-        select(MissionVersion.mission_id, MissionVersion.content_hash).join(
-            Mission,
-            (Mission.id == MissionVersion.mission_id)
-            & (Mission.current_version == MissionVersion.version),
+        select(owner, version_model.content_hash).join(
+            row_model,
+            (row_model.id == owner) & (row_model.current_version == version_model.version),
         )
     )
-    current_hashes = {mission_id: content_hash for mission_id, content_hash in current}
-    highest = await db.execute(
-        select(MissionVersion.mission_id, func.max(MissionVersion.version)).group_by(
-            MissionVersion.mission_id
-        )
-    )
-    latest = {mission_id: version for mission_id, version in highest}
+    current_hashes = {item_id: content_hash for item_id, content_hash in current}
+    highest = await db.execute(select(owner, func.max(version_model.version)).group_by(owner))
+    latest = {item_id: version for item_id, version in highest}
 
-    for mission in content.missions:
-        row = rows.get(mission.slug)
+    for item in items:
+        row = rows.get(item.slug)
         values = {
-            "module_id": module_ids[mission.module],
-            "position": mission.position,
-            "status": mission.status,
+            "module_id": module_ids[item.module],
+            "position": item.position,
+            "status": item.status,
         }
         if row is None:
             # current_version refers to a version inserted right after; the foreign
             # key is checked at commit.
-            row = Mission(slug=mission.slug, current_version=1, **values)
+            row = row_model(slug=item.slug, current_version=1, **values)
             db.add(row)
             await db.flush()
-            db.add(MissionVersion(mission_id=row.id, version=1, **_version(mission)))
-            report.missions_created += 1
-            report.versions_created += 1
+            db.add(_version(version_model, row.id, 1, item))
+            counts.created += 1
+            counts.versions += 1
             continue
         if _update(row, values):
-            report.missions_updated += 1
-        if current_hashes.get(row.id) != mission.content_hash:
+            counts.updated += 1
+        if current_hashes.get(row.id) != item.content_hash:
             version = latest.get(row.id, 0) + 1
-            db.add(MissionVersion(mission_id=row.id, version=version, **_version(mission)))
+            db.add(_version(version_model, row.id, version, item))
             await db.flush()
             row.current_version = version
-            report.versions_created += 1
+            counts.versions += 1
 
-    listed = {mission.slug for mission in content.missions}
+    listed = {item.slug for item in items}
     for slug, row in rows.items():
         if slug not in listed and (row.status != ARCHIVED or row.position is not None):
             row.status = ARCHIVED
             row.position = None
-            report.missions_archived += 1
+            counts.archived += 1
     await db.flush()
+    return counts
 
 
-def _version(mission: loader.Mission) -> dict[str, Any]:
-    return {"content_hash": mission.content_hash, "spec": mission.spec}
+def _owner_column(version_model: type[MissionVersion] | type[QuestionVersion]) -> str:
+    return "mission_id" if version_model is MissionVersion else "question_id"
+
+
+def _version(
+    version_model: type[MissionVersion] | type[QuestionVersion],
+    owner_id: int,
+    version: int,
+    item: loader.Mission | loader.Question,
+) -> MissionVersion | QuestionVersion:
+    return version_model(
+        **{_owner_column(version_model): owner_id},
+        version=version,
+        content_hash=item.content_hash,
+        spec=item.spec,
+    )
 
 
 def _update(row: object, values: Mapping[str, object]) -> bool:

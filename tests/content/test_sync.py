@@ -81,10 +81,17 @@ def edit_briefing(root: Path, slug: str, text: str) -> None:
 def test_first_sync_creates_version_1(client: TestClient, root: Path) -> None:
     report = sync(client, root)
 
-    assert report == SyncReport(modules_created=2, missions_created=3, versions_created=3)
+    assert report == SyncReport(
+        modules_created=3,
+        missions_created=3,
+        versions_created=3,
+        questions_created=3,
+        question_versions_created=3,
+    )
     assert modules(client) == {
         "alpha": ("Módulo de teste A", "Conteúdo sintético usado pelos testes.", "published"),
         "beta": ("Módulo de teste B", "Módulo sem missões publicadas.", "published"),
+        "quiz": ("Questões de teste", "Questões sintéticas usadas pelos testes.", "published"),
     }
     assert missions(client) == {
         "sample-file": ("alpha", 1, "published", 1),
@@ -292,7 +299,7 @@ def test_empty_content_archives_everything_when_allowed(
 
     report = sync(client, empty, allow_empty=True)
 
-    assert report == SyncReport(modules_archived=2, missions_archived=3)
+    assert report == SyncReport(modules_archived=3, missions_archived=3, questions_archived=3)
     assert {status for *_, status in modules(client).values()} == {"archived"}
     assert {(position, status) for _, position, status, _ in missions(client).values()} == {
         (None, "archived")

@@ -1,13 +1,16 @@
-"""Read content/ into validated modules and missions, without touching the database.
+"""Read content/ into validated modules, missions and questions, without touching the
+database.
 
     content/
       modules/<slug>.yaml
       missions/<slug>/mission.yaml, and the files it references
+      questions/<slug>.yaml
 
 Everything is checked before anything is returned: file sizes, UTF-8, YAML (no
 duplicate keys, no aliases), the schema, file references (relative, inside the
-mission directory, no symlinks) and the links between modules and missions. All
-problems are collected and raised together as ContentInvalid. Nothing is executed.
+mission directory, no symlinks) and the links between modules and what they list. A
+module lists missions or questions, never both. All problems are collected and raised
+together as ContentInvalid. Nothing is executed.
 """
 
 import hashlib
@@ -20,11 +23,12 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from linuxlab.content.schema import SLUG, MissionFile, ModuleFile
+from linuxlab.content.schema import SLUG, MissionFile, ModuleFile, QuestionFile
 
 KIB = 1024
 MODULE_FILE_MAX_BYTES = 64 * KIB
 MISSION_FILE_MAX_BYTES = 64 * KIB
+QUESTION_FILE_MAX_BYTES = 64 * KIB
 MARKDOWN_MAX_BYTES = 64 * KIB
 SETUP_MAX_BYTES = 32 * KIB
 TEST_SCRIPT_MAX_BYTES = 64 * KIB
@@ -33,6 +37,7 @@ MISSION_MAX_BYTES = 256 * KIB
 
 MODULES_DIR = "modules"
 MISSIONS_DIR = "missions"
+QUESTIONS_DIR = "questions"
 MISSION_FILE = "mission.yaml"
 # Placeholder files that keep empty directories in git.
 IGNORED_NAMES = frozenset({".gitkeep"})
@@ -62,6 +67,8 @@ class Module:
     description: str
     status: str
     missions: tuple[str, ...]
+    # A module lists missions or questions: one of the two is always empty.
+    questions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,13 +84,26 @@ class Mission:
 
 
 @dataclass(frozen=True)
+class Question:
+    slug: str
+    status: str
+    module: str
+    position: int  # 1-based, in the module's list
+    # The complete specification stored in question_versions: every field of the
+    # question's file except status, the answer and feedback included.
+    spec: dict[str, Any]
+    content_hash: str
+
+
+@dataclass(frozen=True)
 class Content:
     modules: tuple[Module, ...]  # ordered by slug
     missions: tuple[Mission, ...]  # ordered by module, then position
+    questions: tuple[Question, ...] = ()  # ordered by module, then position
 
     @property
     def empty(self) -> bool:
-        return not self.modules and not self.missions
+        return not self.modules and not self.missions and not self.questions
 
 
 def canonical_json(value: Any) -> str:
@@ -91,7 +111,7 @@ def canonical_json(value: Any) -> str:
 
 
 def content_hash(spec: dict[str, Any]) -> str:
-    """SHA-256 of the canonical JSON of a mission specification."""
+    """SHA-256 of the canonical JSON of a mission or question specification."""
     return hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
 
 
@@ -168,8 +188,10 @@ class _Reader:
 
         module_files = self._entries(MODULES_DIR)
         mission_dirs = self._entries(MISSIONS_DIR)
+        question_files = self._entries(QUESTIONS_DIR)
         modules = [m for m in (self._read_module(path) for path in module_files) if m]
-        # With a module file unreadable, which missions are listed is unknown.
+        # With a module file unreadable, which missions and questions are listed is
+        # unknown.
         self.modules_complete = len(modules) == len(module_files)
         mission_slugs = {path.name for path in mission_dirs if self._is_slug_dir(path)}
         placement = self._place_missions(modules, mission_slugs)
@@ -178,18 +200,35 @@ class _Reader:
             for mission in (self._read_mission(path, placement) for path in mission_dirs)
             if mission
         ]
+        question_slugs = {
+            path.stem for path in question_files if path.suffix == ".yaml" and path.is_file()
+        }
+        question_placement = self._place_questions(modules, question_slugs)
+        questions = [
+            question
+            for question in (
+                self._read_question(path, question_placement) for path in question_files
+            )
+            if question
+        ]
         if self.errors:
             raise ContentInvalid(self.errors)
         missions.sort(key=lambda mission: (mission.module, mission.position))
-        return Content(tuple(sorted(modules, key=lambda m: m.slug)), tuple(missions))
+        questions.sort(key=lambda question: (question.module, question.position))
+        return Content(
+            tuple(sorted(modules, key=lambda m: m.slug)), tuple(missions), tuple(questions)
+        )
 
     # Layout
 
     def _check_tree(self) -> None:
         """Only directories and regular files, no symlinks, nothing unexpected on top."""
+        expected = (MODULES_DIR, MISSIONS_DIR, QUESTIONS_DIR)
         for entry in self._list(self.root):
-            if entry.name not in (MODULES_DIR, MISSIONS_DIR) and entry.name not in IGNORED_NAMES:
-                self.error(entry, "unexpected entry; content/ holds modules/ and missions/")
+            if entry.name not in expected and entry.name not in IGNORED_NAMES:
+                self.error(
+                    entry, "unexpected entry; content/ holds modules/, missions/ and questions/"
+                )
         stack = [self.root]
         while stack:
             directory = stack.pop()
@@ -280,7 +319,12 @@ class _Reader:
             self.error(path, "must match the file name", "slug")
             return None
         return Module(
-            module.slug, module.title, module.description, module.status, tuple(module.missions)
+            module.slug,
+            module.title,
+            module.description,
+            module.status,
+            tuple(module.missions or ()),
+            tuple(module.questions or ()),
         )
 
     def _place_missions(
@@ -297,6 +341,24 @@ class _Reader:
                 elif slug in placement:
                     other = placement[slug][0]
                     self.error(path, f"mission {slug} is already in module {other}", field)
+                else:
+                    placement[slug] = (module.slug, index + 1)
+        return placement
+
+    def _place_questions(
+        self, modules: list[Module], question_slugs: set[str]
+    ) -> dict[str, tuple[str, int]]:
+        """Module and position of each question. Each question is in exactly one module."""
+        placement: dict[str, tuple[str, int]] = {}
+        for module in sorted(modules, key=lambda m: m.slug):
+            path = f"{MODULES_DIR}/{module.slug}.yaml"
+            for index, slug in enumerate(module.questions):
+                field = f"questions.{index}"
+                if slug not in question_slugs:
+                    self.error(path, f"no question file questions/{slug}.yaml", field)
+                elif slug in placement:
+                    other = placement[slug][0]
+                    self.error(path, f"question {slug} is already in module {other}", field)
                 else:
                     placement[slug] = (module.slug, index + 1)
         return placement
@@ -397,6 +459,34 @@ class _Reader:
         if text is not None:
             files[reference] = text
         return text
+
+    # Questions
+
+    def _read_question(self, path: Path, placement: dict[str, tuple[str, int]]) -> Question | None:
+        """questions/<slug>.yaml: the whole question in one file, nothing it references."""
+        if path.suffix != ".yaml" or not path.is_file():
+            self.error(path, "questions/ holds only <slug>.yaml files")
+            return None
+        if not _valid_slug(path.stem):
+            self.error(path, "file name must be a slug ([a-z0-9-], up to 64) and .yaml")
+            return None
+        if path.stem not in placement and self.modules_complete:
+            self.error(path, "not listed in any module")
+        data = self._read_yaml(path, QUESTION_FILE_MAX_BYTES)
+        if data is None:
+            return None
+        question = self._validate(QuestionFile, data, path)
+        if question is None:
+            return None
+        if question.slug != path.stem:
+            self.error(path, "must match the file name", "slug")
+            return None
+        if path.stem not in placement:
+            return None
+        spec = question.model_dump(mode="json", by_alias=True, exclude_none=True)
+        del spec["status"]
+        module, position = placement[path.stem]
+        return Question(question.slug, question.status, module, position, spec, content_hash(spec))
 
 
 def _valid_slug(name: str) -> bool:

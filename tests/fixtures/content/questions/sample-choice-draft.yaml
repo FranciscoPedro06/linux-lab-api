@@ -1,0 +1,17 @@
+schema: 1
+slug: sample-choice-draft
+type: single_choice
+title: Questão em rascunho
+summary: Uma questão sintética que não foi publicada.
+difficulty: 1
+estimated_minutes: 1
+status: draft
+question: Questão sintética em rascunho.
+options:
+  - id: a
+    text: Alternativa a
+  - id: b
+    text: Alternativa b
+    feedback: Feedback sintético da alternativa b.
+answer: a
+explanation: Explicação sintética da questão em rascunho.

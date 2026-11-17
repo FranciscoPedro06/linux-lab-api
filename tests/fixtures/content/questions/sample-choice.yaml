@@ -1,0 +1,25 @@
+schema: 1
+slug: sample-choice
+type: single_choice
+title: Questão de teste
+summary: Uma questão sintética de múltipla escolha.
+difficulty: 1
+estimated_minutes: 1
+status: published
+tags: [sample]
+question: |
+  Qual comando mostra o diretório atual?
+options:
+  - id: cd
+    text: "`cd`"
+    feedback: "Feedback sintético da alternativa cd."
+  - id: pwd
+    text: "`pwd`"
+  - id: ls
+    text: "`ls`"
+    feedback: "Feedback sintético da alternativa ls."
+answer: pwd
+explanation: |
+  Explicação sintética da questão de teste.
+hints:
+  - "Dica sintética."

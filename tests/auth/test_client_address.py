@@ -57,6 +57,7 @@ def proxied() -> Iterator[TestClient]:
         sql(
             client,
             "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, user_missions,"
+            " user_questions, question_attempts, questions, question_versions,"
             " command_history, modules, missions, mission_versions",
         )
         yield client

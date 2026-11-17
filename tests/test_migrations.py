@@ -22,6 +22,9 @@ BEFORE_PROGRESS = "c4e1a7b39d52"
 BEFORE_REPLACEMENT = "7d3f2a91c6e8"
 # The last revision of increment 11, before command_history.
 BEFORE_HISTORY = "a3f81c5d2e94"
+# The last revision before questions.
+BEFORE_QUESTIONS = "b91e4d7a2c60"
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 def tables() -> set[str]:
@@ -66,6 +69,10 @@ TABLES = {
     "user_missions",
     "command_history",
     "content_syncs",
+    "questions",
+    "question_versions",
+    "user_questions",
+    "question_attempts",
 }
 
 
@@ -135,6 +142,7 @@ def test_downgrading_replacement_keeps_labs_and_their_reasons_valid() -> None:
     user_id, first, second, third = (uuid.uuid4() for _ in range(4))
     execute(
         "TRUNCATE users, auth_sessions, lab_sessions, validation_runs, user_missions,"
+        " user_questions, question_attempts, questions, question_versions,"
         " command_history, modules, missions, mission_versions",
         "INSERT INTO users (id, email, password_hash, display_name)"
         " VALUES (:user, 'ana@example.com', '$argon2id$synthetic', 'Ana')",
@@ -230,6 +238,38 @@ def test_history_starts_empty_on_a_migrated_database() -> None:
         assert execute("SELECT id FROM lab_sessions") == [(lab_id,)]
         command.upgrade(config, "head")
         assert execute("SELECT count(*) FROM command_history") == [(0,)]
+    finally:
+        command.downgrade(config, "base")
+        command.upgrade(config, "head")
+
+
+def test_syncs_recorded_before_questions_record_none() -> None:
+    """Rows of content_syncs written before questions existed get 0 questions and the
+    SHA-256 of nothing, the fingerprint of no questions, without firing the table's
+    update trigger; going down drops the columns and keeps the rows."""
+    config = Config(str(ALEMBIC_INI))
+    command.downgrade(config, "base")
+    command.upgrade(config, BEFORE_QUESTIONS)
+    execute(
+        "INSERT INTO content_syncs (source_commit, missions, fingerprint)"
+        " VALUES (repeat('a', 40), 5, repeat('b', 64))"
+    )
+    try:
+        command.upgrade(config, "head")
+        assert execute(
+            "SELECT source_commit, missions, fingerprint, questions, question_fingerprint"
+            " FROM content_syncs"
+        ) == [("a" * 40, 5, "b" * 64, 0, EMPTY_SHA256)]
+        defaults = execute(
+            "SELECT column_name, column_default FROM information_schema.columns"
+            " WHERE table_name = 'content_syncs'"
+            " AND column_name IN ('questions', 'question_fingerprint')"
+        )
+        assert sorted(defaults) == [("question_fingerprint", None), ("questions", None)]
+
+        command.downgrade(config, BEFORE_QUESTIONS)
+        assert {"questions", "user_questions", "question_attempts"}.isdisjoint(tables())
+        assert execute("SELECT missions FROM content_syncs") == [(5,)]
     finally:
         command.downgrade(config, "base")
         command.upgrade(config, "head")
