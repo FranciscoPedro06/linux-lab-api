@@ -35,6 +35,7 @@ The API runs as a single process in the MVP. WebSocket connections, rate limitin
 | `catalog` | Read access to published modules and missions, with the user's progress on each |
 | `content` | Parsing, schema validation and sync of missions from the repository |
 | `progress` | `user_missions`: recording and reading the first completion of each mission |
+| `questions` | Conceptual questions: reading them without their answer, checking answers, attempts and progress |
 | `labs` | Lab lifecycle, container configuration, reaper |
 | `terminal` | WebSocket bridge to `docker exec` |
 | `validation` | Condition tree, validators, fact collection |
@@ -336,6 +337,34 @@ The catalog (`GET /api/modules`, `GET /api/missions/{slug}`) shows a mission onl
 
 The format is described in [missions.md](missions.md).
 
+## Questions
+
+Conceptual questions of the easy mode (`src/linuxlab/questions/`, content in `src/linuxlab/content/`; contract in [questions.md](questions.md)). A question is synced like a mission and answered without a lab.
+
+**Content and versions.** `questions/<slug>.yaml` files are read and checked by the same loader, in the same sync and transaction as modules and missions, with the same rules: matched by slug, a new version only when the specification's hash changes, archived (never deleted) when gone, versions immutable (trigger on `question_versions`). A module lists missions or questions, never both. The sync records the questions' count and fingerprint in `content_syncs` next to the missions'.
+
+**Reading.** `GET /api/question-modules` and `GET /api/questions/{slug}` read the presentation fields of the current version (title, summary, statement, the id and text of each option, hints) from `question_versions.spec` with JSON path expressions; `answer`, the options' feedback and `explanation` are never selected, so they cannot reach a response by mistake.
+
+**Answering.** `POST /api/questions/{slug}/answers`:
+
+1. Counts the request against the user's limit (30 per 60 s, in memory, like the other limits: lost on restart, not shared between processes).
+2. Reads the visible question, its current version and specification. A version other than the one the client names is `409 question_outdated`: an answer is always checked against what the student saw.
+3. Reads the specification back through the question schema (`content/stored.py`), with every rule of the sync; a version that breaks them is an error, never half used.
+4. In one transaction: inserts the attempt (user, question, version, option, correct); when it is correct, `INSERT ... ON CONFLICT (user_id, question_id) DO NOTHING RETURNING` records the first completion with the attempt's time; reads the progress back; commits.
+
+Two first correct answers racing are settled by the primary key of `user_questions`, as for missions: one row, and the second answer gets `newly_completed: false`. A failed write stores neither the attempt nor the completion.
+
+| Invariant | Enforced by |
+|---|---|
+| One completion per user and question | Database: primary key `(user_id, question_id)` |
+| An attempt or a completion names an existing version of its own question | Database: foreign keys `(question_id, question_version)` and `(question_id, completed_version)` to `question_versions` |
+| Attempts and completions never change once recorded | Database: triggers rejecting `UPDATE` |
+| An attempt names an option id of the right form | Database: `CHECK` on `option`; Service: the option must be one of the version's |
+| Deleting a user deletes their attempts and completions | Database: `ON DELETE CASCADE` on `user_id` |
+| Only the API decides whether an answer is right | Service: the request carries only `version` and `option` (other fields are refused) |
+| The answer key, feedback and explanation never reach a read route | Service: the read routes never select them; tests inspect every response |
+| Progress and attempts are only read for the user of the session | Service: no route takes a user id |
+
 ## Command history
 
 Implemented in increment 12, in `src/linuxlab/history/` and `lab-image/history.bash`. A lab's history is the list of command lines its interactive bash accepted, as the terminal relay observed them. It is best-effort and informational: it is not a record of everything that ran, not an audit log, and not evidence of anything.
@@ -430,6 +459,10 @@ OAuth, password reset and email verification are out of scope for the MVP. The l
 | `missions` | Stable mission identity (slug, unique), module, position in the module (unique per module, `NULL` once removed from `content/`), status, current version |
 | `mission_versions` | Immutable specification per version: content hash and the complete specification as `JSONB`; PK `(mission_id, version)` |
 | `user_missions` | The first completion of a mission by a user: the version it was on and when; PK `(user_id, mission_id)` |
+| `questions` | Stable question identity (slug, unique), module, position (unique per module, `NULL` once removed), status, current version |
+| `question_versions` | Immutable specification per version, the answer and feedback included; PK `(question_id, version)` |
+| `user_questions` | The first correct answer of a user to a question: the version and when; PK `(user_id, question_id)` |
+| `question_attempts` | Every answer checked: user, question, version, option chosen, whether it was correct, when |
 | `lab_sessions` | Labs: owner, status, end reason, creation, last activity, maximum lifetime, end time, the pinned mission version and the generated parameters |
 | `validation_runs` | Every finished validation: the lab, its pinned version, the outcome (`passed`, `failed`, `error`), an error code for `error`, the tree of statuses and reasons, whether an answer was sent, start and end times |
 | `command_history` | Command lines accepted by a lab's interactive shell: the lab, a sequence number per lab, the line, when the API observed it; PK `(lab_session_id, seq)` |

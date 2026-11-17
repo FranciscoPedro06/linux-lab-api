@@ -153,7 +153,7 @@ Configuration comes from environment variables or `.env`; see [.env.example](.en
 
 ### Mission content
 
-Modules and missions are files in `content/` ([docs/missions.md](docs/missions.md)); the API reads them only from the database. After changing them, sync:
+Modules, missions and questions are files in `content/` ([docs/missions.md](docs/missions.md), [docs/questions.md](docs/questions.md)); the API reads them only from the database. After changing them, sync:
 
 ```sh
 uv run linuxlab content sync                                        # API on the host
@@ -218,6 +218,7 @@ Increments 01 to 10 are implemented: application skeleton, database connection, 
 - [docs/deployment.md](docs/deployment.md): production stack, client addresses, release images and their checks
 - [docs/operations.md](docs/operations.md): installing, deploying, backups, restoring, recovering on a new host, checking labs, rollback
 - [docs/missions.md](docs/missions.md): mission format and authoring rules
+- [docs/questions.md](docs/questions.md): conceptual questions of the easy mode: format, answering and progress
 - [docs/runtime.md](docs/runtime.md): lab runtime, gVisor setup and verification status
 - [docs/terminal.md](docs/terminal.md): terminal protocol, lifecycle and limits
 - [docs/threat-model.md](docs/threat-model.md): isolation, limits and accepted risks

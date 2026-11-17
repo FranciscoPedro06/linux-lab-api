@@ -30,7 +30,8 @@ content/
 
 `linuxlab content sync` reads `content/`, checks everything below, and writes nothing unless all of it holds. Errors name the file and, where there is one, the field (`missions/x/mission.yaml: validation.all.2.mode: Input should be a valid string`).
 
-- `content/` holds only `modules/` and `missions/`; `modules/` only `<slug>.yaml` files; `missions/` only mission directories, each with a `mission.yaml`. `.gitkeep` files are ignored.
+- `content/` holds only `modules/`, `missions/` and `questions/`; `modules/` only `<slug>.yaml` files; `missions/` only mission directories, each with a `mission.yaml`; `questions/` only `<slug>.yaml` files ([questions.md](questions.md)). `.gitkeep` files are ignored.
+- A module lists missions or questions, never both.
 - Every mission is listed by exactly one module, and every slug a module lists has a mission directory. A mission in no module, in two modules or twice in one module is an error.
 - Slugs (`[a-z0-9-]`, up to 64 characters) match the file or directory name.
 - No symbolic links, and nothing but regular files and directories, anywhere under `content/`.
