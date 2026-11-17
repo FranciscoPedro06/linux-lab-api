@@ -42,6 +42,9 @@ General errors, shared by every route:
 | GET | `/api/auth/me` | Current user |
 | GET | `/api/modules` | Published modules with their published missions and the user's progress on each |
 | GET | `/api/missions/{slug}` | Mission detail with the user's progress: at the version of the user's active lab for this mission if there is one, otherwise at its current version |
+| GET | `/api/question-modules` | Published modules of questions with their published questions and the user's progress on each |
+| GET | `/api/questions/{slug}` | Question detail with the user's progress, without its answer |
+| POST | `/api/questions/{slug}/answers` | Answer a question, checked by the API. Body: `version`, `option` |
 | GET | `/api/labs/current` | The user's active lab, or `null` |
 | GET | `/api/labs` | The user's recent labs |
 | GET | `/api/labs/{id}` | One of the user's labs, in any state |
@@ -403,6 +406,109 @@ There is no route to read or change another user's progress, nor a route that ta
 ## Missions (planned)
 
 Releasing `explanation` and `solutions` to a user who completed the mission, in `GET /api/missions/{slug}` and in the validation response, is a candidate for increment 14, after the closed beta deployment (13). Until then the server never returns them.
+
+## Questions
+
+Conceptual questions of the easy mode ([questions.md](questions.md)). All three routes require a session. A question is visible when it is `published` and listed in a `published` module; a question that does not exist, is `draft` or `archived`, or is in a module that is not published is `404 question_not_found`, for reading and for answering alike.
+
+Reading never reveals which option is correct: no listing or detail carries `answer`, an option's `feedback` or the `explanation`, whatever the user's progress. Only the response to an answer does.
+
+Question card, as listed in a module:
+
+```json
+{
+  "slug": "absolute-path",
+  "title": "Caminho absoluto",
+  "summary": "Diferenciar um caminho absoluto de um relativo.",
+  "difficulty": 1,
+  "estimated_minutes": 1,
+  "tags": ["paths"],
+  "version": 1,
+  "progress": { "status": "attempted", "attempts": 1, "completed_version": null, "completed_at": null }
+}
+```
+
+- `version`: the question's current version, the one an answer is checked against.
+- `progress`: the user's progress on the question. `status` is `completed` once a correct answer was recorded (on any version), otherwise `attempted` when the user answered the current version and `not_answered` when not; `attempts` counts the answers to the current version ([questions.md](questions.md#progress)).
+
+### `GET /api/question-modules`
+
+Published modules that have at least one visible question, ordered by slug; questions in the order of the module file. Modules of missions are not listed here, and modules of questions are not listed by `GET /api/modules`, whose response is unchanged.
+
+```json
+[
+  {
+    "slug": "first-steps",
+    "title": "Primeiros passos",
+    "description": "Conceitos básicos de terminal, diretórios, arquivos e permissões.",
+    "completed": 3,
+    "total": 10,
+    "questions": [ { "slug": "current-directory", "...": "question card" } ]
+  }
+]
+```
+
+`completed` counts the module's listed questions the user completed, out of `total`.
+
+### `GET /api/questions/{slug}`
+
+The question card plus:
+
+```json
+{
+  "module": { "slug": "first-steps", "title": "Primeiros passos" },
+  "position": 9,
+  "previous": "hidden-files",
+  "next": "basic-permissions",
+  "question": "Qual destes caminhos é absoluto?\n",
+  "options": [
+    { "id": "relative", "text": "`projeto`" },
+    { "id": "absolute", "text": "`/home/student/projeto`" }
+  ],
+  "hints": ["Olhe o primeiro caractere de cada caminho."]
+}
+```
+
+- `question` and each option's `text` are Markdown; the client renders them with raw HTML disabled, and gives the options their letters by position.
+- `position` is 1-based among the module's visible questions; `previous` and `next` are the neighbours' slugs, or `null`.
+
+### `POST /api/questions/{slug}/answers`
+
+```json
+{ "version": 1, "option": "relative" }
+```
+
+Exactly these two fields: `version`, the version the client shows (an integer, at least 1), and `option`, an option id (`[a-z0-9-]`, up to 32 characters). Any other field, such as a claim that the answer is right or a user id, is refused with `422 invalid_request`.
+
+`200`:
+
+```json
+{
+  "question": { "slug": "absolute-path", "version": 1 },
+  "option": "relative",
+  "correct": false,
+  "feedback": "Esse caminho é relativo: depende do diretório atual.",
+  "explanation": "Um caminho absoluto começa em `/`...",
+  "newly_completed": false,
+  "progress": { "status": "attempted", "attempts": 1, "completed_version": null, "completed_at": null }
+}
+```
+
+- `correct` is decided by the API from the stored version.
+- `feedback` is the chosen option's feedback, `null` when the option is the correct one. The id of the correct option is not returned: when the answer is right, it is `option`.
+- `explanation` is returned with every answer, right or wrong.
+- `newly_completed` is true only for the answer that recorded the user's first completion of the question.
+- Every answer that reaches this point is recorded as an attempt, and none is ever changed or removed.
+
+| Status | Code | When |
+|---|---|---|
+| 404 | `question_not_found` | No visible question with this slug |
+| 409 | `question_outdated` | `version` is not the question's current version; the client reloads the question |
+| 422 | `invalid_option` | `option` is well formed but is not an option of this version |
+| 422 | `invalid_request` | The body is not exactly `version` and `option`, or a value is malformed |
+| 429 | `rate_limited` | More than 30 answers in 60 seconds by this user; `Retry-After` says when to try again |
+
+None of these records an attempt.
 
 ## Terminal
 
