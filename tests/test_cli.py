@@ -19,11 +19,12 @@ def sync(*args: str | Path) -> int:
     return main(["content", "sync", *(str(arg) for arg in args)])
 
 
-def counts(client: TestClient) -> list[tuple[int, int, int]]:
+def counts(client: TestClient) -> list[tuple[int, int, int, int, int]]:
     return sql(
         client,
         "SELECT (SELECT count(*) FROM modules), (SELECT count(*) FROM missions),"
-        " (SELECT count(*) FROM mission_versions)",
+        " (SELECT count(*) FROM mission_versions), (SELECT count(*) FROM questions),"
+        " (SELECT count(*) FROM question_versions)",
     )
 
 
@@ -41,16 +42,17 @@ def test_sync_then_sync_again(
 
     assert sync("--content-dir", root) == 0
     assert capsys.readouterr().out.splitlines() == [
-        "content: 2 modules, 3 missions",
-        "modules: 2 created, 0 updated, 0 archived",
+        "content: 3 modules, 3 missions",
+        "modules: 3 created, 0 updated, 0 archived",
         "missions: 3 created, 0 updated, 0 archived",
         "versions: 3 created",
+        "questions: 3 in content; 3 created, 0 updated, 0 archived, 3 versions created",
         "recorded: content commit not given",
     ]
 
     assert sync("--content-dir", root) == 0
     assert capsys.readouterr().out.splitlines()[-1] == "database already up to date"
-    assert counts(client) == [(2, 3, 3)]
+    assert counts(client) == [(3, 3, 3, 3, 3)]
 
 
 def test_invalid_content_changes_nothing(
@@ -64,7 +66,7 @@ def test_invalid_content_changes_nothing(
     err = capsys.readouterr().err.splitlines()
     assert err[0].startswith("error: missions/sample-file/mission.yaml: difficulty: ")
     assert err[-1] == "content is invalid (1 errors); nothing synced"
-    assert counts(client) == [(0, 0, 0)]
+    assert counts(client) == [(0, 0, 0, 0, 0)]
 
 
 def test_empty_content_needs_allow_empty(
@@ -82,7 +84,7 @@ def test_empty_content_needs_allow_empty(
     assert sync("--content-dir", empty, "--allow-empty") == 0
     assert "missions: 0 created, 0 updated, 3 archived" in capsys.readouterr().out
     assert sql(client, "SELECT count(*) FROM missions WHERE status = 'archived'") == [(3,)]
-    assert counts(client) == [(2, 3, 3)]
+    assert counts(client) == [(3, 3, 3, 3, 3)]
 
 
 def test_repository_content_is_valid(

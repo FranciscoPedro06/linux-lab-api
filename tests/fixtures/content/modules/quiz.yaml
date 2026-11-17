@@ -1,0 +1,9 @@
+schema: 1
+slug: quiz
+title: Questões de teste
+description: Questões sintéticas usadas pelos testes.
+status: published
+questions:
+  - sample-choice
+  - sample-path
+  - sample-choice-draft

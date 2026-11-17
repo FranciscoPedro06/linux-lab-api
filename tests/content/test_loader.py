@@ -55,7 +55,7 @@ def symlink(link: Path, target: Path) -> None:
 def test_fixture_is_loaded() -> None:
     content = load_content(FIXTURE)
 
-    assert [module.slug for module in content.modules] == ["alpha", "beta"]
+    assert [module.slug for module in content.modules] == ["alpha", "beta", "quiz"]
     assert content.modules[0].missions == ("sample-file", "sample-answer")
     placed = [(m.module, m.position, m.slug, m.status) for m in content.missions]
     assert placed == [
@@ -178,7 +178,9 @@ def test_missing_content_directory(tmp_path: Path) -> None:
 
 def test_unexpected_entries(root: Path) -> None:
     (root / "README.md").write_text("x")
-    assert messages(root) == ["README.md: unexpected entry; content/ holds modules/ and missions/"]
+    assert messages(root) == [
+        "README.md: unexpected entry; content/ holds modules/, missions/ and questions/"
+    ]
 
 
 def test_unexpected_files_in_modules_and_missions(root: Path) -> None:

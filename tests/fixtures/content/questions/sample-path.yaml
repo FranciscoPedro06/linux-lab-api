@@ -1,0 +1,17 @@
+schema: 1
+slug: sample-path
+type: single_choice
+title: Segunda questão de teste
+summary: Outra questão sintética.
+difficulty: 2
+estimated_minutes: 2
+status: published
+question: Qual destes caminhos é absoluto?
+options:
+  - id: absolute
+    text: "`/home/student`"
+  - id: relative
+    text: "`student`"
+    feedback: "Feedback sintético do caminho relativo."
+answer: absolute
+explanation: Explicação sintética da segunda questão.

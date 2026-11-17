@@ -11,6 +11,7 @@ from linuxlab.db import Base, create_engine
 from linuxlab.history import models as history_models  # noqa: F401
 from linuxlab.labs import models as lab_models  # noqa: F401
 from linuxlab.progress import models as progress_models  # noqa: F401
+from linuxlab.questions import models as question_models  # noqa: F401
 from linuxlab.validation import models as validation_models  # noqa: F401
 
 config = context.config

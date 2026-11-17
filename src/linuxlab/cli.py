@@ -108,6 +108,11 @@ def content_sync(
         f"{report.missions_archived} archived"
     )
     print(f"versions: {report.versions_created} created")
+    print(
+        f"questions: {len(content.questions)} in content; {report.questions_created} created, "
+        f"{report.questions_updated} updated, {report.questions_archived} archived, "
+        f"{report.question_versions_created} versions created"
+    )
     print(f"recorded: content commit {source_commit or 'not given'}")
     if not report.changed:
         print("database already up to date")

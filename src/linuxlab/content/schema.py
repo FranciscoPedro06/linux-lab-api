@@ -1,4 +1,4 @@
-"""Schema of module and mission files. See docs/missions.md.
+"""Schema of module, mission and question files. See docs/missions.md and docs/questions.md.
 
 The models check structure only. Nothing in a mission is executed here: setup
 scripts, conditions and parameters are validated as data and stored for the code
@@ -132,13 +132,18 @@ class ModuleFile(_Strict):
     title: Text
     description: Text
     status: Status
-    # The missions of this module, in order. The only place where either is defined.
-    missions: list[Slug]
+    # The missions or the questions of this module, in order: a module holds one kind
+    # only. The only place where membership and order are defined.
+    missions: list[Slug] | None = None
+    questions: list[Slug] | None = None
 
     @model_validator(mode="after")
-    def _unique_missions(self) -> Self:
-        if len(set(self.missions)) != len(self.missions):
-            raise ValueError("missions: a mission is listed more than once")
+    def _one_kind(self) -> Self:
+        _exactly_one(self, ("missions", "questions"))
+        for name in ("missions", "questions"):
+            items = getattr(self, name)
+            if items is not None and len(set(items)) != len(items):
+                raise ValueError(f"{name}: a {name[:-1]} is listed more than once")
         return self
 
 
@@ -478,3 +483,61 @@ class MissionFile(_Strict):
 
     def has_answer(self) -> bool:
         return any(isinstance(leaf, Answer) for leaf in checks(self.validation))
+
+
+# Question file. See docs/questions.md.
+
+MIN_OPTIONS = 2
+MAX_OPTIONS = 6
+# Stable identifier of an option, referenced by `answer` and by stored attempts. The
+# letters students see are given by the interface, from the option's position.
+OPTION_ID = re.compile(r"[a-z0-9-]{1,32}")
+OptionId = Annotated[str, Field(pattern=rf"^{OPTION_ID.pattern}$")]
+
+
+class Option(_Strict):
+    id: OptionId
+    text: Text  # Markdown, one line
+    # Shown when this option is chosen. Required on every wrong option; the correct one
+    # has none, the explanation says why it is right.
+    feedback: Text | None = None
+
+
+class QuestionFile(_Strict):
+    schema_: SchemaVersion = Field(alias="schema")
+    slug: Slug
+    type: Literal["single_choice"]
+    title: Text
+    summary: Text
+    difficulty: int = Field(ge=1, le=5)
+    estimated_minutes: int = Field(ge=1)
+    status: Status
+    tags: list[Slug] = []
+
+    question: Text  # Markdown
+    options: list[Option] = Field(min_length=MIN_OPTIONS, max_length=MAX_OPTIONS)
+    answer: OptionId
+    explanation: Text  # Markdown
+    hints: list[Text] = []
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if len(set(self.tags)) != len(self.tags):
+            raise ValueError("tags: a tag is listed more than once")
+        ids = [option.id for option in self.options]
+        if len(set(ids)) != len(ids):
+            raise ValueError("options: an option id is used more than once")
+        texts = [option.text.strip() for option in self.options]
+        if len(set(texts)) != len(texts):
+            raise ValueError("options: two options have the same text")
+        if self.answer not in ids:
+            raise ValueError(f"answer: no option has the id {self.answer}")
+        for option in self.options:
+            if option.id == self.answer and option.feedback is not None:
+                raise ValueError(
+                    f"options: the correct option {option.id} has no feedback;"
+                    " the explanation says why it is right"
+                )
+            if option.id != self.answer and option.feedback is None:
+                raise ValueError(f"options: the wrong option {option.id} needs a feedback")
+        return self
