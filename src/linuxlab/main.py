@@ -26,6 +26,8 @@ from linuxlab.labs.runtime import LabRuntime, LabRuntimeError
 from linuxlab.labs.runtime.docker import DockerRuntime
 from linuxlab.labs.terminal import router as terminal
 from linuxlab.labs.terminal.relay import TerminalRegistry
+from linuxlab.questions import router as questions
+from linuxlab.questions.router import ANSWER_ATTEMPTS, ANSWER_WINDOW_SECONDS
 from linuxlab.validation import router as validation
 from linuxlab.validation.router import VALIDATE_ATTEMPTS, VALIDATE_WINDOW_SECONDS
 from linuxlab.validation.service import Validations
@@ -59,6 +61,7 @@ def create_app(
         app.state.auth_rate_limits = {"signup": RateLimiter(), "login": RateLimiter()}
         app.state.lab_rate_limit = RateLimiter(CREATE_ATTEMPTS, CREATE_WINDOW_SECONDS)
         app.state.validation_rate_limit = RateLimiter(VALIDATE_ATTEMPTS, VALIDATE_WINDOW_SECONDS)
+        app.state.question_rate_limit = RateLimiter(ANSWER_ATTEMPTS, ANSWER_WINDOW_SECONDS)
         docker: aiodocker.Docker | None = None
         runtime = lab_runtime
         if runtime is None:
@@ -107,6 +110,7 @@ def create_app(
     app.include_router(terminal.router)
     app.include_router(validation.router)
     app.include_router(history.router)
+    app.include_router(questions.router)
     return app
 
 
