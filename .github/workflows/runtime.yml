@@ -197,10 +197,22 @@ jobs:
   # Engine (Docker in Docker) with runsc, on a volume of its own: no image, volume,
   # release file, backup or receipt of the origin. Run on the pull request's head
   # commit, with the history the new host clones from.
+  #
+  # Twice: an origin running this commit, and an origin running the last release of
+  # before questions (5f733b6, main before them), whose backups have no question; in
+  # both, the new host recovers with this commit's restore-offsite.sh.
   disaster-recovery:
-    name: Disaster recovery on a new host (runsc)
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Disaster recovery on a new host (runsc)
+            origin: HEAD
+          - name: Disaster recovery of a backup from before questions (runsc)
+            origin: 5f733b6f7a135be701a833d761e729ec202aeb67
     steps:
       - uses: actions/checkout@v7
         with:
@@ -245,12 +257,26 @@ jobs:
           echo "web commit: $(git -C web rev-parse HEAD)"
           df -h /
 
+      # The origin's API checkout: this commit's, or a worktree at the older release.
+      - name: Check out the origin's API
+        env:
+          ORIGIN: ${{ matrix.origin }}
+        run: |
+          if [ "$ORIGIN" = HEAD ]; then
+            echo "ORIGIN_API=$GITHUB_WORKSPACE/api" >>"$GITHUB_ENV"
+          else
+            git -C api worktree add --detach "$RUNNER_TEMP/origin-api" "$ORIGIN"
+            echo "ORIGIN_API=$RUNNER_TEMP/origin-api" >>"$GITHUB_ENV"
+          fi
+
       - name: Build the origin's release
         run: |
-          api/infra/release/build.sh --api-repo api --api-sha "$(git -C api rev-parse HEAD)" \
+          echo "origin's api commit: $(git -C "$ORIGIN_API" rev-parse HEAD)"
+          api/infra/release/build.sh --api-repo "$ORIGIN_API" --api-sha "$(git -C "$ORIGIN_API" rev-parse HEAD)" \
             --web-repo web --web-sha "$(git -C web rev-parse HEAD)" --out "$RUNNER_TEMP/releases"
 
       - name: Lose the origin, recover on a new host, compare
         run: |
           api/infra/tests/disaster.sh "$(ls "$RUNNER_TEMP"/releases/release-*.env)" \
-            --api-repo api --web-repo web --runtime runsc
+            --api-repo "$ORIGIN_API" --web-repo web --runtime runsc \
+            --recover-with "$(git -C api rev-parse HEAD)"
