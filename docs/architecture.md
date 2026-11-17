@@ -343,7 +343,7 @@ Conceptual questions of the easy mode (`src/linuxlab/questions/`, content in `sr
 
 **Content and versions.** `questions/<slug>.yaml` files are read and checked by the same loader, in the same sync and transaction as modules and missions, with the same rules: matched by slug, a new version only when the specification's hash changes, archived (never deleted) when gone, versions immutable (trigger on `question_versions`). A module lists missions or questions, never both. The sync records the questions' count and fingerprint in `content_syncs` next to the missions'.
 
-**Reading.** `GET /api/question-modules` and `GET /api/questions/{slug}` read the presentation fields of the current version (title, summary, statement, the id and text of each option, hints) from `question_versions.spec` with JSON path expressions; `answer`, the options' feedback and `explanation` are never selected, so they cannot reach a response by mistake.
+**Reading.** `GET /api/question-modules` and `GET /api/questions/{slug}` read the presentation fields of the current version from `question_versions.spec` with JSON path expressions: title, summary, difficulty, time, tags, and for the detail the statement, the hints and the options. `answer` and `explanation` are never selected. The options are read whole, each with its feedback, and the route builds the response with the id and the text of each one only: the feedback is loaded on the server and dropped there. The response models (`QuestionCard`, `QuestionDetail`) have no field for the answer, a feedback or the explanation, and the tests inspect every read response for them.
 
 **Answering.** `POST /api/questions/{slug}/answers`:
 
@@ -362,7 +362,7 @@ Two first correct answers racing are settled by the primary key of `user_questio
 | An attempt names an option id of the right form | Database: `CHECK` on `option`; Service: the option must be one of the version's |
 | Deleting a user deletes their attempts and completions | Database: `ON DELETE CASCADE` on `user_id` |
 | Only the API decides whether an answer is right | Service: the request carries only `version` and `option` (other fields are refused) |
-| The answer key, feedback and explanation never reach a read route | Service: the read routes never select them; tests inspect every response |
+| The answer key, feedback and explanation never reach a read route's response | Service: the read routes do not select `answer` nor `explanation`, and keep only the id and text of each option (its feedback is read with it and dropped); the response models have no field for them; tests inspect every response |
 | Progress and attempts are only read for the user of the session | Service: no route takes a user id |
 
 ## Command history

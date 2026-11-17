@@ -40,9 +40,11 @@ router = api_router(prefix="/api")
 PUBLISHED = "published"
 ANSWER_ATTEMPTS = 30
 ANSWER_WINDOW_SECONDS = 60
-# Read from the current version's specification for a card; the detail adds the rest
-# of what a student sees. `answer`, `explanation` and the options' feedback are never
-# read here.
+# Read from the current version's specification for a card. The detail also reads the
+# statement, the hints and the options, whole: each option's feedback is loaded with it
+# and dropped by the route, which returns only the id and the text. `answer` and
+# `explanation` are not read by the read routes; nothing of them, or of a feedback, is
+# in their responses.
 CARD_FIELDS = ("title", "summary", "difficulty", "estimated_minutes", "tags")
 
 
