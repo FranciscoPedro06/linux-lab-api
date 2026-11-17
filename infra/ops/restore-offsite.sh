@@ -485,9 +485,18 @@ recorded_count=$(expected content | cut -d' ' -f1)
 [ "$recorded_count" = - ] || [ "$mission_count" = "$recorded_count" ] \
     || fail "$mission_count missions read back, the manifest records $recorded_count"
 note "missions: $mission_count, $published published, each current version loads with the release's code"
-# The questions the same way: every question's current version must load as the
-# answer endpoint reads it.
-questions=$(compose run --rm --no-deps -T task python - <<'PY'
+# The questions the same way, when the backup has them: every question's current
+# version must load as the answer endpoint reads it. A backup made by a release of
+# before questions records none (its manifest has no question fingerprint, and check
+# prints "questions -"): check_database found no questions table, as the manifest says,
+# and the release rebuilt from it has no question model to import.
+if [ "$(expected questions)" = - ]; then
+    # "t" only when PostgreSQL answers that the table is absent: an error fails too.
+    [ "$(psql_on "$database" -c "SELECT to_regclass('public.questions') IS NULL")" = t ] \
+        || fail "the manifest records no questions, but the database has a questions table (or could not be read)"
+    note "questions: none in this backup (made before questions existed), and no questions table: nothing to read back"
+else
+    questions=$(compose run --rm --no-deps -T task python - <<'PY'
 import asyncio
 from sqlalchemy import select
 from linuxlab.config import get_settings
@@ -519,12 +528,13 @@ async def main():
 asyncio.run(main())
 PY
 ) || fail "the questions could not be read back with the release's code"
-read -r question_count questions_published broken <<<"$questions"
-[ "$broken" = - ] || fail "questions whose current version this release cannot use: $broken"
-recorded_count=$(expected questions | cut -d' ' -f1)
-[ "$recorded_count" = - ] || [ "$question_count" = "$recorded_count" ] \
-    || fail "$question_count questions read back, the manifest records $recorded_count"
-note "questions: $question_count, $questions_published published, each current version loads with the release's code"
+    read -r question_count questions_published broken <<<"$questions"
+    [ "$broken" = - ] || fail "questions whose current version this release cannot use: $broken"
+    recorded_count=$(expected questions | cut -d' ' -f1)
+    [ "$question_count" = "$recorded_count" ] \
+        || fail "$question_count questions read back, the manifest records $recorded_count"
+    note "questions: $question_count, $questions_published published, each current version loads with the release's code"
+fi
 # The site's server in the configuration Caddy loaded from the release's Caddyfile
 # listens on :443. Its HTTP to HTTPS redirect on :80 is a server Caddy adds by itself
 # and does not show there: it is checked by a request to the published port instead.
