@@ -19,12 +19,18 @@
 # be, and used: the site's checks, a student of A logs in and finds their progress, a
 # new student's whole session with a lab under runsc in B.
 #
-#   infra/tests/disaster.sh RELEASE_FILE --api-repo DIR --web-repo DIR [--runtime runsc|runc] [--keep]
+#   infra/tests/disaster.sh RELEASE_FILE --api-repo DIR --web-repo DIR [--recover-with SHA]
+#       [--runtime runsc|runc] [--keep]
 #
 # RELEASE_FILE is A's, built from the commits checked out in DIR (infra/release/build.sh);
 # B gets the repositories as git bundles of those checkouts, which need their full
-# history. When A is destroyed, RELEASE_FILE and its three images are removed too:
-# they are A's. --runtime applies to A's labs only; B's are always under runsc. Needs, on
+# history. A runs its own release's tools: the operations scripts, the Compose files,
+# the synthetic content and the test client of the API checkout. B recovers with
+# restore-offsite.sh of the commit --recover-with names (default: A's API commit), which
+# must descend from A's: a newer script recovering the backup of an older release, as
+# after the loss of a host that was not updated yet. When A is destroyed, RELEASE_FILE
+# and its three images are removed too: they are A's. --runtime applies to A's labs
+# only; B's are always under runsc. Needs, on
 # this host: Docker, age, rclone, minio and mc (as e2e.sh), and network access from B
 # (Alpine packages, the pinned releases). If this host has swap, B runs as a test
 # project that may ignore it (the production project refuses unencrypted swap); CI
@@ -35,24 +41,24 @@ docker() { MSYS_NO_PATHCONV=1 command docker "$@"; }
 
 DIND_IMAGE=docker:28.4.0-dind@sha256:2ceb471176ad51e37145d43ce7cbf0fa5d644a2b185bd537f0ef695fb3a37497
 
-release='' api_repo='' web_repo='' runtime=runsc keep=false
+release='' api_repo='' web_repo='' recover_sha='' runtime=runsc keep=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --api-repo) api_repo=$2; shift 2 ;;
+        --recover-with) recover_sha=$2; shift 2 ;;
         --web-repo) web_repo=$2; shift 2 ;;
         --runtime) runtime=$2; shift 2 ;;
         --keep) keep=true; shift ;;
-        -*) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -*) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) release=$1; shift ;;
     esac
 done
 if [ ! -f "$release" ] || [ ! -d "$api_repo" ] || [ ! -d "$web_repo" ]; then
-    echo "usage: disaster.sh RELEASE_FILE --api-repo DIR --web-repo DIR [--runtime runsc|runc] [--keep]" >&2
+    echo "usage: disaster.sh RELEASE_FILE --api-repo DIR --web-repo DIR [--recover-with SHA] [--runtime runsc|runc] [--keep]" >&2
     exit 2
 fi
 
 here=$(cd "$(dirname "$0")" && pwd)
-repo=$(cd "$here/../.." && pwd)
 value() { sed -n "s/^$1=//p" "$release" | tail -n 1; }
 api_image=$(value API_IMAGE)
 api_sha=$(value API_SHA)
@@ -63,6 +69,20 @@ for name in API LAB EDGE; do
 done
 [ "$(git -C "$api_repo" rev-parse HEAD)" = "$api_sha" ] || { echo "error: $api_repo is not at $api_sha" >&2; exit 1; }
 [ "$(git -C "$web_repo" rev-parse HEAD)" = "$web_sha" ] || { echo "error: $web_repo is not at $web_sha" >&2; exit 1; }
+recover_sha=$(git -C "$api_repo" rev-parse --verify --quiet "${recover_sha:-$api_sha}^{commit}") \
+    || { echo "error: --recover-with is not a commit in $api_repo" >&2; exit 1; }
+git -C "$api_repo" merge-base --is-ancestor "$api_sha" "$recover_sha" \
+    || { echo "error: $recover_sha does not descend from A's API commit $api_sha" >&2; exit 1; }
+# A's own tools, from its API checkout (the same files as this script's when A runs
+# the commit under test).
+origin_api=$(cd "$api_repo" && pwd)
+# Whether A's release has questions: then A's students answer one, and B must find it.
+if git -C "$origin_api" cat-file -e "$api_sha:src/linuxlab/questions/router.py" 2>/dev/null; then
+    origin_questions=true
+else
+    origin_questions=false
+fi
+echo "A: API $api_sha (questions: $origin_questions); B recovers with restore-offsite.sh of $recover_sha"
 
 run_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 network="linuxlab-dr-$run_id"
@@ -86,6 +106,7 @@ cleanup() {
     for id in $(docker ps -aq --filter "label=linuxlab.deployment=$deployment"); do docker rm -f "$id" >/dev/null; done
     docker rm -f "$host_b" >/dev/null 2>&1 || true
     docker volume rm "$volume_b" >/dev/null 2>&1 || true
+    git -C "$api_repo" update-ref -d "refs/heads/linuxlab-dr-$run_id" >/dev/null 2>&1 || true
     [ -z "$MINIO_PID" ] || kill "$MINIO_PID" 2>/dev/null || true
     docker network rm "$network" >/dev/null 2>&1 || true
     rm -rf "$work" "$memory"
@@ -154,29 +175,30 @@ BACKUP_RETRY_DELAY=1
 EOF
 )
 compose_a() {
-    docker compose -p "$origin" -f "$repo/infra/compose.prod.yml" -f "$here/compose.e2e.yml" \
+    docker compose -p "$origin" -f "$origin_api/infra/compose.prod.yml" -f "$origin_api/infra/tests/compose.e2e.yml" \
         --env-file "$release" --env-file "$env_a" "$@"
 }
 printf 'Filename\tType\tSize\tUsed\tPriority\n' >"$work/no-swaps"
 export LINUXLAB_ENV_FILE=$env_a LINUXLAB_PROJECT=$origin LINUXLAB_TEST_LOCK_FILE=$work/ops.lock
-export LINUXLAB_OVERRIDES=$here/compose.e2e.yml LINUXLAB_TEST_SWAPS=$work/no-swaps
+export LINUXLAB_OVERRIDES=$origin_api/infra/tests/compose.e2e.yml LINUXLAB_TEST_SWAPS=$work/no-swaps
 content="$work/content-repo"
 mkdir -p "$content"
-cp -r "$repo/tests/fixtures/content" "$content/content"
+cp -r "$origin_api/tests/fixtures/content" "$content/content"
 git -C "$content" init -q
 git -C "$content" config core.autocrlf false
 git -C "$content" add content
 git -C "$content" -c user.name=dr -c user.email=dr@dr.example commit -q -m content
 content_sha=$(git -C "$content" rev-parse HEAD)
 expect_ok "A: migrated, content synced at $content_sha, started" sh -c "
-    '$repo/infra/ops/migrate.sh' '$release' >'$work/a-start.log' 2>&1 &&
-    '$repo/infra/ops/content-sync.sh' '$release' '$content' '$content_sha' >>'$work/a-start.log' 2>&1"
+    '$origin_api/infra/ops/migrate.sh' '$release' >'$work/a-start.log' 2>&1 &&
+    '$origin_api/infra/ops/content-sync.sh' '$release' '$content' '$content_sha' >>'$work/a-start.log' 2>&1"
 compose_a up -d --wait >/dev/null
 for _ in $(seq 30); do
     compose_a exec -T caddy cat /data/caddy/pki/authorities/local/root.crt >"$work/root-a.crt" 2>/dev/null && break
     sleep 1
 done
-cp "$here/e2e.py" "$work/e2e.py"
+# A's test client, which B's checks use too: B runs A's release.
+cp "$origin_api/infra/tests/e2e.py" "$work/e2e.py"
 caddy_a=$(docker inspect --format "{{(index .NetworkSettings.Networks \"${origin}_public\").IPAddress}}" "$(compose_a ps -q caddy)")
 client_a() {
     local address=$1
@@ -219,7 +241,7 @@ logged() {
 }
 expect_ok "A: students ana and bia: lab, terminal, history, validation" \
     session end_a a-flow-1.log client_a 172.28.0.130 flow ana@dr.example bia@dr.example
-first=$("$repo/infra/ops/backup.sh" "$release" before 2>"$work/a-backup-1.log") || true
+first=$("$origin_api/infra/ops/backup.sh" "$release" before 2>"$work/a-backup-1.log") || true
 expect_ok "A: a first backup, confirmed in MinIO" test -f "$first.receipt.json"
 expect_ok "A: students caio and dani, after it" \
     session end_a a-flow-2.log client_a 172.28.0.131 flow caio@dr.example dani@dr.example
@@ -258,7 +280,7 @@ print(hashlib.sha256(base64.b64decode("".join(body.split()))).hexdigest())'; }
 compose_a exec -T caddy cat /data/caddy/certificates/local/linuxlab.localhost/linuxlab.localhost.crt | certificate_sha >"$work/a.certificate"
 certificate_sha <"$work/root-a.crt" >"$work/a.root"
 echo "A: $(wc -l <"$work/a.tables") tables ($(paste -sd ' ' "$work/a.tables" | cut -c1-200)...)"
-last=$("$repo/infra/ops/backup.sh" "$release" disaster 2>"$work/a-backup-2.log") || true
+last=$("$origin_api/infra/ops/backup.sh" "$release" disaster 2>"$work/a-backup-2.log") || true
 if [ ! -f "$last.receipt.json" ]; then
     result 1 "A: the last backup, confirmed in MinIO, its receipt here"
     tail -n 20 "$work/a-backup-2.log" >&2
@@ -269,8 +291,15 @@ last_name=$(basename "$last")
 last_key=${last_name#linuxlab-}
 last_key=${last_key%.tar.age}
 age --decrypt --identity "$work/keys/operator.key" --output "$memory/last.tar" "$last"
-manifest_content() { python3 -c 'import json, sys, tarfile; m = json.load(tarfile.open(sys.argv[1]).extractfile("manifest.json")); print(m["code"]["content"]["sha"])' "$memory/last.tar"; }
-expect_ok "A: its manifest names the content commit synced ($content_sha)" test "$(manifest_content)" = "$content_sha"
+manifest_content() { python3 -c 'import json, sys, tarfile; m = json.load(tarfile.open(sys.argv[1]).extractfile("manifest.json")); print(m["code"]["content"][sys.argv[2]])' "$memory/last.tar" "$1"; }
+expect_ok "A: its manifest names the content commit synced ($content_sha)" test "$(manifest_content sha)" = "$content_sha"
+if [ "$origin_questions" = true ]; then
+    expect_ok "A: its manifest records the questions" test "$(manifest_content questions)" = 3
+else
+    # A backup of before questions: its manifest has no question field at all.
+    expect_ok "A: its manifest has no question field (a release of before questions)" \
+        test "$(python3 -c 'import json, sys, tarfile; m = json.load(tarfile.open(sys.argv[1]).extractfile("manifest.json")); print(sorted(k for k in m["code"]["content"] if "question" in k))' "$memory/last.tar")" = "[]"
+fi
 rm -f "$memory/last.tar"
 # migrate.sh's backup (before the first migration), "before" and "disaster".
 backups_a=$(find "$origin_dir/backups" -maxdepth 1 -name 'linuxlab-*.tar.age.receipt.json' | wc -l)
@@ -352,14 +381,18 @@ expect_ok "B mounts nothing of this host but its own Docker volume ($mounts_b)" 
     test "$mounts_b" = "volume:$volume_b$(docker volume inspect --format '{{.Mountpoint}}' "$volume_b") "
 # Preparing the host: packages, the source code, then the repository's installers.
 in_b apk add --no-cache bash coreutils util-linux findutils python3 git curl bzip2 tar gzip grep sed >"$work/b-prepare.log" 2>&1
+# The commit B recovers with, under a branch of this run while the bundle is made: a
+# commit that no branch of the checkout points to would not be in it.
+git -C "$api_repo" update-ref "refs/heads/linuxlab-dr-$run_id" "$recover_sha"
 git -C "$api_repo" bundle create "$work/api.bundle" --all 2>/dev/null
+git -C "$api_repo" update-ref -d "refs/heads/linuxlab-dr-$run_id"
 git -C "$web_repo" bundle create "$work/web.bundle" --all 2>/dev/null
 docker cp "$work/api.bundle" "$host_b:/root/api.bundle" >/dev/null
 docker cp "$work/web.bundle" "$host_b:/root/web.bundle" >/dev/null
 rm -f "$work/api.bundle" "$work/web.bundle"
 in_b bash -c "
     set -e
-    git clone -q /root/api.bundle /srv/src/linux-lab-api && git -C /srv/src/linux-lab-api checkout -q --detach $api_sha
+    git clone -q /root/api.bundle /srv/src/linux-lab-api && git -C /srv/src/linux-lab-api checkout -q --detach $recover_sha
     git clone -q /root/web.bundle /srv/src/linux-lab-web && git -C /srv/src/linux-lab-web checkout -q --detach $web_sha
     rm /root/api.bundle /root/web.bundle
     cd /srv/src/linux-lab-api
@@ -425,6 +458,18 @@ fi
 sed 's/^/    /' "$work/recovery.log" | grep -E '^    (==|.*(selected|valid receipt|images built|matches the manifest|restored into|missions:|questions:|API:|Caddy:|ok |note )|backup:|api:|web:|content:)' || true
 expect_ok "the newest backup was found and used ($last_key)" grep -q "^backup: $last_key " "$work/recovery.log"
 expect_ok "  found by listing with the recovery credential, not from a file of A" grep -q "$backups_a valid receipt(s) of $backups_a" "$work/recovery.log"
+expect_ok "  recovered by restore-offsite.sh of $recover_sha" \
+    test "$(in_b git -C /srv/src/linux-lab-api rev-parse HEAD)" = "$recover_sha"
+expect_ok "  the missions were read back with the release's code" \
+    grep -q "missions: .*each current version loads with the release's code" "$work/recovery.log"
+if [ "$origin_questions" = true ]; then
+    expect_ok "  the questions were read back with the release's code" \
+        grep -q "questions: 3, 2 published, each current version loads with the release's code" "$work/recovery.log"
+else
+    expect_ok "  a backup of before questions: no question to read back, no question model imported" \
+        grep -q "questions: none in this backup (made before questions existed), and no questions table" "$work/recovery.log"
+    expect_ok "  and nothing about questions failed" sh -c "! grep -qE 'ImportError|cannot import|questions could not be read back' '$work/recovery.log'"
+fi
 
 release_b=$(in_b sh -c 'ls /var/lib/linuxlab/releases/release-*.env')
 compose_b() {
@@ -486,8 +531,13 @@ client_b() {
 }
 memory_note "B recovered"
 expect_ok "the site through B's Caddy: headers, routes, API, limits, redirect" logged b-site.log client_b site
-expect_ok "ana, a student of A, logs in on B and finds sample-file and sample-choice completed; a lab of it starts under runsc" \
-    logged b-returning.log client_b returning ana@dr.example sample-file sample-choice
+if [ "$origin_questions" = true ]; then
+    expect_ok "ana, a student of A, logs in on B and finds sample-file and sample-choice completed; a lab of it starts under runsc" \
+        logged b-returning.log client_b returning ana@dr.example sample-file sample-choice
+else
+    expect_ok "ana, a student of A, logs in on B and finds sample-file completed; a lab of it starts under runsc" \
+        logged b-returning.log client_b returning ana@dr.example sample-file
+fi
 expect_ok "a new student's whole session on B: lab, terminal, validation, history, reset, switch" \
     logged b-flow.log client_b flow erin@dr.example fabi@dr.example
 expect_ok "B's API runs labs under runsc, in production mode" \
