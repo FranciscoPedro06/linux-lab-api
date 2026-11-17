@@ -117,8 +117,10 @@ def test_removed_question_is_archived_with_its_versions(client: TestClient, root
     edit_yaml(module_file(root, "quiz"), lambda d: d["questions"].remove("sample-path"))
     question_file(root, "sample-path").unlink()
 
-    assert sync(client, root) == SyncReport(questions_archived=1)
+    # The draft after it moves up a position: an update, without a version.
+    assert sync(client, root) == SyncReport(questions_updated=1, questions_archived=1)
     assert questions(client)["sample-path"] == ("quiz", None, "archived", 1)
+    assert questions(client)["sample-choice-draft"] == ("quiz", 2, "draft", 1)
     assert len(versions(client, "sample-path")) == 1
 
 
