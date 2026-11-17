@@ -33,6 +33,9 @@ from linuxlab.db import Base
 STATUSES = ("archived", "draft", "published")
 STATUSES_SQL = ", ".join(f"'{status}'" for status in STATUSES)
 SLUG_SQL = "slug ~ '^[a-z0-9-]{1,64}$'"
+# The fingerprint of no questions: the SHA-256 of nothing (sync.QUESTION_FINGERPRINT on
+# a database without questions).
+NO_QUESTIONS = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 class Module(Base):
@@ -114,10 +117,12 @@ class ContentSync(Base):
     missions: Mapped[int] = mapped_column(Integer)
     # As infra/ops/lib.sh computes it (content_fingerprint), right after the sync.
     fingerprint: Mapped[str] = mapped_column(Text)
-    # The same for questions (question_fingerprint in lib.sh). Rows written before
-    # questions existed record none: 0 and the SHA-256 of nothing.
-    questions: Mapped[int] = mapped_column(Integer)
-    question_fingerprint: Mapped[str] = mapped_column(Text)
+    # The same for questions (question_fingerprint in lib.sh), always given by this
+    # release's sync. The defaults say "no questions" (0 and the SHA-256 of nothing): the
+    # values of rows written before questions existed, and of rows a release of before
+    # them inserts after a rollback of the application.
+    questions: Mapped[int] = mapped_column(Integer, server_default="0")
+    question_fingerprint: Mapped[str] = mapped_column(Text, server_default=NO_QUESTIONS)
 
 
 class MissionVersion(Base):

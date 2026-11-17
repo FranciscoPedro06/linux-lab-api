@@ -7,10 +7,14 @@ Create Date: 2026-11-17 12:00:00.000000
 Conceptual questions (docs/questions.md), synced from content/questions/ like missions
 from content/missions/, and the answers users give to them.
 
-content_syncs gains the questions' count and fingerprint. Rows of syncs that ran before
-this migration get 0 and the SHA-256 of nothing, which is what the fingerprint of a
-database without questions is: there were none. The defaults are dropped afterwards, so
-every new row states both. Adding the columns does not fire the table's update trigger.
+content_syncs gains the questions' count and fingerprint, with defaults that say "no
+questions": 0 and the SHA-256 of nothing, which is the fingerprint of a database
+without questions (sync.QUESTION_FINGERPRINT and question_fingerprint in
+infra/ops/lib.sh). Rows of syncs that ran before this migration get them: there were
+none. The defaults stay, so that the sync of a release of before questions, which
+inserts the row without these columns, keeps working on this schema (a rollback of the
+application, docs/operations.md#migrations); the sync of this release always states
+both. Adding the columns does not fire the table's update trigger.
 """
 
 from collections.abc import Sequence
@@ -194,8 +198,6 @@ def upgrade() -> None:
         "content_syncs",
         sa.Column("question_fingerprint", sa.Text(), server_default=EMPTY_SHA256, nullable=False),
     )
-    op.alter_column("content_syncs", "questions", server_default=None)
-    op.alter_column("content_syncs", "question_fingerprint", server_default=None)
     op.create_check_constraint(
         op.f("ck_content_syncs_questions_not_negative"), "content_syncs", "questions >= 0"
     )

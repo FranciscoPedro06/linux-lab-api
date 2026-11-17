@@ -11,6 +11,8 @@ from alembic.config import Config
 from sqlalchemy import inspect, text
 
 from linuxlab.config import get_settings
+from linuxlab.content.models import NO_QUESTIONS
+from linuxlab.content.sync import QUESTION_FINGERPRINT
 from linuxlab.db import create_engine
 
 pytestmark = pytest.mark.integration
@@ -246,7 +248,9 @@ def test_history_starts_empty_on_a_migrated_database() -> None:
 def test_syncs_recorded_before_questions_record_none() -> None:
     """Rows of content_syncs written before questions existed get 0 questions and the
     SHA-256 of nothing, the fingerprint of no questions, without firing the table's
-    update trigger; going down drops the columns and keeps the rows."""
+    update trigger; the defaults stay, for the rows a release of before questions
+    inserts after a rollback of the application; going down drops the columns and keeps
+    the rows."""
     config = Config(str(ALEMBIC_INI))
     command.downgrade(config, "base")
     command.upgrade(config, BEFORE_QUESTIONS)
@@ -265,7 +269,10 @@ def test_syncs_recorded_before_questions_record_none() -> None:
             " WHERE table_name = 'content_syncs'"
             " AND column_name IN ('questions', 'question_fingerprint')"
         )
-        assert sorted(defaults) == [("question_fingerprint", None), ("questions", None)]
+        assert sorted(defaults) == [
+            ("question_fingerprint", f"'{EMPTY_SHA256}'::text"),
+            ("questions", "0"),
+        ]
 
         command.downgrade(config, BEFORE_QUESTIONS)
         assert {"questions", "user_questions", "question_attempts"}.isdisjoint(tables())
@@ -273,3 +280,31 @@ def test_syncs_recorded_before_questions_record_none() -> None:
     finally:
         command.downgrade(config, "base")
         command.upgrade(config, "head")
+
+
+def test_a_release_of_before_questions_still_records_its_syncs() -> None:
+    """The INSERT of a release of before questions, whose ContentSync has no question
+    column, works on this schema, and its row says "no questions" with the values the
+    fingerprint query gives for no questions. A row of this release keeps the values it
+    states. The old release's own sync runs in infra/tests/legacy-sync-cases.sh."""
+    execute("TRUNCATE content_syncs, questions, question_versions RESTART IDENTITY CASCADE")
+    try:
+        # The fingerprint of no questions, as the sync computes it.
+        assert execute(str(QUESTION_FINGERPRINT)) == [(0, EMPTY_SHA256)]
+        assert NO_QUESTIONS == EMPTY_SHA256
+
+        execute(
+            "INSERT INTO content_syncs (source_commit, missions, fingerprint)"
+            " VALUES (repeat('c', 40), 2, repeat('d', 64))"
+        )
+        execute(
+            "INSERT INTO content_syncs"
+            " (source_commit, missions, fingerprint, questions, question_fingerprint)"
+            " VALUES (NULL, 2, repeat('d', 64), 3, repeat('e', 64))"
+        )
+        assert execute(
+            "SELECT source_commit, missions, questions, question_fingerprint"
+            " FROM content_syncs ORDER BY id"
+        ) == [("c" * 40, 2, 0, EMPTY_SHA256), (None, 2, 3, "e" * 64)]
+    finally:
+        execute("TRUNCATE content_syncs RESTART IDENTITY")
