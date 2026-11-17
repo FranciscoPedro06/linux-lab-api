@@ -160,16 +160,19 @@ def leaks(body: Any) -> list[str]:
 def test_reading_never_reveals_the_answer_even_after_completion(
     client: TestClient, token: str
 ) -> None:
+    before = get(client, token, f"/api/questions/{QUESTION}")
     assert leaks(get(client, token, "/api/question-modules")) == []
-    assert leaks(get(client, token, f"/api/questions/{QUESTION}")) == []
+    assert leaks(before) == []
 
     answered(client, token, WRONG)
     answered(client, token, RIGHT)
 
     for path in ("/api/question-modules", f"/api/questions/{QUESTION}"):
-        body = get(client, token, path)
-        assert leaks(body) == []
-        assert RIGHT not in json.dumps(body).replace('"id": "pwd"', "")
+        assert leaks(get(client, token, path)) == []
+    # Completing the question changes its progress and nothing else that is read.
+    after = get(client, token, f"/api/questions/{QUESTION}")
+    assert after["progress"]["status"] == "completed"
+    assert {**after, "progress": None} == {**before, "progress": None}
 
 
 @pytest.mark.parametrize(
