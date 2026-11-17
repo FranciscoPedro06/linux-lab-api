@@ -56,6 +56,14 @@ jobs:
       - run: uv run pytest
       - name: Integration tests (PostgreSQL)
         run: uv run pytest -m "integration and not docker"
+      # A rollback of the application without a downgrade: the content sync of the last
+      # release of before questions (5f733b6, main before them) on this schema, then
+      # this release's again.
+      - name: Content sync of the release of before questions on this schema
+        run: |
+          git fetch --no-tags --depth=1 origin 5f733b6f7a135be701a833d761e729ec202aeb67
+          git worktree add --detach "$RUNNER_TEMP/before-questions" FETCH_HEAD
+          infra/tests/legacy-sync-cases.sh "$RUNNER_TEMP/before-questions"
 
   labs:
     name: Lab integration (Docker, runc)
