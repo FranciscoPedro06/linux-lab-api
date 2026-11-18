@@ -7,7 +7,8 @@
 # (ListBucket restricted to that prefix, and GetObject) finds and reads them. The
 # backups are made by the real backup.sh with Docker and PostgreSQL stood in for
 # (infra/tests/stubs/docker), as in remote-cases.sh. The rest of the recovery, with
-# real Docker and PostgreSQL, is infra/tests/disaster.sh.
+# real Docker and PostgreSQL, is infra/tests/disaster.sh. The new host's runsc check
+# (without --check-only) runs against a docker stand-in written below.
 #
 #   infra/tests/offsite-cases.sh
 #
@@ -280,6 +281,59 @@ check "an unknown argument" err_says "unknown argument: --extra"
 run "$ops/restore-offsite.sh" --remote recovery:backups/host --rclone-config "$recovery_config" \
     --identity-file "$keys/recovery.key" --recovery-dir "$work/recovered"
 check "without --check-only, the repositories are required" err_says "--api-repo and --web-repo are required"
+
+echo "== the new host's runsc check, with Docker stood in for"
+# Without --check-only, the host is checked before anything is downloaded. A docker
+# stand-in (not infra/tests/stubs/docker, and no real Docker) answers the engine's
+# version, Compose's, and `docker info` with STUB_RUNTIMES (printf %b) and status
+# STUB_INFO_RC. Once the runtime check passes, the next check (check-env.sh, on this
+# test's environment file) stops the run: nothing is downloaded or built.
+mkdir "$work/host"
+cat >"$work/host/docker" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >>"$HOST_LOG"
+case " $* " in
+    *" version --format "*) echo 28.4.0 ;;
+    *" compose version "*) echo "Docker Compose version v2.39.2" ;;
+    *" info --format "*) printf '%b' "${STUB_RUNTIMES-}"; exit "${STUB_INFO_RC:-0}" ;;
+    *) echo "unexpected docker call: $*" >&2; exit 99 ;;
+esac
+SH
+chmod +x "$work/host/docker"
+export HOST_LOG="$work/host/calls"
+# host_check RUNTIMES [STATUS]
+host_check() {
+    : >"$HOST_LOG"
+    rm -rf "$work/recovered"
+    run env PATH="$work/host:$PATH" STUB_RUNTIMES="$1" STUB_INFO_RC="${2:-0}" \
+        "$ops/restore-offsite.sh" --remote recovery:backups/host --rclone-config "$recovery_config" \
+        --identity-file "$keys/recovery.key" --recovery-dir "$work/recovered" \
+        --api-repo "$here/../.." --web-repo "$here/../.."
+}
+runtime_passed() { err_says "the environment file is not ready" && not err_says "runsc runtime"; }
+asked_docker_info() { grep -q "^info --format" "$HOST_LOG"; }
+nothing_downloaded() { [ -z "$(find "$work/recovered" -type f 2>/dev/null)" ]; }
+host_check 'io.containerd.runc.v2 runc runsc '
+check "Docker lists runsc: the runtime check passes" runtime_passed
+check "  docker info was asked, of the stand-in" asked_docker_info
+check "  nothing downloaded" nothing_downloaded
+host_check 'runc\nrunsc\n'
+check "runtimes on several lines: runsc found" runtime_passed
+host_check 'io.containerd.runc.v2 runc '
+check "Docker lists runc only: refused" failed
+check "  with the runtimes Docker reports" \
+    err_says "not registered with Docker (Docker reports: io.containerd.runc.v2 runc)"
+check "  nothing downloaded" nothing_downloaded
+host_check 'runsc-foo runc '
+check "a runtime whose name only starts with runsc: refused" \
+    err_says "not registered with Docker (Docker reports: runsc-foo runc)"
+host_check ''
+check "Docker lists no runtime: refused" failed
+check "  says so" err_says "not registered with Docker (Docker reports: no runtimes)"
+host_check 'runsc ' 3
+check "docker info fails: refused" failed
+check "  with its status" err_says "docker info failed (status 3): cannot check the runsc runtime"
+check "  not as a missing runtime, although it listed runsc" not err_says "not registered"
 
 echo "== nothing confirmed off the host"
 recover --remote recovery:backups/host/empty
