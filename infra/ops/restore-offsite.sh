@@ -131,8 +131,21 @@ if [ "$check_only" = false ]; then
     engine=$(docker version --format '{{.Server.Version}}' 2>/dev/null) || fail "the Docker Engine does not answer"
     [ "${engine%%.*}" -ge 28 ] 2>/dev/null || fail "Docker Engine 28 or later is required, this is $engine"
     docker compose version >/dev/null 2>&1 || fail "the Docker Compose plugin is required"
-    docker info --format '{{range $name, $_ := .Runtimes}}{{$name}} {{end}}' | tr ' ' '\n' | grep -qx runsc \
-        || fail "the runsc runtime (gVisor) is not registered with Docker: infra/release/install-gvisor.sh, then restart Docker"
+    # Read whole, not through a pipe: docker info's status and the runtimes it lists
+    # are kept for the message. Names are compared whole (runsc-foo is not runsc).
+    if runtimes=$(docker info --format '{{range $name, $_ := .Runtimes}}{{$name}} {{end}}'); then
+        :
+    else
+        docker_info_status=$?
+        fail "docker info failed (status $docker_info_status): cannot check the runsc runtime"
+    fi
+    read -r -d '' -a runtime_names <<<"$runtimes" || true
+    runsc_registered=false
+    for runtime_name in "${runtime_names[@]}"; do
+        [ "$runtime_name" != runsc ] || runsc_registered=true
+    done
+    [ "$runsc_registered" = true ] \
+        || fail "the runsc runtime (gVisor) is not registered with Docker (Docker reports: ${runtime_names[*]:-no runtimes}): infra/release/install-gvisor.sh, then restart Docker"
     "$INFRA_DIR/release/check-env.sh" "$ENV_FILE" || fail "the environment file is not ready (see above)"
 fi
 for ((i = 1; i < ${#identities[@]}; i += 2)); do
